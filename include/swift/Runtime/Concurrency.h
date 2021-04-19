@@ -178,17 +178,6 @@ void swift_taskGroup_wait_next_throwing(
     OpaqueValue *resultPointer, SWIFT_ASYNC_CONTEXT AsyncContext *rawContext,
     TaskGroup *group, const Metadata *successType);
 
-/// Create a new `TaskGroup`.
-/// The caller is responsible for retaining and managing the group's lifecycle.
-///
-/// Its Swift signature is
-///
-/// \code
-/// func swift_taskGroup_create() -> Builtin.RawPointer
-/// \endcode
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-TaskGroup* swift_taskGroup_create(); // TODO: probably remove this call, and just use the initialize always
-
 /// Initialize a `TaskGroup` in the passed `group` memory location.
 /// The caller is responsible for retaining and managing the group's lifecycle.
 ///
@@ -512,6 +501,14 @@ void swift_defaultActor_initialize(DefaultActor *actor);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_defaultActor_destroy(DefaultActor *actor);
 
+/// Deallocate an instance of a default actor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_defaultActor_deallocate(DefaultActor *actor);
+
+/// Deallocate an instance of what might be a default actor.
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_defaultActor_deallocateResilient(HeapObject *actor);
+
 /// Enqueue a job on the default actor implementation.
 ///
 /// The job must be ready to run.  Notably, if it's a task, that
@@ -580,6 +577,13 @@ AsyncTask *swift_task_getCurrent(void);
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 ExecutorRef swift_task_getCurrentExecutor(void);
 
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+bool swift_task_isCurrentExecutor(ExecutorRef executor);
+
+SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
+void swift_task_reportUnexpectedExecutor(
+    const unsigned char *file, uintptr_t fileLength, bool fileIsASCII,
+    uintptr_t line, ExecutorRef executor);
 }
 
 #pragma clang diagnostic pop

@@ -486,7 +486,8 @@ AccessedStorage::AccessedStorage(SILValue base, Kind kind) {
     value = base;
     break;
   case Yield:
-    assert(isa<BeginApplyResult>(base));
+    assert(isa<BeginApplyInst>(
+             cast<MultipleValueInstructionResult>(base)->getParent()));
     value = base;
     break;
   case Unidentified:
@@ -1857,6 +1858,9 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
     case BuiltinValueKind::AutoDiffAllocateSubcontext:
     case BuiltinValueKind::InitializeDefaultActor:
     case BuiltinValueKind::DestroyDefaultActor:
+    case BuiltinValueKind::GetCurrentExecutor:
+    case BuiltinValueKind::CreateTaskGroup:
+    case BuiltinValueKind::DestroyTaskGroup:
       return;
 
     // General memory access to a pointer in first operand position.
@@ -2016,6 +2020,7 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::FixLifetimeInst:
   case SILInstructionKind::GlobalAddrInst:
   case SILInstructionKind::HopToExecutorInst:
+  case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::InitExistentialValueInst:
   case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::IsEscapingClosureInst:

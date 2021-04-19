@@ -58,7 +58,7 @@ extension Task {
     // FIXME: This retain seems pretty wrong, however if we don't we WILL crash
     //        with "destroying a task that never completed" in the task's destroy.
     //        How do we solve this properly?
-    _swiftRetain(_task)
+    Builtin.retain(_task)
 
     return Task(_task)
   }
@@ -361,6 +361,20 @@ extension Task {
 
 // ==== Detached Tasks ---------------------------------------------------------
 
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+extension Task {
+
+  @discardableResult
+  @available(*, deprecated, message: "`Task.runDetached` was replaced by `detach` and will be removed shortly.")
+  public static func runDetached<T>(
+    priority: Task.Priority = .unspecified,
+    operation: __owned @Sendable @escaping () async throws -> T
+  ) -> Task.Handle<T, Error> {
+    detach(priority: priority, operation: operation)
+  }
+
+}
+
 /// Run given throwing `operation` as part of a new top-level task.
 ///
 /// Creating detached tasks should, generally, be avoided in favor of using
@@ -448,10 +462,10 @@ public func detach<T>(
 ///     throw the error the operation has thrown when awaited on.
 @discardableResult
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
-public func detach<T, Failure>(
+public func detach<T>(
   priority: Task.Priority = .unspecified,
   operation: __owned @Sendable @escaping () async throws -> T
-) -> Task.Handle<T, Failure> {
+) -> Task.Handle<T, Error> {
   // Set up the job flags for a new task.
   var flags = Task.JobFlags()
   flags.kind = .task
@@ -464,7 +478,7 @@ public func detach<T, Failure>(
   // Enqueue the resulting job.
   _enqueueJobGlobal(Builtin.convertTaskToJob(task))
 
-  return Task.Handle<T, Failure>(task)
+  return Task.Handle<T, Error>(task)
 }
 
 // ==== Async Handler ----------------------------------------------------------
@@ -503,7 +517,54 @@ extension Task {
   }
 }
 
+// ==== Voluntary Suspension -----------------------------------------------------
+
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+extension Task {
+
+  /// Explicitly suspend the current task, potentially giving up execution actor
+  /// of current actor/task, allowing other tasks to execute.
+  ///
+  /// This is not a perfect cure for starvation;
+  /// if the task is the highest-priority task in the system, it might go
+  /// immediately back to executing.
+  public static func yield() async {
+    // Prepare the job flags
+    var flags = JobFlags()
+    flags.kind = .task
+    flags.priority = .default
+    flags.isFuture = true
+
+    // Create the asynchronous task future, it will do nothing, but simply serves
+    // as a way for us to yield our execution until the executor gets to it and
+    // resumes us.
+    // TODO: consider if it would be useful for this task to be a child task
+    let (task, _) = Builtin.createAsyncTaskFuture(flags.bits, {})
+
+    // Enqueue the resulting job.
+    _enqueueJobGlobal(Builtin.convertTaskToJob(task))
+
+    let _ = await Handle<Void, Never>(task).get()
+  }
+}
+
 // ==== UnsafeCurrentTask ------------------------------------------------------
+
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+extension Task {
+
+  @available(*, deprecated, message: "`Task.unsafeCurrent` was replaced by `withUnsafeCurrentTask { task in ... }`, and will be removed soon.")
+  public static var unsafeCurrent: UnsafeCurrentTask? {
+    guard let _task = _getCurrentAsyncTask() else {
+      return nil
+    }
+    // FIXME: This retain seems pretty wrong, however if we don't we WILL crash
+    //        with "destroying a task that never completed" in the task's destroy.
+    //        How do we solve this properly?
+    Builtin.retain(_task)
+    return UnsafeCurrentTask(_task)
+  }
+}
 
 /// Calls the given closure with the with the "current" task in which this
 /// function was invoked.
@@ -530,7 +591,7 @@ public func withUnsafeCurrentTask<T>(body: (UnsafeCurrentTask?) throws -> T) ret
   // FIXME: This retain seems pretty wrong, however if we don't we WILL crash
   //        with "destroying a task that never completed" in the task's destroy.
   //        How do we solve this properly?
-  _swiftRetain(_task)
+  Builtin.retain(_task)
 
   return try body(UnsafeCurrentTask(_task))
 }
@@ -619,10 +680,6 @@ func _enqueueJobGlobal(_ task: Builtin.Job)
 @usableFromInline
 func _enqueueJobGlobalWithDelay(_ delay: UInt64, _ task: Builtin.Job)
 
-@available(*, deprecated)
-@_silgen_name("swift_task_runAndBlockThread")
-public func runAsyncAndBlock(_ asyncFun: @escaping () async -> ())
-
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 @_silgen_name("swift_task_asyncMainDrainQueue")
 public func _asyncMainDrainQueue() -> Never
@@ -697,6 +754,20 @@ func _taskCancel(_ task: Builtin.NativeObject)
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
 @_silgen_name("swift_task_isCancelled")
 func _taskIsCancelled(_ task: Builtin.NativeObject) -> Bool
+
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+@usableFromInline
+@_silgen_name("swift_task_isCurrentExecutor")
+func _taskIsCurrentExecutor(_ executor: Builtin.Executor) -> Bool
+
+@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+@usableFromInline
+@_silgen_name("swift_task_reportUnexpectedExecutor")
+func _reportUnexpectedExecutor(_ _filenameStart: Builtin.RawPointer,
+                               _ _filenameLength: Builtin.Word,
+                               _ _filenameIsASCII: Builtin.Int1,
+                               _ _line: Builtin.Word,
+                               _ _executor: Builtin.Executor)
 
 #if _runtime(_ObjC)
 

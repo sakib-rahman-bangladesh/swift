@@ -65,11 +65,17 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask) {
     switch (queueHead.getStatus()) {
     case Status::Error:
     case Status::Success:
+#if SWIFT_TASK_PRINTF_DEBUG
+      fprintf(stderr, "[%p] task %p waiting on task %p, completed immediately\n", pthread_self(), waitingTask, this);
+#endif
       _swift_tsan_acquire(static_cast<Job *>(this));
       // The task is done; we don't need to wait.
       return queueHead.getStatus();
 
     case Status::Executing:
+#if SWIFT_TASK_PRINTF_DEBUG
+      fprintf(stderr, "[%p] task %p waiting on task %p, going to sleep\n", pthread_self(), waitingTask, this);
+#endif
       _swift_tsan_release(static_cast<Job *>(waitingTask));
       // Task is now complete. We'll need to add ourselves to the queue.
       break;
@@ -128,10 +134,20 @@ void AsyncTask::completeFuture(AsyncContext *context) {
 
   // Schedule every waiting task on the executor.
   auto waitingTask = queueHead.getTask();
+
+#if SWIFT_TASK_PRINTF_DEBUG
+  if (!waitingTask)
+    fprintf(stderr, "[%p] task %p had no waiting tasks\n", pthread_self(), this);
+#endif
+
   while (waitingTask) {
     // Find the next waiting task before we invalidate it by resuming
     // the task.
     auto nextWaitingTask = waitingTask->getNextWaitingTask();
+
+#if SWIFT_TASK_PRINTF_DEBUG
+    fprintf(stderr, "[%p] waking task %p from future of task %p\n", pthread_self(), waitingTask, this);
+#endif
 
     // Fill in the return context.
     auto waitingContext =
@@ -257,6 +273,10 @@ static void completeTask(SWIFT_ASYNC_CONTEXT AsyncContext *context,
   // there's no need to wait for the object to be destroyed.
   _swift_task_alloc_destroy(task);
 
+#if SWIFT_TASK_PRINTF_DEBUG
+  fprintf(stderr, "[%p] task %p completed\n", pthread_self(), task);
+#endif
+
   // Complete the future.
   if (task->isFuture()) {
     task->completeFuture(context);
@@ -326,6 +346,10 @@ static AsyncTaskAndContext swift_task_create_group_future_commonImpl(
   if (flags.task_isChildTask()) {
     parent = swift_task_getCurrent();
     assert(parent != nullptr && "creating a child task with no active task");
+
+    // Inherit the priority of the parent task if unspecified.
+    if (flags.getPriority() == JobPriority::Unspecified)
+      flags.setPriority(parent->getPriority());
   }
 
   // Figure out the size of the header.
@@ -423,7 +447,10 @@ static AsyncTaskAndContext swift_task_create_group_future_commonImpl(
             sizeof(FutureAsyncContextPrefix));
     futureAsyncContextPrefix->indirectResult = futureFragment->getStoragePtr();
   }
-  
+
+#if SWIFT_TASK_PRINTF_DEBUG
+  fprintf(stderr, "[%p] creating task %p with parent %p\n", pthread_self(), task, parent);
+#endif
 
   // Perform additional linking between parent and child task.
   if (parent) {
@@ -507,7 +534,7 @@ getAsyncClosureEntryPointAndContextSize(void *function,
       reinterpret_cast<const AsyncFunctionPointer<AsyncSignature> *>(function);
 #if SWIFT_PTRAUTH
   fnPtr = (const AsyncFunctionPointer<AsyncSignature> *)ptrauth_auth_data(
-      (void *)fnPtr, ptrauth_key_process_independent_code, AuthDiscriminator);
+      (void *)fnPtr, ptrauth_key_process_independent_data, AuthDiscriminator);
 #endif
   return {reinterpret_cast<typename AsyncSignature::FunctionType *>(
               fnPtr->Function.get()),
@@ -838,9 +865,9 @@ swift_task_addCancellationHandlerImpl(
     void *context) {
   void *allocation =
       swift_task_alloc(sizeof(CancellationNotificationStatusRecord));
-  auto *record =
-      new (allocation) CancellationNotificationStatusRecord(
-          handler, context);
+  auto unsigned_handler = swift_auth_code(handler, 3848);
+  auto *record = new (allocation)
+      CancellationNotificationStatusRecord(unsigned_handler, context);
 
   swift_task_addStatusRecord(record);
   return record;

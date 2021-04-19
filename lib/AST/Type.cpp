@@ -856,7 +856,7 @@ Type TypeBase::removeArgumentLabels(unsigned numArgumentLabels) {
   llvm::SmallVector<AnyFunctionType::Param, 8> unlabeledParams;
   unlabeledParams.reserve(fnType->getNumParams());
   for (const auto &param : fnType->getParams())
-    unlabeledParams.push_back(param.getWithoutLabel());
+    unlabeledParams.push_back(param.getWithoutLabels());
 
   auto result = fnType->getResult()
                       ->removeArgumentLabels(numArgumentLabels - 1);
@@ -1081,9 +1081,7 @@ rebuildSelfTypeWithObjectType(AnyFunctionType::Param selfParam,
   if (selfParam.getPlainType()->getAs<MetatypeType>())
     objectTy = MetatypeType::get(objectTy);
 
-  return AnyFunctionType::Param(objectTy,
-                                selfParam.getLabel(),
-                                selfParam.getParameterFlags());
+  return selfParam.withType(objectTy);
 }
 
 /// Returns a new function type exactly like this one but with the self
@@ -1258,9 +1256,11 @@ getCanonicalParams(AnyFunctionType *funcType,
                    SmallVectorImpl<AnyFunctionType::Param> &canParams) {
   auto origParams = funcType->getParams();
   for (auto param : origParams) {
+    // Canonicalize the type and drop the internal label to canonicalize the
+    // Param.
     canParams.emplace_back(param.getPlainType()->getCanonicalType(genericSig),
-                           param.getLabel(),
-                           param.getParameterFlags());
+                           param.getLabel(), param.getParameterFlags(),
+                           /*InternalLabel=*/Identifier());
   }
 }
 
@@ -3150,7 +3150,7 @@ static bool canSubstituteTypeInto(Type ty, const DeclContext *dc,
   case OpaqueSubstitutionKind::SubstituteNonResilientModule:
     // Can't access types that are not public from a different module.
     if (dc->getParentModule() == typeDecl->getDeclContext()->getParentModule())
-      return true;
+      return typeDecl->getEffectiveAccess() > AccessLevel::FilePrivate;
 
     return typeDecl->getEffectiveAccess() > AccessLevel::Internal;
   }
@@ -3181,15 +3181,12 @@ operator()(SubstitutableType *maybeOpaqueType) const {
   // archetype in question. This will map the inner generic signature of the
   // opaque type to its outer signature.
   auto partialSubstTy = archetype->getInterfaceType().subst(*subs);
-  // Then apply the substitutions from the root opaque archetype, to specialize
-  // for its type arguments.
-  auto substTy = partialSubstTy.subst(opaqueRoot->getSubstitutions());
 
   // Check that we are allowed to substitute the underlying type into the
   // context.
   auto inContext = this->inContext;
   auto isContextWholeModule = this->isContextWholeModule;
-  if (substTy.findIf(
+  if (partialSubstTy.findIf(
           [inContext, substitutionKind, isContextWholeModule](Type t) -> bool {
             if (!canSubstituteTypeInto(t, inContext, substitutionKind,
                                        isContextWholeModule))
@@ -3197,6 +3194,12 @@ operator()(SubstitutableType *maybeOpaqueType) const {
             return false;
           }))
     return maybeOpaqueType;
+
+  // Then apply the substitutions from the root opaque archetype, to specialize
+  // for its type arguments. We perform this substitution after checking for
+  // visibility, since we do not want the result of the visibility check to
+  // depend on the substitutions previously applied.
+  auto substTy = partialSubstTy.subst(opaqueRoot->getSubstitutions());
 
   // If the type changed, but still contains opaque types, recur.
   if (!substTy->isEqual(maybeOpaqueType) && substTy->hasOpaqueArchetype()) {
@@ -3264,18 +3267,12 @@ operator()(CanType maybeOpaqueType, Type replacementType,
   // archetype in question. This will map the inner generic signature of the
   // opaque type to its outer signature.
   auto partialSubstTy = archetype->getInterfaceType().subst(*subs);
-  auto partialSubstRef =
-      abstractRef.subst(archetype->getInterfaceType(), *subs);
-
-  // Then apply the substitutions from the root opaque archetype, to specialize
-  // for its type arguments.
-  auto substTy = partialSubstTy.subst(opaqueRoot->getSubstitutions());
 
   // Check that we are allowed to substitute the underlying type into the
   // context.
   auto inContext = this->inContext;
   auto isContextWholeModule = this->isContextWholeModule;
-  if (substTy.findIf(
+  if (partialSubstTy.findIf(
           [inContext, substitutionKind, isContextWholeModule](Type t) -> bool {
             if (!canSubstituteTypeInto(t, inContext, substitutionKind,
                                        isContextWholeModule))
@@ -3284,6 +3281,14 @@ operator()(CanType maybeOpaqueType, Type replacementType,
           }))
     return abstractRef;
 
+  // Then apply the substitutions from the root opaque archetype, to specialize
+  // for its type arguments. We perform this substitution after checking for
+  // visibility, since we do not want the result of the visibility check to
+  // depend on the substitutions previously applied.
+  auto substTy = partialSubstTy.subst(opaqueRoot->getSubstitutions());
+
+  auto partialSubstRef =
+      abstractRef.subst(archetype->getInterfaceType(), *subs);
   auto substRef =
       partialSubstRef.subst(partialSubstTy, opaqueRoot->getSubstitutions());
 
@@ -4849,6 +4854,7 @@ case TypeKind::Id:
       auto type = param.getPlainType();
       auto label = param.getLabel();
       auto flags = param.getParameterFlags();
+      auto internalLabel = param.getInternalLabel();
 
       auto substType = type.transformRec(fn);
       if (!substType)
@@ -4867,7 +4873,7 @@ case TypeKind::Id:
         flags = flags.withInOut(true);
       }
 
-      substParams.emplace_back(substType, label, flags);
+      substParams.emplace_back(substType, label, flags, internalLabel);
     }
 
     // Transform result type.
@@ -4877,6 +4883,17 @@ case TypeKind::Id:
 
     if (resultTy.getPointer() != function->getResult().getPointer())
       isUnchanged = false;
+
+    // Transform the global actor.
+    Type globalActorType;
+    if (Type origGlobalActorType = function->getGlobalActor()) {
+      globalActorType = origGlobalActorType.transformRec(fn);
+      if (!globalActorType)
+        return Type();
+
+      if (globalActorType.getPointer() != origGlobalActorType.getPointer())
+        isUnchanged = false;
+    }
 
     if (auto genericFnType = dyn_cast<GenericFunctionType>(base)) {
 #ifndef NDEBUG
@@ -4894,7 +4911,8 @@ case TypeKind::Id:
       if (!function->hasExtInfo())
         return GenericFunctionType::get(genericSig, substParams, resultTy);
       return GenericFunctionType::get(genericSig, substParams, resultTy,
-                                      function->getExtInfo());
+                                      function->getExtInfo()
+                                          .withGlobalActor(globalActorType));
     }
 
     if (isUnchanged) return *this;
@@ -4902,7 +4920,8 @@ case TypeKind::Id:
     if (!function->hasExtInfo())
       return FunctionType::get(substParams, resultTy);
     return FunctionType::get(substParams, resultTy,
-                             function->getExtInfo());
+                             function->getExtInfo()
+                                 .withGlobalActor(globalActorType));
   }
 
   case TypeKind::ArraySlice: {
