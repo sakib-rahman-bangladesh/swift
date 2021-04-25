@@ -139,7 +139,6 @@ void verifyKeyPathComponent(SILModule &M,
                             SubstitutionMap patternSubs,
                             bool forPropertyDescriptor,
                             bool hasIndices) {
-  auto &C = M.getASTContext();
   auto expansion = typeExpansionContext.getResilienceExpansion();
   auto opaque = AbstractionPattern::getOpaque();
   auto loweredBaseTy =
@@ -170,8 +169,7 @@ void verifyKeyPathComponent(SILModule &M,
           require(param.getConvention()
                     == ParameterConvention::Direct_Unowned,
                   "indices pointer should be trivial");
-          require(param.getInterfaceType()->getAnyNominal()
-                    == C.getUnsafeRawPointerDecl(),
+          require(param.getInterfaceType()->isUnsafeRawPointer(),
                   "indices pointer should be an UnsafeRawPointer");
         }
         
@@ -181,9 +179,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(substEqualsType->getResults()[0].getConvention()
                   == ResultConvention::Unowned,
                 "result should be unowned");
-        require(substEqualsType->getResults()[0].getInterfaceType()
-                               ->getAnyNominal()
-                  == C.getBoolDecl(),
+        require(substEqualsType->getResults()[0].getInterfaceType()->isBool(),
                 "result should be Bool");
       }
       {
@@ -202,8 +198,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(param.getConvention()
                   == ParameterConvention::Direct_Unowned,
                 "indices pointer should be trivial");
-        require(param.getInterfaceType()->getAnyNominal()
-                  == C.getUnsafeRawPointerDecl(),
+        require(param.getInterfaceType()->isUnsafeRawPointer(),
                 "indices pointer should be an UnsafeRawPointer");
         
         require(substHashType->getResults().size() == 1,
@@ -212,9 +207,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(substHashType->getResults()[0].getConvention()
                   == ResultConvention::Unowned,
                 "result should be unowned");
-        require(substHashType->getResults()[0].getInterfaceType()
-                             ->getAnyNominal()
-                  == C.getIntDecl(),
+        require(substHashType->getResults()[0].getInterfaceType()->isInt(),
                 "result should be Int");
       }
     } else {
@@ -303,7 +296,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(
             indicesParam
                     .getArgumentType(M, substGetterType, typeExpansionContext)
-                    ->getAnyNominal() == C.getUnsafeRawPointerDecl(),
+                    ->isUnsafeRawPointer(),
             "indices pointer should be an UnsafeRawPointer");
       }
 
@@ -361,7 +354,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(
             indicesParam
                     .getArgumentType(M, substSetterType, typeExpansionContext)
-                    ->getAnyNominal() == C.getUnsafeRawPointerDecl(),
+                    ->isUnsafeRawPointer(),
             "indices pointer should be an UnsafeRawPointer");
       }
 
@@ -1329,7 +1322,7 @@ public:
               "Operand is of an ArchetypeType that does not exist in the "
               "Caller's generic param list.");
       if (auto OpenedA = getOpenedArchetypeOf(A)) {
-        auto *openingInst = F->getModule().getOpenedArchetypeInst(OpenedA);
+        auto *openingInst = F->getModule().getOpenedArchetypeInst(OpenedA, F);
         require(I == nullptr || openingInst == I ||
                 properlyDominates(openingInst, I),
                 "Use of an opened archetype should be dominated by a "
@@ -1463,7 +1456,8 @@ public:
         FoundOpenedArchetypes.insert(A);
         // Also check that they are properly tracked inside the current
         // function.
-        auto *openingInst = F.getModule().getOpenedArchetypeInst(A);
+        auto *openingInst = F.getModule().getOpenedArchetypeInst(A,
+                              AI->getFunction());
         require(openingInst == AI ||
                 properlyDominates(openingInst, AI),
                 "Use of an opened archetype should be dominated by a "
@@ -3411,7 +3405,8 @@ public:
     auto archetype = getOpenedArchetypeOf(OEI->getType().getASTType());
     require(archetype,
         "open_existential_addr result must be an opened existential archetype");
-    require(OEI->getModule().getOpenedArchetypeInst(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_addr should be registered in "
             "SILFunction");
 
@@ -3444,7 +3439,8 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_ref result must be an opened existential archetype");
-    require(OEI->getModule().getOpenedArchetypeInst(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_ref should be registered in "
             "SILFunction");
   }
@@ -3466,7 +3462,8 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_box result must be an opened existential archetype");
-    require(OEI->getModule().getOpenedArchetypeInst(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_box should be registered in "
             "SILFunction");
   }
@@ -3488,7 +3485,8 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_box_value result not an opened existential archetype");
-    require(OEI->getModule().getOpenedArchetypeInst(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_box_value should be "
             "registered in SILFunction");
   }
@@ -3534,7 +3532,7 @@ public:
     require(archetype, "open_existential_metatype result must be an opened "
                        "existential metatype");
     require(
-        I->getModule().getOpenedArchetypeInst(archetype) == I,
+        I->getModule().getOpenedArchetypeInst(archetype, I->getFunction()) == I,
         "Archetype opened by open_existential_metatype should be registered in "
         "SILFunction");
   }
@@ -3553,7 +3551,8 @@ public:
     auto archetype = getOpenedArchetypeOf(OEI->getType().getASTType());
     require(archetype, "open_existential_value result must be an opened "
                        "existential archetype");
-    require(OEI->getModule().getOpenedArchetypeInst(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential should be registered in "
             "SILFunction");
   }
@@ -3841,7 +3840,7 @@ public:
       SILValue Def;
       if (t->isOpenedExistential()) {
         auto archetypeTy = cast<ArchetypeType>(t);
-        Def = I->getModule().getOpenedArchetypeInst(archetypeTy);
+        Def = I->getModule().getOpenedArchetypeInst(archetypeTy, I->getFunction());
         require(Def, "Opened archetype should be registered in SILModule");
       } else if (t->hasDynamicSelfType()) {
         require(I->getFunction()->hasSelfParam() ||
@@ -4844,10 +4843,9 @@ public:
     
     auto kpBGT = kpTy.getAs<BoundGenericType>();
     require(kpBGT, "keypath result must be a generic type");
-    auto &C = F.getASTContext();
-    require(kpBGT->getDecl() == C.getKeyPathDecl()
-            || kpBGT->getDecl() == C.getWritableKeyPathDecl()
-            || kpBGT->getDecl() == C.getReferenceWritableKeyPathDecl(),
+    require(kpBGT->isKeyPath() ||
+            kpBGT->isWritableKeyPath() ||
+            kpBGT->isReferenceWritableKeyPath(),
             "keypath result must be a key path type");
     
     auto baseTy = CanType(kpBGT->getGenericArgs()[0]);

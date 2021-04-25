@@ -1163,9 +1163,8 @@ deriveBodyEncodable_enum_encode(AbstractFunctionDecl *encodeDecl, void *) {
       new (C) DeclRefExpr(ConcreteDeclRef(selfRef), DeclNameLoc(),
                           /*implicit*/ true, AccessSemantics::Ordinary);
 
-  auto switchStmt = SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), enumRef,
-                                       SourceLoc(), cases, SourceLoc(),
-                                       SourceLoc(), C);
+  auto switchStmt =
+      SwitchStmt::createImplicit(LabeledStmtInfo(), enumRef, cases, C);
   statements.push_back(switchStmt);
 
   auto *body = BraceStmt::create(C, SourceLoc(), statements, SourceLoc(),
@@ -1190,7 +1189,7 @@ static FuncDecl *deriveEncodable_encode(DerivedConformance &derived) {
   //                         output: ()
   // Create from the inside out:
 
-  auto encoderType = C.getEncoderDecl()->getDeclaredInterfaceType();
+  auto encoderType = C.getEncoderType();
   auto returnType = TupleType::getEmpty(C);
 
   // Params: (Encoder)
@@ -1801,8 +1800,7 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
         UnresolvedDotExpr::createImplicit(C, allKeysExpr, C.Id_first);
 
     auto switchStmt =
-        SwitchStmt::create(LabeledStmtInfo(), SourceLoc(), firstExpr,
-                           SourceLoc(), cases, SourceLoc(), SourceLoc(), C);
+        SwitchStmt::createImplicit(LabeledStmtInfo(), firstExpr, cases, C);
 
     statements.push_back(switchStmt);
   }
@@ -1832,7 +1830,7 @@ static ValueDecl *deriveDecodable_init(DerivedConformance &derived) {
   // Compute from the inside out:
 
   // Params: (Decoder)
-  auto decoderType = C.getDecoderDecl()->getDeclaredInterfaceType();
+  auto decoderType = C.getDecoderType();
   auto *decoderParamDecl = new (C) ParamDecl(
       SourceLoc(), SourceLoc(), C.Id_from,
       SourceLoc(), C.Id_decoder, conformanceDC);

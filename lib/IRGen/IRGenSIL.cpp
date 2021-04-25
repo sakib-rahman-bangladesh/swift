@@ -1727,7 +1727,7 @@ IRGenSILFunction::IRGenSILFunction(IRGenModule &IGM, SILFunction *f)
     IGM.emitDynamicReplacementOriginalFunctionThunk(f);
   }
 
-  if (f->isDynamicallyReplaceable()) {
+  if (f->isDynamicallyReplaceable() && !f->isAsync()) {
     IGM.createReplaceableProlog(*this, f);
   }
 
@@ -1955,6 +1955,11 @@ static void emitEntryPointArgumentsNativeCC(IRGenSILFunction &IGF,
         IGF, getAsyncContextLayout(IGF.IGM, IGF.CurSILFn),
         LinkEntity::forSILFunction(IGF.CurSILFn),
         Signature::forAsyncEntry(IGF.IGM, funcTy).getAsyncContextIndex());
+    if (IGF.CurSILFn->isDynamicallyReplaceable()) {
+      IGF.IGM.createReplaceableProlog(IGF, IGF.CurSILFn);
+      // Remap the entry block.
+      IGF.LoweredBBs[&*IGF.CurSILFn->begin()] = LoweredBB(&IGF.CurFn->back(), {});
+    }
   }
 
   SILFunctionConventions conv(funcTy, IGF.getSILModule());
@@ -2508,6 +2513,12 @@ static FunctionPointer::Kind classifyFunctionPointerKind(SILFunction *fn) {
       return SpecialKind::TaskFutureWait;
     if (name.equals("swift_task_future_wait_throwing"))
       return SpecialKind::TaskFutureWaitThrowing;
+
+    if (name.equals("swift_asyncLet_wait"))
+      return SpecialKind::AsyncLetWait;
+    if (name.equals("swift_asyncLet_wait_throwing"))
+      return SpecialKind::AsyncLetWaitThrowing;
+
     if (name.equals("swift_taskGroup_wait_next_throwing"))
       return SpecialKind::TaskGroupWaitNext;
   }
