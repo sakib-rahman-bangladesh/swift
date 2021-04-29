@@ -466,7 +466,7 @@ static SILValue reapplyFunctionConversion(
 static Optional<std::pair<SILValue, AutoDiffConfig>>
 emitDerivativeFunctionReference(
     DifferentiationTransformer &transformer, SILBuilder &builder,
-    AutoDiffConfig desiredConfig, AutoDiffDerivativeFunctionKind kind,
+    const AutoDiffConfig &desiredConfig, AutoDiffDerivativeFunctionKind kind,
     SILValue original, DifferentiationInvoker invoker,
     SmallVectorImpl<AllocStackInst *> &newBuffersToDealloc) {
   ADContext &context = transformer.getContext();
@@ -1043,8 +1043,7 @@ static SILValue promoteCurryThunkApplicationToDifferentiableFunction(
   if (newThunk->empty()) {
     if (auto newThunkGenSig = thunkType->getSubstGenericSignature())
       newThunk->setGenericEnvironment(newThunkGenSig->getGenericEnvironment());
-    // TODO(TF-1206): Enable ownership in all differentiation thunks.
-    newThunk->setOwnershipEliminated();
+
     BasicTypeSubstCloner cloner(thunk, newThunk);
     cloner.cloneFunction();
     auto *retInst = cast<ReturnInst>(newThunk->findReturnBB()->getTerminator());

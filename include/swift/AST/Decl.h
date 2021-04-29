@@ -62,6 +62,7 @@ namespace swift {
   class DynamicSelfType;
   class Type;
   class Expr;
+  struct ExternalSourceLocs;
   class CaptureListExpr;
   class DeclRefExpr;
   class ForeignAsyncConvention;
@@ -688,14 +689,12 @@ private:
   void operator=(const Decl&) = delete;
   SourceLoc getLocFromSource() const;
 
-  struct CachedExternalSourceLocs {
-    SourceLoc Loc;
-    SourceLoc StartLoc;
-    SourceLoc EndLoc;
-    SmallVector<CharSourceRange, 4> DocRanges;
-  };
-  mutable CachedExternalSourceLocs const *CachedSerializedLocs = nullptr;
-  const CachedExternalSourceLocs *getSerializedLocs() const;
+  /// Returns the serialized locations of this declaration from the
+  /// corresponding .swiftsourceinfo file. "Empty" (ie. \c BufferID of 0, an
+  /// invalid \c Loc, and empty \c DocRanges) if either there is no
+  /// .swiftsourceinfo or the buffer could not be created, eg. if the file
+  /// no longer exists.
+  const ExternalSourceLocs *getSerializedLocs() const;
 
   /// Directly set the invalid bit
   void setInvalidBit();
@@ -5718,7 +5717,7 @@ public:
   ArrayRef<AutoDiffConfig> getDerivativeFunctionConfigurations();
 
   /// Add the given derivative function configuration.
-  void addDerivativeFunctionConfiguration(AutoDiffConfig config);
+  void addDerivativeFunctionConfiguration(const AutoDiffConfig &config);
 
 protected:
   // If a function has a body at all, we have either a parsed body AST node or
