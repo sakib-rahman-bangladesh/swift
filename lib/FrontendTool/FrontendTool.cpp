@@ -418,6 +418,7 @@ static bool buildModuleFromInterface(CompilerInstance &Instance) {
       Invocation.getSearchPathOptions(), Invocation.getLangOptions(),
       Invocation.getClangImporterOptions(),
       Invocation.getClangModuleCachePath(), PrebuiltCachePath,
+      FEOpts.BackupModuleInterfaceDir,
       Invocation.getModuleName(), InputPath, Invocation.getOutputFilename(),
       FEOpts.SerializeModuleInterfaceDependencyHashes,
       FEOpts.shouldTrackSystemDependencies(), LoaderOpts,
@@ -1973,9 +1974,10 @@ int swift::performFrontend(ArrayRef<const char *> Args,
     DiagnosticInfo errorInfo(
         DiagID(0), SourceLoc(), DiagnosticKind::Error,
         "fatal error encountered during compilation; " SWIFT_BUG_REPORT_MESSAGE,
-        {}, SourceLoc(), {}, {}, {}, false);
+        {}, StringRef(), SourceLoc(), {}, {}, {}, false);
     DiagnosticInfo noteInfo(DiagID(0), SourceLoc(), DiagnosticKind::Note,
-                            reason, {}, SourceLoc(), {}, {}, {}, false);
+                            reason, {}, StringRef(), SourceLoc(), {}, {}, {},
+                            false);
     PDC.handleDiagnostic(dummyMgr, errorInfo);
     PDC.handleDiagnostic(dummyMgr, noteInfo);
     if (shouldCrash)

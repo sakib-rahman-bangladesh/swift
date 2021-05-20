@@ -193,6 +193,11 @@ enum class DiagnosticSeverityKind {
   Error
 };
 
+enum class DiagnosticCategory {
+  Deprecation,
+  NoUsage
+};
+
 struct DiagnosticEntryInfoBase {
   struct Fixit {
     unsigned Offset;
@@ -200,11 +205,13 @@ struct DiagnosticEntryInfoBase {
     std::string Text;
   };
 
+  std::string ID;
   std::string Description;
   unsigned Offset = 0;
   unsigned Line = 0;
   unsigned Column = 0;
   std::string Filename;
+  SmallVector<DiagnosticCategory, 1> Categories;
   SmallVector<std::pair<unsigned, unsigned>, 2> Ranges;
   SmallVector<Fixit, 2> Fixits;
   SmallVector<std::string, 1> EducationalNotePaths;
@@ -405,6 +412,14 @@ struct ReferencedDeclInfo {
         IsSPI(SPI), ParentContexts(Parents) {}
 };
 
+struct LocationInfo {
+  StringRef Filename;
+  unsigned Offset = 0;
+  unsigned Length = 0;
+  unsigned Line = 0;
+  unsigned Column = 0;
+};
+
 struct CursorSymbolInfo {
   UIdent Kind;
   UIdent DeclarationLang;
@@ -430,11 +445,8 @@ struct CursorSymbolInfo {
   /// Non-empty if a generated interface editor document has previously been
   /// opened for the module the symbol came from.
   StringRef ModuleInterfaceName;
-  /// This is an (offset,length) pair. It is set only if the declaration has a
-  /// source location.
-  llvm::Optional<std::pair<unsigned, unsigned>> DeclarationLoc = None;
-  /// Set only if the declaration has a source location.
-  StringRef Filename;
+  /// Filename is non-empty if there's a source location.
+  LocationInfo Location;
   /// For methods this lists the USRs of the overrides in the class hierarchy.
   ArrayRef<StringRef> OverrideUSRs;
   /// Related declarations, overloaded functions etc., in annotated XML form.
@@ -444,7 +456,7 @@ struct CursorSymbolInfo {
   /// Stores the Symbol Graph title, kind, and USR of the parent contexts of the
   /// symbol under the cursor.
   ArrayRef<ParentInfo> ParentContexts;
-  /// The set of decls referenced in the symbol graph delcaration fragments.
+  /// The set of decls referenced in the symbol graph declaration fragments.
   ArrayRef<ReferencedDeclInfo> ReferencedSymbols;
   /// For calls this lists the USRs of the receiver types (multiple only in the
   /// case that the base is a protocol composition).

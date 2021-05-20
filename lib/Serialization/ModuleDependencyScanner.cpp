@@ -54,6 +54,7 @@ std::error_code ModuleDependencyScanner::findModuleFilesInDirectory(
     }
   }
   assert(fs.exists(InPath));
+
   // Use the private interface file if exits.
   auto PrivateInPath =
   BaseName.getName(file_types::TY_PrivateSwiftModuleInterfaceFile);
@@ -192,7 +193,8 @@ Optional<ModuleDependencies> SerializedModuleLoaderBase::getModuleDependencies(
   assert(isa<PlaceholderSwiftModuleScanner>(scanners[0].get()) &&
          "Expected PlaceholderSwiftModuleScanner as the first dependency scanner loader.");
   for (auto &scanner : scanners) {
-    if (scanner->canImportModule({moduleId, SourceLoc()})) {
+    if (scanner->canImportModule({moduleId, SourceLoc()},
+                                 llvm::VersionTuple(), false)) {
       // Record the dependencies.
       cache.recordDependencies(moduleName, *(scanner->dependencies));
       return std::move(scanner->dependencies);

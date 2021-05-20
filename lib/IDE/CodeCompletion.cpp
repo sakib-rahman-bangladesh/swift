@@ -1294,8 +1294,8 @@ CodeCompletionResult *CodeCompletionResultBuilder::takeResult() {
     }
 
     return new (*Sink.Allocator) CodeCompletionResult(
-        SemanticContext, NumBytesToErase, CCS, AssociatedDecl, ModuleName,
-        NotRecReason, copyString(*Sink.Allocator, BriefComment),
+        SemanticContext, IsArgumentLabels, NumBytesToErase, CCS, AssociatedDecl,
+        ModuleName, NotRecReason, copyString(*Sink.Allocator, BriefComment),
         copyAssociatedUSRs(*Sink.Allocator, AssociatedDecl),
         copyArray(*Sink.Allocator, CommentWords), ExpectedTypeRelation);
   }
@@ -1303,22 +1303,22 @@ CodeCompletionResult *CodeCompletionResultBuilder::takeResult() {
   case CodeCompletionResult::ResultKind::Keyword:
     return new (*Sink.Allocator)
         CodeCompletionResult(
-          KeywordKind, SemanticContext, NumBytesToErase,
+          KeywordKind, SemanticContext, IsArgumentLabels, NumBytesToErase,
           CCS, ExpectedTypeRelation,
           copyString(*Sink.Allocator, BriefDocComment));
 
   case CodeCompletionResult::ResultKind::BuiltinOperator:
   case CodeCompletionResult::ResultKind::Pattern:
     return new (*Sink.Allocator) CodeCompletionResult(
-        Kind, SemanticContext, NumBytesToErase, CCS, ExpectedTypeRelation,
-        CodeCompletionOperatorKind::None,
+        Kind, SemanticContext, IsArgumentLabels, NumBytesToErase, CCS,
+        ExpectedTypeRelation, CodeCompletionOperatorKind::None,
         copyString(*Sink.Allocator, BriefDocComment));
 
   case CodeCompletionResult::ResultKind::Literal:
     assert(LiteralKind.hasValue());
     return new (*Sink.Allocator)
-        CodeCompletionResult(*LiteralKind, SemanticContext, NumBytesToErase,
-                             CCS, ExpectedTypeRelation);
+        CodeCompletionResult(*LiteralKind, SemanticContext, IsArgumentLabels,
+                             NumBytesToErase, CCS, ExpectedTypeRelation);
   }
 
   llvm_unreachable("Unhandled CodeCompletionResult in switch.");
@@ -1669,6 +1669,7 @@ public:
   void completeGenericRequirement() override;
   void completeAfterIfStmt(bool hasElse) override;
   void completeStmtLabel(StmtKind ParentKind) override;
+  void completeForEachPatternBeginning(bool hasTry, bool hasAwait) override;
 
   void doneParsing() override;
 
@@ -2538,20 +2539,21 @@ public:
 
     // If the reference is 'async', all types must be 'Sendable'.
     if (implicitlyAsync && T) {
+      auto *M = CurrDeclContext->getParentModule();
       if (isa<VarDecl>(VD)) {
-        if (!isSendableType(CurrDeclContext, T)) {
+        if (!isSendableType(M, T)) {
           NotRecommended = NotRecommendedReason::CrossActorReference;
         }
       } else {
         assert(isa<FuncDecl>(VD) || isa<SubscriptDecl>(VD));
         // Check if the result and the param types are all 'Sendable'.
         auto *AFT = T->castTo<AnyFunctionType>();
-        if (!isSendableType(CurrDeclContext, AFT->getResult())) {
+        if (!isSendableType(M, AFT->getResult())) {
           NotRecommended = NotRecommendedReason::CrossActorReference;
         } else {
           for (auto &param : AFT->getParams()) {
             Type paramType = param.getPlainType();
-            if (!isSendableType(CurrDeclContext, paramType)) {
+            if (!isSendableType(M, paramType)) {
               NotRecommended = NotRecommendedReason::CrossActorReference;
               break;
             }
@@ -2895,6 +2897,7 @@ public:
               : CodeCompletionResult::ResultKind::Pattern,
           SemanticContext ? *SemanticContext : getSemanticContextKind(AFD),
           expectedTypeContext);
+      Builder.setIsArgumentLabels();
       if (AFD) {
         Builder.setAssociatedDecl(AFD);
         setClangDeclKeywords(AFD, Pairs, Builder);
@@ -4344,28 +4347,31 @@ public:
       builder.addRightBracket();
     });
 
-    auto floatType = context.getFloatType();
-    addFromProto(LK::ColorLiteral, [&](Builder &builder) {
-      builder.addBaseName("#colorLiteral");
-      builder.addLeftParen();
-      builder.addCallParameter(context.getIdentifier("red"), floatType);
-      builder.addComma();
-      builder.addCallParameter(context.getIdentifier("green"), floatType);
-      builder.addComma();
-      builder.addCallParameter(context.getIdentifier("blue"), floatType);
-      builder.addComma();
-      builder.addCallParameter(context.getIdentifier("alpha"), floatType);
-      builder.addRightParen();
-    });
+    // Optionally add object literals.
+    if (CompletionContext->includeObjectLiterals()) {
+      auto floatType = context.getFloatType();
+      addFromProto(LK::ColorLiteral, [&](Builder &builder) {
+        builder.addBaseName("#colorLiteral");
+        builder.addLeftParen();
+        builder.addCallParameter(context.getIdentifier("red"), floatType);
+        builder.addComma();
+        builder.addCallParameter(context.getIdentifier("green"), floatType);
+        builder.addComma();
+        builder.addCallParameter(context.getIdentifier("blue"), floatType);
+        builder.addComma();
+        builder.addCallParameter(context.getIdentifier("alpha"), floatType);
+        builder.addRightParen();
+      });
 
-    auto stringType = context.getStringType();
-    addFromProto(LK::ImageLiteral, [&](Builder &builder) {
-      builder.addBaseName("#imageLiteral");
-      builder.addLeftParen();
-      builder.addCallParameter(context.getIdentifier("resourceName"),
-                               stringType);
-      builder.addRightParen();
-    });
+      auto stringType = context.getStringType();
+      addFromProto(LK::ImageLiteral, [&](Builder &builder) {
+        builder.addBaseName("#imageLiteral");
+        builder.addLeftParen();
+        builder.addCallParameter(context.getIdentifier("resourceName"),
+                                 stringType);
+        builder.addRightParen();
+      });
+    }
 
     // Add tuple completion (item, item).
     {
@@ -5819,6 +5825,17 @@ void CodeCompletionCallbacksImpl::completeStmtLabel(StmtKind ParentKind) {
   ParentStmtKind = ParentKind;
 }
 
+void CodeCompletionCallbacksImpl::completeForEachPatternBeginning(
+    bool hasTry, bool hasAwait) {
+  CurDeclContext = P.CurDeclContext;
+  Kind = CompletionKind::ForEachPatternBeginning;
+  ParsedKeywords.clear();
+  if (hasTry)
+    ParsedKeywords.emplace_back("try");
+  if (hasAwait)
+    ParsedKeywords.emplace_back("await");
+}
+
 static bool isDynamicLookup(Type T) {
   return T->getRValueType()->isAnyObject();
 }
@@ -5944,7 +5961,6 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
   case CompletionKind::PoundAvailablePlatform:
   case CompletionKind::Import:
   case CompletionKind::UnresolvedMember:
-  case CompletionKind::CallArg:
   case CompletionKind::LabeledTrailingClosure:
   case CompletionKind::AfterPoundExpr:
   case CompletionKind::AfterPoundDirective:
@@ -5997,12 +6013,19 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
     addAnyTypeKeyword(Sink, CurDeclContext->getASTContext().TheAnyType);
     break;
 
+  case CompletionKind::CallArg:
+  case CompletionKind::PostfixExprParen:
+    // Note that we don't add keywords here as the completion might be for
+    // an argument list pattern. We instead add keywords later in
+    // CodeCompletionCallbacksImpl::doneParsing when we know we're not
+    // completing for a argument list pattern.
+    break;
+
   case CompletionKind::CaseStmtKeyword:
     addCaseStmtKeywords(Sink);
     break;
 
   case CompletionKind::PostfixExpr:
-  case CompletionKind::PostfixExprParen:
   case CompletionKind::CaseStmtBeginning:
   case CompletionKind::TypeIdentifierWithDot:
   case CompletionKind::TypeIdentifierWithoutDot:
@@ -6054,6 +6077,13 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
   case CompletionKind::AfterIfStmtElse:
     addKeyword(Sink, "if", CodeCompletionKeywordKind::kw_if);
     break;
+  case CompletionKind::ForEachPatternBeginning:
+    if (!llvm::is_contained(ParsedKeywords, "try"))
+      addKeyword(Sink, "try", CodeCompletionKeywordKind::kw_try);
+    if (!llvm::is_contained(ParsedKeywords, "await"))
+      addKeyword(Sink, "await", CodeCompletionKeywordKind::None);
+    addKeyword(Sink, "var", CodeCompletionKeywordKind::kw_var);
+    addKeyword(Sink, "case", CodeCompletionKeywordKind::kw_case);
   }
 }
 
@@ -6592,6 +6622,13 @@ void CodeCompletionCallbacksImpl::doneParsing() {
     if (isDynamicLookup(*ExprType))
       Lookup.setIsDynamicLookup();
     Lookup.getValueExprCompletions(*ExprType, ReferencedDecl.getDecl());
+    /// We set the type of ParsedExpr explicitly above. But we don't want an
+    /// unresolved type in our AST when we type check again for operator
+    /// completions. Remove the type of the ParsedExpr and see if we can come up
+    /// with something more useful based on the the full sequence expression.
+    if (ParsedExpr->getType()->is<UnresolvedType>()) {
+      ParsedExpr->setType(nullptr);
+    }
     Lookup.getOperatorCompletions(ParsedExpr, leadingSequenceExprs);
     Lookup.getPostfixKeywordCompletions(*ExprType, ParsedExpr);
     break;
@@ -6626,6 +6663,11 @@ void CodeCompletionCallbacksImpl::doneParsing() {
       Lookup.setExpectedTypes(ContextInfo.getPossibleTypes(),
                               ContextInfo.isImplicitSingleExpressionReturn());
       Lookup.setHaveLParen(false);
+
+      // Add any keywords that can be used in an argument expr position.
+      addSuperKeyword(CompletionContext.getResultSink());
+      addExprKeywords(CompletionContext.getResultSink());
+
       DoPostfixExprBeginning();
     }
     break;
@@ -6767,6 +6809,11 @@ void CodeCompletionCallbacksImpl::doneParsing() {
     if (shouldPerformGlobalCompletion) {
       Lookup.setExpectedTypes(ContextInfo.getPossibleTypes(),
                               ContextInfo.isImplicitSingleExpressionReturn());
+
+      // Add any keywords that can be used in an argument expr position.
+      addSuperKeyword(CompletionContext.getResultSink());
+      addExprKeywords(CompletionContext.getResultSink());
+
       DoPostfixExprBeginning();
     }
     break;
@@ -6944,6 +6991,7 @@ void CodeCompletionCallbacksImpl::doneParsing() {
   case CompletionKind::AfterIfStmtElse:
   case CompletionKind::CaseStmtKeyword:
   case CompletionKind::EffectsSpecifier:
+  case CompletionKind::ForEachPatternBeginning:
     // Handled earlier by keyword completions.
     break;
   }

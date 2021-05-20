@@ -3225,7 +3225,8 @@ public:
   /// subsequent solution would be worse than the best known solution.
   bool recordFix(ConstraintFix *fix, unsigned impact = 1);
 
-  void recordPotentialHole(Type type);
+  void recordPotentialHole(TypeVariableType *typeVar);
+  void recordAnyTypeVarAsPotentialHole(Type type);
 
   void recordMatchCallArgumentResult(ConstraintLocator *locator,
                                      MatchCallArgumentResult result);
@@ -4993,6 +4994,13 @@ public:
   /// diagnostic.
   void maybeProduceFallbackDiagnostic(SolutionApplicationTarget target) const;
 
+  /// Check whether given AST node represents an argument of an application
+  /// of some sort (call, operator invocation, subscript etc.)
+  /// and return AST node representing and argument index. E.g. for regular
+  /// calls `test(42)` passing `42` should return node representing
+  /// entire call and index `0`.
+  Optional<std::pair<Expr *, unsigned>> isArgumentExpr(Expr *expr);
+
   SWIFT_DEBUG_DUMP;
   SWIFT_DEBUG_DUMPER(dump(Expr *));
 
@@ -5261,17 +5269,9 @@ bool hasAppliedSelf(ConstraintSystem &cs, const OverloadChoice &choice);
 bool hasAppliedSelf(const OverloadChoice &choice,
                     llvm::function_ref<Type(Type)> getFixedType);
 
-/// Check whether type conforms to a given known protocol.
-bool conformsToKnownProtocol(DeclContext *dc, Type type,
-                             KnownProtocolKind protocol);
-
-/// Check whether given type conforms to `RawPepresentable` protocol
+/// Check whether given type conforms to `RawRepresentable` protocol
 /// and return witness type.
 Type isRawRepresentable(ConstraintSystem &cs, Type type);
-/// Check whether given type conforms to a specific known kind
-/// `RawPepresentable` protocol and return witness type.
-Type isRawRepresentable(ConstraintSystem &cs, Type type,
-                        KnownProtocolKind rawRepresentableProtocol);
 
 /// Compute the type that shall stand in for dynamic 'Self' in a member
 /// reference with a base of the given object type.
@@ -5301,7 +5301,20 @@ public:
 
   bool attempt(ConstraintSystem &cs) const;
 
-  bool isDisabled() const { return Choice->isDisabled(); }
+  bool isDisabled() const {
+    if (!Choice->isDisabled())
+      return false;
+
+    // If solver is in a diagnostic mode, let's allow
+    // constraints that have fixes or have been disabled
+    // in attempt to produce a solution faster for
+    // well-formed expressions.
+    if (CS.shouldAttemptFixes()) {
+      return !(hasFix() || Choice->isDisabledInPerformanceMode());
+    }
+
+    return true;
+  }
 
   bool hasFix() const {
     return bool(Choice->getFix());
@@ -5578,6 +5591,11 @@ Type getConcreteReplacementForProtocolSelfType(ValueDecl *member);
 /// Determine whether given disjunction constraint represents a set
 /// of operator overload choices.
 bool isOperatorDisjunction(Constraint *disjunction);
+
+/// Find out whether closure body has any `async` or `await` expressions,
+/// declarations, or statements directly in its body (no in other closures
+/// or nested declarations).
+ASTNode findAsyncNode(ClosureExpr *closure);
 
 } // end namespace constraints
 

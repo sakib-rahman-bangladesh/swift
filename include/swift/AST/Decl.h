@@ -423,7 +423,7 @@ protected:
     HasNestedTypeDeclarations : 1
   );
 
-  SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1+1+1,
+  SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl, 1+1+2+1+1+2+1,
     /// Whether we've computed the 'static' flag yet.
     IsStaticComputed : 1,
 
@@ -441,12 +441,6 @@ protected:
 
     /// Backing bits for 'self' access kind.
     SelfAccess : 2,
-
-    /// Whether we've computed the IsAsyncHandlerRequest.
-    IsAsyncHandlerComputed : 1,
-
-    /// The value of IsAsyncHandlerRequest.
-    IsAsyncHandler : 1,
 
     /// Whether this is a top-level function which should be treated
     /// as if it were in local context for the purposes of capture
@@ -588,7 +582,10 @@ protected:
     HasAnyUnavailableValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1,
+    /// If the module is compiled as static library.
+    StaticLibrary : 1,
+
     /// If the module was or is being compiled with `-enable-testing`.
     TestingEnabled : 1,
 
@@ -3778,9 +3775,8 @@ public:
   /// Get the closest-to-root superclass that's an actor class.
   const ClassDecl *getRootActorClass() const;
 
-  /// Does this class explicitly declare any of the methods that
-  /// would prevent it from being a default actor?
-  bool hasExplicitCustomActorMethods() const;
+  /// Fetch this class's unownedExecutor property, if it has one.
+  const VarDecl *getUnownedExecutorProperty() const;
 
   /// Is this the NSObject class type?
   bool isNSObject() const;
@@ -4006,6 +4002,7 @@ enum class KnownDerivableProtocolKind : uint8_t {
   Decodable,
   AdditiveArithmetic,
   Differentiable,
+  Actor,
 };
 
 /// ProtocolDecl - A declaration of a protocol, for example:
@@ -5846,15 +5843,8 @@ public:
   ///
   /// Functions that are an 'async' context can make calls to 'async' functions.
   bool isAsyncContext() const {
-    return hasAsync() || isAsyncHandler();
+    return hasAsync();
   }
-
-  /// Returns true if the function is an @asyncHandler.
-  bool isAsyncHandler() const;
-
-  /// Returns true if the function signature matches the form of an
-  /// @asyncHandler.
-  bool canBeAsyncHandler() const;
 
   /// Returns true if the function body throws.
   bool hasThrows() const { return Bits.AbstractFunctionDecl.Throws; }
@@ -6140,7 +6130,6 @@ class FuncDecl : public AbstractFunctionDecl {
   friend class SelfAccessKindRequest;
   friend class IsStaticRequest;
   friend class ResultTypeRequest;
-  friend class IsAsyncHandlerRequest;
 
   SourceLoc StaticLoc;  // Location of the 'static' token or invalid.
   SourceLoc FuncLoc;    // Location of the 'func' token.
@@ -6172,8 +6161,6 @@ protected:
     Bits.FuncDecl.SelfAccessComputed = false;
     Bits.FuncDecl.IsStaticComputed = false;
     Bits.FuncDecl.IsStatic = false;
-    Bits.FuncDecl.IsAsyncHandlerComputed = false;
-    Bits.FuncDecl.IsAsyncHandler = false;
     Bits.FuncDecl.HasTopLevelLocalContextCaptures = false;
   }
 
@@ -6202,18 +6189,6 @@ private:
       return Bits.FuncDecl.IsStatic;
 
     return None;
-  }
-
-  Optional<bool> getCachedIsAsyncHandler() const {
-    if (Bits.FuncDecl.IsAsyncHandlerComputed)
-      return Bits.FuncDecl.IsAsyncHandler;
-
-    return None;
-  }
-
-  void setIsAsyncHandler(bool value) {
-    Bits.FuncDecl.IsAsyncHandlerComputed = true;
-    Bits.FuncDecl.IsAsyncHandler = value;
   }
 
 public:

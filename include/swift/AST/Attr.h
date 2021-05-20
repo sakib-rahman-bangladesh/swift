@@ -162,10 +162,6 @@ protected:
       kind : NumInlineKindBits
     );
 
-    SWIFT_INLINE_BITFIELD(ActorIndependentAttr, DeclAttribute, NumActorIndependentKindBits,
-      kind : NumActorIndependentKindBits
-    );
-
     SWIFT_INLINE_BITFIELD(OptimizeAttr, DeclAttribute, NumOptimizationModeBits,
       mode : NumOptimizationModeBits
     );
@@ -743,6 +739,8 @@ public:
                          llvm::VersionTuple Obsoleted
                          = llvm::VersionTuple());
 
+  AvailableAttr *clone(ASTContext &C, bool implicit) const;
+
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_Available;
   }
@@ -1215,25 +1213,6 @@ public:
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_ReferenceOwnership;
-  }
-};
-
-/// Represents an actorIndependent/actorIndependent(unsafe) decl attribute.
-class ActorIndependentAttr : public DeclAttribute {
-public:
-  ActorIndependentAttr(SourceLoc atLoc, SourceRange range, ActorIndependentKind kind)
-      : DeclAttribute(DAK_ActorIndependent, atLoc, range, /*Implicit=*/false) {
-    Bits.ActorIndependentAttr.kind = unsigned(kind);
-  }
-
-  ActorIndependentAttr(ActorIndependentKind kind, bool IsImplicit=false)
-    : ActorIndependentAttr(SourceLoc(), SourceRange(), kind) {
-      setImplicit(IsImplicit);
-    }
-
-  ActorIndependentKind getKind() const { return ActorIndependentKind(Bits.ActorIndependentAttr.kind); }
-  static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_ActorIndependent;
   }
 };
 
@@ -2077,9 +2056,10 @@ public:
   CompletionHandlerAsyncAttr(AbstractFunctionDecl &asyncFunctionDecl,
                              size_t completionHandlerIndex,
                              SourceLoc completionHandlerIndexLoc,
-                             SourceLoc atLoc, SourceRange range)
+                             SourceLoc atLoc, SourceRange range,
+                             bool implicit)
       : DeclAttribute(DAK_CompletionHandlerAsync, atLoc, range,
-                      /*implicit*/ false),
+                      implicit),
         AsyncFunctionDecl(&asyncFunctionDecl) ,
         CompletionHandlerIndex(completionHandlerIndex),
         CompletionHandlerIndexLoc(completionHandlerIndexLoc) {}

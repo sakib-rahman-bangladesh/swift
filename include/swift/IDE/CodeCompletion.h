@@ -561,6 +561,7 @@ enum class CompletionKind {
   GenericRequirement,
   PrecedenceGroup,
   StmtLabel,
+  ForEachPatternBeginning,
 };
 
 /// A single code completion result.
@@ -613,6 +614,7 @@ private:
   unsigned AssociatedKind : 8;
   unsigned KnownOperatorKind : 6;
   unsigned SemanticContext : 3;
+  unsigned IsArgumentLabels : 1;
   unsigned NotRecommended : 4;
   unsigned IsSystem : 1;
 
@@ -637,7 +639,7 @@ public:
   ///
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(ResultKind Kind, SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        ExpectedTypeRelation TypeDistance,
                        CodeCompletionOperatorKind KnownOperatorKind =
@@ -645,6 +647,7 @@ public:
                        StringRef BriefDocComment = StringRef())
       : Kind(Kind), KnownOperatorKind(unsigned(KnownOperatorKind)),
         SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
         NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         BriefDocComment(BriefDocComment), TypeDistance(TypeDistance) {
@@ -664,12 +667,13 @@ public:
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(CodeCompletionKeywordKind Kind,
                        SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        ExpectedTypeRelation TypeDistance,
                        StringRef BriefDocComment = StringRef())
       : Kind(Keyword), KnownOperatorKind(0),
         SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
         NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         BriefDocComment(BriefDocComment), TypeDistance(TypeDistance) {
@@ -683,11 +687,12 @@ public:
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(CodeCompletionLiteralKind LiteralKind,
                        SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        ExpectedTypeRelation TypeDistance)
       : Kind(Literal), KnownOperatorKind(0),
         SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
         NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         TypeDistance(TypeDistance) {
@@ -702,7 +707,7 @@ public:
   /// arguments outlive this result, typically by storing them in the same
   /// \c CodeCompletionResultSink as the result itself.
   CodeCompletionResult(SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        const Decl *AssociatedDecl, StringRef ModuleName,
                        CodeCompletionResult::NotRecommendedReason NotRecReason,
@@ -712,6 +717,7 @@ public:
                        enum ExpectedTypeRelation TypeDistance)
       : Kind(ResultKind::Declaration), KnownOperatorKind(0),
         SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
         NotRecommended(unsigned(NotRecReason)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         ModuleName(ModuleName), BriefDocComment(BriefDocComment),
@@ -728,9 +734,9 @@ public:
            getOperatorKind() != CodeCompletionOperatorKind::None);
   }
 
-  // FIXME:
+  // Used by deserialization.
   CodeCompletionResult(SemanticContextKind SemanticContext,
-                       unsigned NumBytesToErase,
+                       bool IsArgumentLabels, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        CodeCompletionDeclKind DeclKind, bool IsSystem,
                        StringRef ModuleName,
@@ -743,6 +749,7 @@ public:
       : Kind(ResultKind::Declaration),
         KnownOperatorKind(unsigned(KnownOperatorKind)),
         SemanticContext(unsigned(SemanticContext)),
+        IsArgumentLabels(unsigned(IsArgumentLabels)),
         NotRecommended(unsigned(NotRecReason)), IsSystem(IsSystem),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         ModuleName(ModuleName), BriefDocComment(BriefDocComment),
@@ -805,6 +812,10 @@ public:
     return static_cast<SemanticContextKind>(SemanticContext);
   }
 
+  bool isArgumentLabels() const {
+    return static_cast<bool>(IsArgumentLabels);
+  }
+
   bool isNotRecommended() const {
     return getNotRecommendedReason() != NotRecommendedReason::None;
   }
@@ -855,6 +866,9 @@ struct CodeCompletionResultSink {
 
   /// Whether to annotate the results with XML.
   bool annotateResult = false;
+
+  /// Whether to emit object literals if desired.
+  bool includeObjectLiterals = true;
 
   std::vector<CodeCompletionResult *> Results;
 
@@ -926,6 +940,11 @@ public:
 
   void setAnnotateResult(bool flag) { CurrentResults.annotateResult = flag; }
   bool getAnnotateResult() { return CurrentResults.annotateResult; }
+
+  void setIncludeObjectLiterals(bool flag) {
+    CurrentResults.includeObjectLiterals = flag;
+  }
+  bool includeObjectLiterals() { return CurrentResults.includeObjectLiterals; }
 
   /// Allocate a string owned by the code completion context.
   StringRef copyString(StringRef Str);

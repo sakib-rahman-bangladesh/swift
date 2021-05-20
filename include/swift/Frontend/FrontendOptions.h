@@ -81,8 +81,15 @@ public:
   /// binary module has already been built for use by the compiler.
   std::string PrebuiltModuleCachePath;
 
+  /// The path to look in to find backup .swiftinterface files if those found
+  /// from SDKs are failing.
+  std::string BackupModuleInterfaceDir;
+
   /// For these modules, we should prefer using Swift interface when importing them.
   std::vector<std::string> PreferInterfaceForModules;
+
+  /// User-defined module version number.
+  llvm::VersionTuple UserModuleVersion;
 
   /// Emit index data for imported serialized swift system modules.
   bool IndexSystemModules = false;
@@ -310,6 +317,9 @@ public:
   /// are errors. The resulting serialized AST may include errors types and
   /// skip nodes entirely, depending on the errors involved.
   bool AllowModuleWithCompilerErrors = false;
+
+  /// True if the "-static" option is set.
+  bool Static = false;
 
   /// The different modes for validating TBD against the LLVM IR.
   enum class TBDValidationMode {

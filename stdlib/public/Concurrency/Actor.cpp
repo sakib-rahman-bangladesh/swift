@@ -17,7 +17,16 @@
 
 #include "swift/Runtime/Concurrency.h"
 
+#ifdef _WIN32
+// On Windows, an include below triggers an indirect include of minwindef.h
+// which contains a definition of the `max` macro, generating an error in our
+// use of std::max in this file. This define prevents those macros from being
+// defined.
+#define NOMINMAX
+#endif
+
 #include "../CompatibilityOverride/CompatibilityOverride.h"
+#include "../runtime/ThreadLocalStorage.h"
 #include "swift/Runtime/Atomic.h"
 #include "swift/Runtime/Casting.h"
 #include "swift/Runtime/Once.h"
@@ -25,6 +34,7 @@
 #include "swift/Runtime/ThreadLocal.h"
 #include "swift/ABI/Task.h"
 #include "swift/ABI/Actor.h"
+#include "llvm/Config/config.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "TaskPrivate.h"
 
@@ -54,12 +64,22 @@
 
 #if HAVE_PTHREAD_H
 #include <pthread.h>
+
+// Only use __has_include since HAVE_PTHREAD_NP_H is not provided.
+#if __has_include(<pthread_np.h>)
+#include <pthread_np.h>
+#endif
 #endif
 
 #if defined(_WIN32)
 #include <io.h>
 #include <handleapi.h>
 #include <processthreadsapi.h>
+#endif
+
+#if SWIFT_OBJC_INTEROP
+extern "C" void *objc_autoreleasePoolPush();
+extern "C" void objc_autoreleasePoolPop(void *);
 #endif
 
 using namespace swift;
@@ -175,6 +195,17 @@ public:
   }
 };
 
+#ifdef SWIFT_TLS_HAS_RESERVED_PTHREAD_SPECIFIC
+class ActiveTask {
+public:
+  static void set(AsyncTask *task) {
+    SWIFT_THREAD_SETSPECIFIC(SWIFT_CONCURRENCY_TASK_KEY, task);
+  }
+  static AsyncTask *get() {
+    return (AsyncTask *)SWIFT_THREAD_GETSPECIFIC(SWIFT_CONCURRENCY_TASK_KEY);
+  }
+};
+#else
 class ActiveTask {
   /// A thread-local variable pointing to the active tracking
   /// information about the current thread, if any.
@@ -187,16 +218,21 @@ public:
 
 /// Define the thread-locals.
 SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(
-  Pointer<ExecutorTrackingInfo>,
-  ExecutorTrackingInfo::ActiveInfoInThread);
-SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(
   Pointer<AsyncTask>,
   ActiveTask::Value);
+#endif
+SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(
+  Pointer<ExecutorTrackingInfo>,
+  ExecutorTrackingInfo::ActiveInfoInThread);
 
 } // end anonymous namespace
 
 void swift::runJobInEstablishedExecutorContext(Job *job) {
   _swift_tsan_acquire(job);
+
+#if SWIFT_OBJC_INTEROP
+  auto pool = objc_autoreleasePoolPush();
+#endif
 
   if (auto task = dyn_cast<AsyncTask>(job)) {
     // Update the active task in the current thread.
@@ -215,6 +251,10 @@ void swift::runJobInEstablishedExecutorContext(Job *job) {
     // There's no extra bookkeeping to do for simple jobs.
     job->runSimpleInFullyEstablishedContext();
   }
+
+#if SWIFT_OBJC_INTEROP
+  objc_autoreleasePoolPop(pool);
+#endif
 
   _swift_tsan_release(job);
 }
@@ -280,7 +320,8 @@ static bool swift_task_isCurrentExecutorImpl(ExecutorRef executor) {
     return currentTracking->getActiveExecutor() == executor;
   }
 
-  return executor.isMainExecutor() && isExecutingOnMainThread();
+  return executor == _swift_task_getMainExecutor()
+      && isExecutingOnMainThread();
 }
 
 /// Logging level for unexpected executors:
@@ -323,7 +364,7 @@ void swift::swift_task_reportUnexpectedExecutor(
 
   const char *functionIsolation;
   const char *whereExpected;
-  if (executor.isMainExecutor()) {
+  if (executor == _swift_task_getMainExecutor()) {
     functionIsolation = "@MainActor function";
     whereExpected = "the main thread";
   } else {
@@ -1442,6 +1483,7 @@ static void swift_job_runImpl(Job *job, ExecutorRef executor) {
 ///                     the actor lives for the duration of job execution.
 ///                     Note that this may conflict with the retain/release
 ///                     design in the DefaultActorImpl, but it does fix bugs!
+SWIFT_CC(swiftasync)
 static void processDefaultActor(DefaultActorImpl *currentActor,
                                 RunningJobInfo runner) {
 #if SWIFT_TASK_PRINTF_DEBUG
@@ -1516,6 +1558,7 @@ static void processDefaultActor(DefaultActorImpl *currentActor,
   swift_release(actor);
 }
 
+SWIFT_CC(swiftasync)
 void ProcessInlineJob::process(Job *job) {
   DefaultActorImpl *actor = DefaultActorImpl::fromInlineJob(job);
 
@@ -1524,11 +1567,11 @@ void ProcessInlineJob::process(Job *job) {
   auto targetPriority = job->getPriority();
   auto runner = RunningJobInfo::forInline(targetPriority);
 
-  // FIXME: force tail call
   swift_retain(actor);
-  return processDefaultActor(actor, runner);
+  return processDefaultActor(actor, runner); // 'return' forces tail call
 }
 
+SWIFT_CC(swiftasync)
 void ProcessOutOfLineJob::process(Job *job) {
   auto self = cast<ProcessOutOfLineJob>(job);
   DefaultActorImpl *actor = self->Actor;
@@ -1540,11 +1583,11 @@ void ProcessOutOfLineJob::process(Job *job) {
 
   delete self;
 
-  // FIXME: force tail call
   swift_retain(actor);
-  return processDefaultActor(actor, runner);
+  return processDefaultActor(actor, runner); // 'return' forces tail call
 }
 
+SWIFT_CC(swiftasync)
 void ProcessOverrideJob::process(Job *job) {
   auto self = cast<ProcessOverrideJob>(job);
 
@@ -1552,9 +1595,8 @@ void ProcessOverrideJob::process(Job *job) {
   auto actor = self->Actor;
   auto runner = RunningJobInfo::forOverride(self);
 
-  // FIXME: force tail call
   swift_retain(actor);
-  return processDefaultActor(actor, runner);
+  return processDefaultActor(actor, runner); // 'return' forces tail call
 }
 
 void DefaultActorImpl::enqueue(Job *job) {
@@ -1698,18 +1740,6 @@ void swift::swift_defaultActor_deallocateResilient(HeapObject *actor) {
                       metadata->getInstanceAlignMask());
 }
 
-/// FIXME: only exists for the quick-and-dirty MainActor implementation.
-namespace swift {
-  Metadata* MainActorMetadata = nullptr;
-}
-
-/// FIXME: only exists for the quick-and-dirty MainActor implementation.
-void swift::swift_MainActor_register(HeapObject *actor) {
-  assert(actor);
-  MainActorMetadata = const_cast<Metadata*>(swift_getObjectType(actor));
-  assert(MainActorMetadata);
-}
-
 /*****************************************************************************/
 /****************************** ACTOR SWITCHING ******************************/
 /*****************************************************************************/
@@ -1783,8 +1813,7 @@ static void runOnAssumedThread(AsyncTask *task, ExecutorRef executor,
   if (oldTracking) {
     oldTracking->setActiveExecutor(executor);
 
-    // FIXME: force tail call
-    return task->runInFullyEstablishedContext();
+    return task->runInFullyEstablishedContext(); // 'return' forces tail call
   }
 
   // Otherwise, set up tracking info.
@@ -1827,8 +1856,7 @@ static void swift_task_switchImpl(SWIFT_ASYNC_CONTEXT AsyncContext *resumeContex
   // we can just immediately continue running with the resume function
   // we were passed in.
   if (!currentExecutor.mustSwitchToRun(newExecutor)) {
-    // FIXME: force tail call
-    return resumeFunction(resumeContext);
+    return resumeFunction(resumeContext); // 'return' forces tail call
   }
 
   auto task = swift_task_getCurrent();
@@ -1852,7 +1880,7 @@ static void swift_task_switchImpl(SWIFT_ASYNC_CONTEXT AsyncContext *resumeContex
     fprintf(stderr, "[%p] switch succeeded, task %p assumed thread for executor %p\n", pthread_self(), task, newExecutor.getIdentity());
 #endif
     giveUpThreadForSwitch(currentExecutor, runner);
-    // FIXME: force tail call
+    // 'return' forces tail call
     return runOnAssumedThread(task, newExecutor, trackingInfo, runner);
   }
 
@@ -1868,6 +1896,14 @@ static void swift_task_switchImpl(SWIFT_ASYNC_CONTEXT AsyncContext *resumeContex
 /************************* GENERIC ACTOR INTERFACES **************************/
 /*****************************************************************************/
 
+// Implemented in Swift to avoid some annoying hard-coding about
+// SerialExecutor's protocol witness table.  We could inline this
+// with effort, though.
+extern "C" SWIFT_CC(swift)
+void _swift_task_enqueueOnExecutor(Job *job, HeapObject *executor,
+                                   const Metadata *selfType,
+                                   const SerialExecutorWitnessTable *wtable);
+
 SWIFT_CC(swift)
 static void swift_task_enqueueImpl(Job *job, ExecutorRef executor) {
 #if SWIFT_TASK_PRINTF_DEBUG
@@ -1881,16 +1917,13 @@ static void swift_task_enqueueImpl(Job *job, ExecutorRef executor) {
   if (executor.isGeneric())
     return swift_task_enqueueGlobal(job);
 
-  /// FIXME: only exists for the quick-and-dirty MainActor implementation.
-  if (executor.isMainExecutor())
-    return swift_task_enqueueMainExecutor(job);
-
   if (executor.isDefaultActor())
     return asImpl(executor.getDefaultActor())->enqueue(job);
 
-  // Just assume it's actually a default actor that we haven't tagged
-  // properly.
-  swift_unreachable("unexpected or corrupt executor reference");
+  auto wtable = executor.getSerialExecutorWitnessTable();
+  auto executorObject = executor.getIdentity();
+  auto executorType = swift_getObjectType(executorObject);
+  _swift_task_enqueueOnExecutor(job, executorObject, executorType, wtable);
 }
 
 #define OVERRIDE_ACTOR COMPATIBILITY_OVERRIDE

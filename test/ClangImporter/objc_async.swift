@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -I %S/Inputs/custom-modules -enable-experimental-concurrency -enable-experimental-async-handler %s -verify
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -I %S/Inputs/custom-modules -enable-experimental-concurrency %s -verify
 
 // REQUIRES: objc_interop
 // REQUIRES: concurrency
@@ -121,10 +121,6 @@ actor MySubclassCheckingSwiftAttributes : ProtocolWithSwiftAttributes {
     syncMethod() // expected-error{{ctor-isolated instance method 'syncMethod()' can not be referenced from a non-isolated context}}
   }
 
-  func asyncHandlerMethod() {
-    await globalAsync() // okay because we infer @asyncHandler from the protocol
-  }
-
   func mainActorMethod() {
     syncMethod() // expected-error{{actor-isolated instance method 'syncMethod()' can not be referenced from synchronous context of global actor 'MainActor'}}
   }
@@ -163,4 +159,11 @@ class MyButton : NXButton {
 
 func testButtons(mb: MyButton) {
   mb.onButtonPress()
+}
+
+
+func testMirrored(instance: ClassWithAsync) async {
+  await instance.instanceAsync()
+  await instance.protocolMethod()
+  await instance.customAsyncName()
 }

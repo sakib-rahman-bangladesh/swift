@@ -961,10 +961,25 @@ void Serializer::writeHeader(const SerializationOptions &options) {
     size_t compatibilityVersionStringLength =
         versionString.tell() - shortVersionStringLength - 1;
     versionString << ")/" << version::getSwiftFullVersion();
+    auto userModuleMajor = options.UserModuleVersion.getMajor();
+    auto userModuleMinor = 0;
+    if (auto minor = options.UserModuleVersion.getMinor()) {
+      userModuleMinor = *minor;
+    }
+    auto userModuleSubminor = 0;
+    if (auto subMinor = options.UserModuleVersion.getSubminor()) {
+      userModuleSubminor = *subMinor;
+    }
+    auto userModuleBuild = 0;
+    if (auto build = options.UserModuleVersion.getBuild()) {
+      userModuleBuild = *build;
+    }
     Metadata.emit(ScratchRecord,
                   SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR,
                   shortVersionStringLength,
                   compatibilityVersionStringLength,
+                  userModuleMajor, userModuleMinor,
+                  userModuleSubminor, userModuleBuild,
                   versionString.str());
 
     Target.emit(ScratchRecord, M->getASTContext().LangOpts.Target.str());
@@ -974,6 +989,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
 
       options_block::IsSIBLayout IsSIB(Out);
       IsSIB.emit(ScratchRecord, options.IsSIB);
+
+      if (options.StaticLibrary) {
+        options_block::IsStaticLibraryLayout IsStaticLibrary(Out);
+        IsStaticLibrary.emit(ScratchRecord);
+      }
 
       if (M->isTestingEnabled()) {
         options_block::IsTestableLayout IsTestable(Out);
@@ -2384,14 +2404,6 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       return;
     }
 
-    case DAK_ActorIndependent: {
-      auto *theAttr = cast<ActorIndependentAttr>(DA);
-      auto abbrCode = S.DeclTypeAbbrCodes[ActorIndependentDeclAttrLayout::Code];
-      ActorIndependentDeclAttrLayout::emitRecord(S.Out, S.ScratchRecord,
-                                        abbrCode, (unsigned)theAttr->getKind());
-      return;
-    }
-
     case DAK_Optimize: {
       auto *theAttr = cast<OptimizeAttr>(DA);
       auto abbrCode = S.DeclTypeAbbrCodes[OptimizeDeclAttrLayout::Code];
@@ -2633,8 +2645,8 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       auto asyncFuncDeclID = S.addDeclRef(attr->AsyncFunctionDecl);
 
       CompletionHandlerAsyncDeclAttrLayout::emitRecord(
-          S.Out, S.ScratchRecord, abbrCode, attr->CompletionHandlerIndex,
-          asyncFuncDeclID);
+          S.Out, S.ScratchRecord, abbrCode, attr->isImplicit(),
+          attr->CompletionHandlerIndex, asyncFuncDeclID);
       return;
     }
     }
@@ -3066,10 +3078,7 @@ public:
 
     SmallVector<TypeID, 8> inheritedAndDependencyTypes;
     for (auto inherited : extension->getInherited()) {
-      if (extension->getASTContext().LangOpts.AllowModuleWithCompilerErrors &&
-          !inherited.getType())
-        continue;
-      assert(!inherited.getType()->hasArchetype());
+      assert(!inherited.getType() || !inherited.getType()->hasArchetype());
       inheritedAndDependencyTypes.push_back(S.addTypeRef(inherited.getType()));
     }
     size_t numInherited = inheritedAndDependencyTypes.size();
@@ -3307,7 +3316,7 @@ public:
 
     SmallVector<TypeID, 4> inheritedAndDependencyTypes;
     for (auto inherited : theStruct->getInherited()) {
-      assert(!inherited.getType()->hasArchetype());
+      assert(!inherited.getType() || !inherited.getType()->hasArchetype());
       inheritedAndDependencyTypes.push_back(S.addTypeRef(inherited.getType()));
     }
 
@@ -3352,7 +3361,7 @@ public:
 
     SmallVector<TypeID, 4> inheritedAndDependencyTypes;
     for (auto inherited : theEnum->getInherited()) {
-      assert(!inherited.getType()->hasArchetype());
+      assert(!inherited.getType() || !inherited.getType()->hasArchetype());
       inheritedAndDependencyTypes.push_back(S.addTypeRef(inherited.getType()));
     }
 
@@ -3410,7 +3419,7 @@ public:
 
     SmallVector<TypeID, 4> inheritedAndDependencyTypes;
     for (auto inherited : theClass->getInherited()) {
-      assert(!inherited.getType()->hasArchetype());
+      assert(!inherited.getType() || !inherited.getType()->hasArchetype());
       inheritedAndDependencyTypes.push_back(S.addTypeRef(inherited.getType()));
     }
 
@@ -3468,10 +3477,11 @@ public:
     llvm::SmallSetVector<Type, 4> dependencyTypes;
 
     for (auto element : proto->getInherited()) {
-      assert(!element.getType()->hasArchetype());
-      inheritedAndDependencyTypes.push_back(S.addTypeRef(element.getType()));
-      if (element.getType()->is<ProtocolType>())
-        dependencyTypes.insert(element.getType());
+      auto elementType = element.getType();
+      assert(!elementType || !elementType->hasArchetype());
+      inheritedAndDependencyTypes.push_back(S.addTypeRef(elementType));
+      if (elementType && elementType->is<ProtocolType>())
+        dependencyTypes.insert(elementType);
     }
 
     for (Requirement req : proto->getRequirementSignature()) {

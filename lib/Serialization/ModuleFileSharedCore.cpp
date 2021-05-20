@@ -131,6 +131,9 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
       options_block::IsSIBLayout::readRecord(scratch, IsSIB);
       extendedInfo.setIsSIB(IsSIB);
       break;
+    case options_block::IS_STATIC_LIBRARY:
+      extendedInfo.setIsStaticLibrary(true);
+      break;
     case options_block::IS_TESTABLE:
       extendedInfo.setIsTestable(true);
       break;
@@ -251,7 +254,24 @@ validateControlBlock(llvm::BitstreamCursor &cursor,
       // These fields were added later; be resilient against their absence.
       switch (scratch.size()) {
       default:
-        // Add new cases here, in descending order.
+      // Add new cases here, in descending order.
+      case 8:
+      case 7:
+      case 6:
+      case 5: {
+        auto subMinor = 0;
+        auto build = 0;
+        // case 7 and 8 were added after case 5 and 6, so we need to have this
+        // special handling to make sure we can still load the module without
+        // case 7 and case 8 successfully.
+        if (scratch.size() >= 8) {
+          subMinor = scratch[6];
+          build = scratch[7];
+        }
+        result.userModuleVersion = llvm::VersionTuple(scratch[4], scratch[5],
+                                                      subMinor, build);
+        LLVM_FALLTHROUGH;
+      }
       case 4:
         if (scratch[3] != 0) {
           result.compatibilityVersion =
@@ -1172,8 +1192,10 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       Name = info.name;
       TargetTriple = info.targetTriple;
       CompatibilityVersion = info.compatibilityVersion;
+      UserModuleVersion = info.userModuleVersion;
       Bits.ArePrivateImportsEnabled = extInfo.arePrivateImportsEnabled();
       Bits.IsSIB = extInfo.isSIB();
+      Bits.IsStaticLibrary = extInfo.isStaticLibrary();
       Bits.IsTestable = extInfo.isTestable();
       Bits.ResilienceStrategy = unsigned(extInfo.getResilienceStrategy());
       Bits.IsImplicitDynamicEnabled = extInfo.isImplicitDynamicEnabled();
@@ -1489,4 +1511,8 @@ ModuleFileSharedCore::ModuleFileSharedCore(
     info.status = error(Status::MalformedDocumentation);
     return;
   }
+}
+
+bool ModuleFileSharedCore::hasSourceInfo() const {
+  return !!DeclUSRsTable;
 }

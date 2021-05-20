@@ -610,7 +610,8 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   SwiftTaskTy = createStructType(*this, "swift.task", {
     RefCountedStructTy,   // object header
     Int8PtrTy, Int8PtrTy, // Job.SchedulerPrivate
-    SizeTy,               // Job.Flags
+    Int32Ty,              // Job.Flags
+    Int32Ty,              // Job.ID
     FunctionPtrTy,        // Job.RunJob/Job.ResumeTask
     SwiftContextPtrTy,    // Task.ResumeContext
     IntPtrTy              // Task.Status
@@ -620,7 +621,7 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   SwiftTaskPtrTy = SwiftTaskTy->getPointerTo(DefaultAS);
   SwiftAsyncLetPtrTy = Int8PtrTy; // we pass it opaquely (AsyncLet*)
   SwiftTaskGroupPtrTy = Int8PtrTy; // we pass it opaquely (TaskGroup*)
-  ExecutorFirstTy = RefCountedPtrTy;
+  ExecutorFirstTy = SizeTy;
   ExecutorSecondTy = SizeTy;
   SwiftExecutorTy = createStructType(*this, "swift.executor", {
     ExecutorFirstTy,      // identity
@@ -629,7 +630,8 @@ IRGenModule::IRGenModule(IRGenerator &irgen,
   SwiftJobTy = createStructType(*this, "swift.job", {
     RefCountedStructTy,   // object header
     Int8PtrTy, Int8PtrTy, // SchedulerPrivate
-    SizeTy,               // flags
+    Int32Ty,              // flags
+    Int32Ty,              // ID
     FunctionPtrTy,        // RunJob/ResumeTask
   });
   SwiftJobPtrTy = SwiftJobTy->getPointerTo(DefaultAS);

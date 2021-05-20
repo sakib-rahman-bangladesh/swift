@@ -4284,14 +4284,6 @@ llvm::Error DeclDeserializer::deserializeDeclCommon() {
         break;
       }
 
-      case decls_block::ActorIndependent_DECL_ATTR: {
-        unsigned kind;
-        serialization::decls_block::ActorIndependentDeclAttrLayout::readRecord(
-            scratch, kind);
-        Attr = new (ctx) ActorIndependentAttr((ActorIndependentKind)kind);
-        break;
-      }
-
       case decls_block::Optimize_DECL_ATTR: {
         unsigned kind;
         serialization::decls_block::OptimizeDeclAttrLayout::readRecord(
@@ -4639,16 +4631,17 @@ llvm::Error DeclDeserializer::deserializeDeclCommon() {
       }
 
       case decls_block::CompletionHandlerAsync_DECL_ATTR: {
+        bool isImplicit;
         uint64_t handlerIndex;
         uint64_t asyncFunctionDeclID;
         serialization::decls_block::CompletionHandlerAsyncDeclAttrLayout::
-            readRecord(scratch, handlerIndex, asyncFunctionDeclID);
+            readRecord(scratch, isImplicit, handlerIndex, asyncFunctionDeclID);
 
         auto mappedFunctionDecl =
             cast<AbstractFunctionDecl>(MF.getDecl(asyncFunctionDeclID));
         Attr = new (ctx) CompletionHandlerAsyncAttr(
             *mappedFunctionDecl, handlerIndex, /*handlerIndexLoc*/ SourceLoc(),
-            /*atLoc*/ SourceLoc(), /*range*/ SourceRange());
+            /*atLoc*/ SourceLoc(), /*range*/ SourceRange(), isImplicit);
         break;
       }
 

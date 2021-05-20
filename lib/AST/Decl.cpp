@@ -5153,6 +5153,8 @@ Optional<KnownDerivableProtocolKind>
     return KnownDerivableProtocolKind::AdditiveArithmetic;
   case KnownProtocolKind::Differentiable:
     return KnownDerivableProtocolKind::Differentiable;
+  case KnownProtocolKind::Actor:
+    return KnownDerivableProtocolKind::Actor;
   default: return None;
   }
 }
@@ -5876,7 +5878,7 @@ bool VarDecl::isMemberwiseInitialized(bool preferDeclaredProperties) const {
 }
 
 bool VarDecl::isAsyncLet() const {
-  return getAttrs().hasAttribute<AsyncAttr>();
+  return getAttrs().hasAttribute<AsyncAttr>() || getAttrs().hasAttribute<SpawnAttr>();
 }
 
 void ParamDecl::setSpecifier(Specifier specifier) {
@@ -5934,17 +5936,33 @@ llvm::TinyPtrVector<CustomAttr *> VarDecl::getAttachedPropertyWrappers() const {
 
 /// Whether this property has any attached property wrappers.
 bool VarDecl::hasAttachedPropertyWrapper() const {
-  return !getAttachedPropertyWrappers().empty() || hasImplicitPropertyWrapper();
+  if (getAttrs().hasAttribute<CustomAttr>()) {
+    if (!getAttachedPropertyWrappers().empty())
+      return true;
+  }
+
+  if (hasImplicitPropertyWrapper())
+    return true;
+
+  return false;
 }
 
 bool VarDecl::hasImplicitPropertyWrapper() const {
-  if (!getAttachedPropertyWrappers().empty())
+  if (getAttrs().hasAttribute<CustomAttr>()) {
+    if (!getAttachedPropertyWrappers().empty())
+      return false;
+  }
+
+  if (isImplicit())
     return false;
 
-  auto *dc = getDeclContext();
-  bool isClosureParam = isa<ParamDecl>(this) &&
-      dc->getContextKind() == DeclContextKind::AbstractClosureExpr;
-  return !isImplicit() && getName().hasDollarPrefix() && isClosureParam;
+  if (!isa<ParamDecl>(this))
+    return false;
+
+  if (!isa<AbstractClosureExpr>(getDeclContext()))
+    return false;
+
+  return getName().hasDollarPrefix();
 }
 
 bool VarDecl::hasExternalPropertyWrapper() const {
@@ -6937,28 +6955,6 @@ bool AbstractFunctionDecl::argumentNameIsAPIByDefault() const {
 
 bool AbstractFunctionDecl::isSendable() const {
   return getAttrs().hasAttribute<SendableAttr>();
-}
-
-bool AbstractFunctionDecl::isAsyncHandler() const {
-  auto func = dyn_cast<FuncDecl>(this);
-  if (!func)
-    return false;
-
-  auto mutableFunc = const_cast<FuncDecl *>(func);
-  return evaluateOrDefault(getASTContext().evaluator,
-                           IsAsyncHandlerRequest{mutableFunc},
-                           false);
-}
-
-bool AbstractFunctionDecl::canBeAsyncHandler() const {
-  auto func = dyn_cast<FuncDecl>(this);
-  if (!func)
-    return false;
-
-  auto mutableFunc = const_cast<FuncDecl *>(func);
-  return evaluateOrDefault(getASTContext().evaluator,
-                           CanBeAsyncHandlerRequest{mutableFunc},
-                           false);
 }
 
 BraceStmt *AbstractFunctionDecl::getBody(bool canSynthesize) const {
@@ -8087,12 +8083,43 @@ Type TypeBase::getSwiftNewtypeUnderlyingType() {
   return {};
 }
 
-bool ClassDecl::hasExplicitCustomActorMethods() const {
-  return false;
+const VarDecl *ClassDecl::getUnownedExecutorProperty() const {
+  auto &ctx = getASTContext();
+
+  auto hasUnownedSerialExecutorType = [&](VarDecl *property) {
+    if (auto type = property->getInterfaceType())
+      if (auto td = type->getAnyNominal())
+        if (td == ctx.getUnownedSerialExecutorDecl())
+          return true;
+    return false;
+  };
+
+  VarDecl *candidate = nullptr;
+  for (auto member: getMembers()) {
+    // Instance properties called unownedExecutor.
+    if (auto property = dyn_cast<VarDecl>(member)) {
+      if (property->getName() == ctx.Id_unownedExecutor &&
+          !property->isStatic()) {
+        if (!candidate) {
+          candidate = property;
+          continue;
+        }
+
+        bool oldHasRightType = hasUnownedSerialExecutorType(candidate);
+        if (oldHasRightType == hasUnownedSerialExecutorType(property)) {
+          // just ignore the new property, we should diagnose this eventually
+        } else if (!oldHasRightType) {
+          candidate = property;
+        }
+      }
+    }
+  }
+
+  return candidate;
 }
 
 bool ClassDecl::isRootDefaultActor() const {
-  return isRootDefaultActor(getModuleContext(), ResilienceExpansion::Minimal);
+  return isRootDefaultActor(getModuleContext(), ResilienceExpansion::Maximal);
 }
 
 bool ClassDecl::isRootDefaultActor(ModuleDecl *M,

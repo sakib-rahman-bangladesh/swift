@@ -166,7 +166,9 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  virtual bool canImportModule(ImportPath::Element named) override;
+  virtual bool canImportModule(ImportPath::Element named,
+                               llvm::VersionTuple version,
+                               bool underlyingVersion) override;
 
   /// Import a module with the given module path.
   ///
@@ -248,7 +250,13 @@ public:
 /// Imports serialized Swift modules from a MemoryBuffer into an ASTContext.
 /// This interface is primarily used by LLDB.
 class MemoryBufferSerializedModuleLoader : public SerializedModuleLoaderBase {
-  llvm::StringMap<std::unique_ptr<llvm::MemoryBuffer>> MemoryBuffers;
+
+  struct MemoryBufferInfo {
+    std::unique_ptr<llvm::MemoryBuffer> buffer;
+    llvm::VersionTuple userVersion;
+  };
+
+  llvm::StringMap<MemoryBufferInfo> MemoryBuffers;
 
   MemoryBufferSerializedModuleLoader(ASTContext &ctx,
                                      DependencyTracker *tracker,
@@ -274,7 +282,8 @@ class MemoryBufferSerializedModuleLoader : public SerializedModuleLoaderBase {
 public:
   virtual ~MemoryBufferSerializedModuleLoader();
 
-  bool canImportModule(ImportPath::Element named) override;
+  bool canImportModule(ImportPath::Element named, llvm::VersionTuple version,
+                       bool underlyingVersion) override;
   ModuleDecl *
   loadModule(SourceLoc importLoc,
              ImportPath::Module path) override;
@@ -286,8 +295,9 @@ public:
   ///
   /// FIXME: make this an actual import *path* once submodules are designed.
   void registerMemoryBuffer(StringRef importPath,
-                            std::unique_ptr<llvm::MemoryBuffer> input) {
-    MemoryBuffers[importPath] = std::move(input);
+                            std::unique_ptr<llvm::MemoryBuffer> input,
+                            llvm::VersionTuple version) {
+    MemoryBuffers[importPath] = {std::move(input), version};
   }
 
   void collectVisibleTopLevelModuleNames(
@@ -433,7 +443,7 @@ public:
 
   virtual StringRef getModuleDefiningPath() const override;
 
-  Decl *getMainDecl() const override;
+  ValueDecl *getMainDecl() const override;
 
   bool hasEntryPoint() const override;
 
@@ -458,7 +468,12 @@ public:
   }
 };
 
+/// Extract compiler arguments from an interface file buffer.
+bool extractCompilerFlagsFromInterface(StringRef buffer, llvm::StringSaver &ArgSaver,
+                                       SmallVectorImpl<const char *> &SubArgs);
 
+/// Extract the user module version number from an interface file.
+llvm::VersionTuple extractUserModuleVersionFromInterface(StringRef moduleInterfacePath);
 } // end namespace swift
 
 #endif

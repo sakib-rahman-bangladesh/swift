@@ -475,6 +475,7 @@ ModuleDecl::ModuleDecl(Identifier name, ASTContext &ctx,
 
   setAccess(AccessLevel::Public);
 
+  Bits.ModuleDecl.StaticLibrary = 0;
   Bits.ModuleDecl.TestingEnabled = 0;
   Bits.ModuleDecl.FailedToLoad = 0;
   Bits.ModuleDecl.RawResilienceStrategy = 0;
@@ -1422,7 +1423,7 @@ bool ModuleDecl::isBuiltinModule() const {
   return this == getASTContext().TheBuiltinModule;
 }
 
-bool SourceFile::registerMainDecl(Decl *mainDecl, SourceLoc diagLoc) {
+bool SourceFile::registerMainDecl(ValueDecl *mainDecl, SourceLoc diagLoc) {
   assert(mainDecl);
   if (mainDecl == MainDecl)
     return false;

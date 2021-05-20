@@ -59,7 +59,7 @@ void runJobInEstablishedExecutorContext(Job *job);
 /// Clear the active task reference for the current thread.
 AsyncTask *_swift_task_clearCurrent();
 
-AsyncTaskAndContext swift_task_create_async_let_future(JobFlags flags,
+AsyncTaskAndContext swift_task_create_async_let_future(size_t flags,
                      const Metadata *futureResultType,
                      void *closureEntry,
                      void *closureContext);
@@ -87,6 +87,14 @@ void _swift_tsan_release(void *addr);
 /// executors.
 #define DISPATCH_QUEUE_GLOBAL_EXECUTOR (void *)1
 #define DISPATCH_QUEUE_MAIN_EXECUTOR (void *)2
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
+// FIXME: remove this and switch to a representation that uses
+// _dispatch_main_q somehow
+extern "C" SWIFT_CC(swift)
+ExecutorRef _swift_task_getMainExecutor();
+#pragma clang diagnostic pop
 
 // ==== ------------------------------------------------------------------------
 

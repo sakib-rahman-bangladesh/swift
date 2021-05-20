@@ -52,19 +52,37 @@ enum class DiagnosticOptions {
 
   /// After a fatal error subsequent diagnostics are suppressed.
   Fatal,
+
+  /// An API or ABI breakage diagnostic emitted by the API digester.
+  APIDigesterBreakage,
+
+  /// A deprecation warning or error.
+  Deprecation,
+
+  /// A diagnostic warning about an unused element.
+  NoUsage,
 };
 struct StoredDiagnosticInfo {
   DiagnosticKind kind : 2;
   bool pointsToFirstBadToken : 1;
   bool isFatal : 1;
+  bool isAPIDigesterBreakage : 1;
+  bool isDeprecation : 1;
+  bool isNoUsage : 1;
 
   constexpr StoredDiagnosticInfo(DiagnosticKind k, bool firstBadToken,
-                                 bool fatal)
-      : kind(k), pointsToFirstBadToken(firstBadToken), isFatal(fatal) {}
+                                 bool fatal, bool isAPIDigesterBreakage,
+                                 bool deprecation, bool noUsage)
+      : kind(k), pointsToFirstBadToken(firstBadToken), isFatal(fatal),
+        isAPIDigesterBreakage(isAPIDigesterBreakage), isDeprecation(deprecation),
+        isNoUsage(noUsage) {}
   constexpr StoredDiagnosticInfo(DiagnosticKind k, DiagnosticOptions opts)
       : StoredDiagnosticInfo(k,
                              opts == DiagnosticOptions::PointsToFirstBadToken,
-                             opts == DiagnosticOptions::Fatal) {}
+                             opts == DiagnosticOptions::Fatal,
+                             opts == DiagnosticOptions::APIDigesterBreakage,
+                             opts == DiagnosticOptions::Deprecation,
+                             opts == DiagnosticOptions::NoUsage) {}
 };
 
 // Reproduce the DiagIDs, as we want both the size and access to the raw ids
@@ -100,6 +118,12 @@ static constexpr const char * const diagnosticStrings[] = {
 
 static constexpr const char *const debugDiagnosticStrings[] = {
 #define DIAG(KIND, ID, Options, Text, Signature) Text " [" #ID "]",
+#include "swift/AST/DiagnosticsAll.def"
+    "<not a diagnostic>",
+};
+
+static constexpr const char *const diagnosticIDStrings[] = {
+#define DIAG(KIND, ID, Options, Text, Signature) #ID,
 #include "swift/AST/DiagnosticsAll.def"
     "<not a diagnostic>",
 };
@@ -314,6 +338,18 @@ void Diagnostic::addChildNote(Diagnostic &&D) {
 
 bool DiagnosticEngine::isDiagnosticPointsToFirstBadToken(DiagID ID) const {
   return storedDiagnosticInfos[(unsigned) ID].pointsToFirstBadToken;
+}
+
+bool DiagnosticEngine::isAPIDigesterBreakageDiagnostic(DiagID ID) const {
+  return storedDiagnosticInfos[(unsigned)ID].isAPIDigesterBreakage;
+}
+
+bool DiagnosticEngine::isDeprecationDiagnostic(DiagID ID) const {
+  return storedDiagnosticInfos[(unsigned)ID].isDeprecation;
+}
+
+bool DiagnosticEngine::isNoUsageDiagnostic(DiagID ID) const {
+  return storedDiagnosticInfos[(unsigned)ID].isNoUsage;
 }
 
 bool DiagnosticEngine::finishProcessing() {
@@ -1092,11 +1128,20 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic) {
     }
   }
 
+  StringRef Category;
+  if (isAPIDigesterBreakageDiagnostic(diagnostic.getID()))
+    Category = "api-digester-breaking-change";
+  else if (isDeprecationDiagnostic(diagnostic.getID()))
+    Category = "deprecation";
+  else if (isNoUsageDiagnostic(diagnostic.getID()))
+    Category = "no-usage";
+
   return DiagnosticInfo(
       diagnostic.getID(), loc, toDiagnosticKind(behavior),
       diagnosticStringFor(diagnostic.getID(), getPrintDiagnosticNames()),
-      diagnostic.getArgs(), getDefaultDiagnosticLoc(), /*child note info*/ {},
-      diagnostic.getRanges(), diagnostic.getFixIts(), diagnostic.isChildNote());
+      diagnostic.getArgs(), Category, getDefaultDiagnosticLoc(),
+      /*child note info*/ {}, diagnostic.getRanges(), diagnostic.getFixIts(),
+      diagnostic.isChildNote());
 }
 
 void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
@@ -1144,12 +1189,17 @@ DiagnosticEngine::diagnosticStringFor(const DiagID id,
   auto defaultMessage = printDiagnosticNames
                             ? debugDiagnosticStrings[(unsigned)id]
                             : diagnosticStrings[(unsigned)id];
-  if (localization) {
-    auto localizedMessage =
-        localization.get()->getMessageOr(id, defaultMessage);
+
+  if (auto producer = localization.get()) {
+    auto localizedMessage = producer->getMessageOr(id, defaultMessage);
     return localizedMessage;
   }
   return defaultMessage;
+}
+
+llvm::StringRef
+DiagnosticEngine::diagnosticIDStringFor(const DiagID id) {
+  return diagnosticIDStrings[(unsigned)id];
 }
 
 const char *InFlightDiagnostic::fixItStringFor(const FixItID id) {

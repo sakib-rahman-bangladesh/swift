@@ -150,7 +150,8 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
                   bool IsFramework) override;
 
-  bool canImportModule(ImportPath::Element mID) override;
+  bool canImportModule(ImportPath::Element mID, llvm::VersionTuple version,
+                       bool underlyingVersion) override;
 
   bool isCached(StringRef DepPath) override { return false; };
 
@@ -335,17 +336,25 @@ class ModuleInterfaceCheckerImpl: public ModuleInterfaceChecker {
   ASTContext &Ctx;
   std::string CacheDir;
   std::string PrebuiltCacheDir;
+  std::string BackupInterfaceDir;
   ModuleInterfaceLoaderOptions Opts;
   RequireOSSAModules_t RequiresOSSAModules;
 
 public:
   explicit ModuleInterfaceCheckerImpl(ASTContext &Ctx, StringRef cacheDir,
                                       StringRef prebuiltCacheDir,
+                                      StringRef BackupInterfaceDir,
                                       ModuleInterfaceLoaderOptions opts,
                                       RequireOSSAModules_t requiresOSSAModules)
       : Ctx(Ctx), CacheDir(cacheDir), PrebuiltCacheDir(prebuiltCacheDir),
+        BackupInterfaceDir(BackupInterfaceDir),
         Opts(opts), RequiresOSSAModules(requiresOSSAModules) {}
-
+  explicit ModuleInterfaceCheckerImpl(ASTContext &Ctx, StringRef cacheDir,
+                                      StringRef prebuiltCacheDir,
+                                      ModuleInterfaceLoaderOptions opts,
+                                      RequireOSSAModules_t requiresOSSAModules):
+    ModuleInterfaceCheckerImpl(Ctx, cacheDir, prebuiltCacheDir, StringRef(),
+                               opts, requiresOSSAModules) {}
   std::vector<std::string>
   getCompiledModuleCandidatesForInterface(StringRef moduleName,
                                           StringRef interfacePath) override;
@@ -413,7 +422,8 @@ public:
       SourceManager &SourceMgr, DiagnosticEngine &Diags,
       const SearchPathOptions &SearchPathOpts, const LangOptions &LangOpts,
       const ClangImporterOptions &ClangOpts, StringRef CacheDir,
-      StringRef PrebuiltCacheDir, StringRef ModuleName, StringRef InPath,
+      StringRef PrebuiltCacheDir, StringRef BackupInterfaceDir,
+      StringRef ModuleName, StringRef InPath,
       StringRef OutPath, bool SerializeDependencyHashes,
       bool TrackSystemDependencies, ModuleInterfaceLoaderOptions Opts,
       RequireOSSAModules_t RequireOSSAModules);
@@ -422,7 +432,9 @@ public:
 struct InterfaceSubContextDelegateImpl: InterfaceSubContextDelegate {
 private:
   SourceManager &SM;
-  DiagnosticEngine &Diags;
+public:
+  DiagnosticEngine *Diags;
+private:
   llvm::BumpPtrAllocator Allocator;
   llvm::StringSaver ArgSaver;
   std::vector<StringRef> GenericArgs;
@@ -438,7 +450,7 @@ private:
       // Diagnose this inside the interface file, if possible.
       loc = SM.getLocFromExternalSource(interfacePath, 1, 1);
     }
-    return Diags.diagnose(loc, ID, std::move(Args)...);
+    return Diags->diagnose(loc, ID, std::move(Args)...);
   }
   void
   inheritOptionsForBuildingInterface(const SearchPathOptions &SearchPathOpts,
@@ -451,11 +463,12 @@ private:
                                            SourceLoc diagnosticLoc);
 public:
   InterfaceSubContextDelegateImpl(
-      SourceManager &SM, DiagnosticEngine &Diags,
+      SourceManager &SM, DiagnosticEngine *Diags,
       const SearchPathOptions &searchPathOpts, const LangOptions &langOpts,
       const ClangImporterOptions &clangImporterOpts,
       ModuleInterfaceLoaderOptions LoaderOpts, bool buildModuleCacheDirIfAbsent,
       StringRef moduleCachePath, StringRef prebuiltCachePath,
+      StringRef backupModuleInterfaceDir,
       bool serializeDependencyHashes, bool trackSystemDependencies,
       RequireOSSAModules_t requireOSSAModules);
   std::error_code runInSubContext(StringRef moduleName,

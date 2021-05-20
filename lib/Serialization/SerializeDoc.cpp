@@ -489,10 +489,14 @@ void DocSerializer::writeDocHeader() {
     control_block::TargetLayout Target(Out);
 
     auto& LangOpts = M->getASTContext().LangOpts;
+    auto verText = version::getSwiftFullVersion(LangOpts.EffectiveLanguageVersion);
     Metadata.emit(ScratchRecord, SWIFTDOC_VERSION_MAJOR, SWIFTDOC_VERSION_MINOR,
                   /*short version string length*/0, /*compatibility length*/0,
-                  version::getSwiftFullVersion(
-                    LangOpts.EffectiveLanguageVersion));
+                  /*user module version major*/0,
+                  /*user module version minor*/0,
+                  /*user module version subminor*/0,
+                  /*user module version build*/0,
+                  verText);
 
     ModuleName.emit(ScratchRecord, M->getName().str());
     Target.emit(ScratchRecord, LangOpts.Target.str());
@@ -619,10 +623,7 @@ static void writeRawLoc(const ExternalSourceLocs::RawLoc &Loc,
   Writer.write<uint32_t>(Loc.Directive.Offset);
   Writer.write<int32_t>(Loc.Directive.LineOffset);
   Writer.write<uint32_t>(Loc.Directive.Length);
-  llvm::SmallString<128> AbsName = Loc.Directive.Name;
-  if (!AbsName.empty())
-    llvm::sys::fs::make_absolute(AbsName);
-  Writer.write<uint32_t>(Strings.getTextOffset(AbsName.str()));
+  Writer.write<uint32_t>(Strings.getTextOffset(Loc.Directive.Name));
 }
 
 /**
@@ -875,10 +876,15 @@ public:
       control_block::TargetLayout Target(Out);
 
       auto& LangOpts = M->getASTContext().LangOpts;
+      auto verText = version::getSwiftFullVersion(LangOpts.EffectiveLanguageVersion);
       Metadata.emit(ScratchRecord, SWIFTSOURCEINFO_VERSION_MAJOR,
                     SWIFTSOURCEINFO_VERSION_MINOR,
                     /*short version string length*/0, /*compatibility length*/0,
-              version::getSwiftFullVersion(LangOpts.EffectiveLanguageVersion));
+                    /*user module version major*/0,
+                    /*user module version minor*/0,
+                    /*user module version sub-minor*/0,
+                    /*user module version build*/0,
+                    verText);
 
       ModuleName.emit(ScratchRecord, M->getName().str());
       Target.emit(ScratchRecord, LangOpts.Target.str());
