@@ -1670,6 +1670,7 @@ public:
   void completeAfterIfStmt(bool hasElse) override;
   void completeStmtLabel(StmtKind ParentKind) override;
   void completeForEachPatternBeginning(bool hasTry, bool hasAwait) override;
+  void completeTypeAttrBeginning() override;
 
   void doneParsing() override;
 
@@ -2078,6 +2079,12 @@ public:
     IncludeInstanceMembers = true;
   }
 
+  bool isHiddenModuleName(Identifier Name) {
+    return (Name.str().startswith("_") ||
+            Name == Ctx.SwiftShimsModuleName ||
+            Name.str() == SWIFT_ONONE_SUPPORT);
+  }
+
   void addSubModuleNames(std::vector<std::pair<std::string, bool>>
       &SubModuleNameVisibilityPairs) {
     for (auto &Pair : SubModuleNameVisibilityPairs) {
@@ -2142,10 +2149,7 @@ public:
 
     auto mainModuleName = CurrModule->getName();
     for (auto ModuleName : ModuleNames) {
-      if (ModuleName.str().startswith("_") ||
-          ModuleName == mainModuleName ||
-          ModuleName == Ctx.SwiftShimsModuleName ||
-          ModuleName.str() == SWIFT_ONONE_SUPPORT)
+      if (ModuleName == mainModuleName || isHiddenModuleName(ModuleName))
         continue;
 
       auto MD = ModuleDecl::create(ModuleName, Ctx);
@@ -2521,6 +2525,10 @@ public:
     auto isolation = getActorIsolation(const_cast<ValueDecl *>(VD));
 
     switch (isolation.getKind()) {
+    case ActorIsolation::DistributedActorInstance: {
+      // TODO: implicitlyThrowing here for distributed
+      LLVM_FALLTHROUGH; // continue the ActorInstance checks
+    }
     case ActorIsolation::ActorInstance: {
       if (IsCrossActorReference) {
         implicitlyAsync = true;
@@ -4647,6 +4655,7 @@ public:
 
   static bool canUseAttributeOnDecl(DeclAttrKind DAK, bool IsInSil,
                                     bool IsConcurrencyEnabled,
+                                    bool IsDistributedEnabled,
                                     Optional<DeclKind> DK) {
     if (DeclAttribute::isUserInaccessible(DAK))
       return false;
@@ -4657,6 +4666,8 @@ public:
     if (!IsInSil && DeclAttribute::isSilOnly(DAK))
       return false;
     if (!IsConcurrencyEnabled && DeclAttribute::isConcurrencyOnly(DAK))
+      return false;
+    if (!IsDistributedEnabled && DeclAttribute::isDistributedOnly(DAK))
       return false;
     if (!DK.hasValue())
       return true;
@@ -4676,9 +4687,13 @@ public:
       }
     }
     bool IsConcurrencyEnabled = Ctx.LangOpts.EnableExperimentalConcurrency;
+    bool IsDistributedEnabled = Ctx.LangOpts.EnableExperimentalDistributed;
     std::string Description = TargetName.str() + " Attribute";
 #define DECL_ATTR(KEYWORD, NAME, ...)                                         \
-    if (canUseAttributeOnDecl(DAK_##NAME, IsInSil, IsConcurrencyEnabled, DK)) \
+    if (canUseAttributeOnDecl(DAK_##NAME, IsInSil,                            \
+                              IsConcurrencyEnabled,                           \
+                              IsDistributedEnabled,                           \
+                              DK))                                            \
       addDeclAttrKeyword(#KEYWORD, Description);
 #include "swift/AST/Attr.def"
   }
@@ -4701,6 +4716,22 @@ public:
         addDeclAttrParamKeyword("deprecated", "Specify version number", true);
       }
     }
+  }
+
+  void getTypeAttributeKeywordCompletions() {
+    auto addTypeAttr = [&](StringRef Name) {
+      CodeCompletionResultBuilder Builder(
+          Sink,
+          CodeCompletionResult::ResultKind::Keyword,
+          SemanticContextKind::None, expectedTypeContext);
+      Builder.addAttributeKeyword(Name, "Type Attribute");
+    };
+    addTypeAttr("autoclosure");
+    addTypeAttr("convention(swift)");
+    addTypeAttr("convention(block)");
+    addTypeAttr("convention(c)");
+    addTypeAttr("convention(thin)");
+    addTypeAttr("escaping");
   }
 
   void collectPrecedenceGroups() {
@@ -5836,6 +5867,11 @@ void CodeCompletionCallbacksImpl::completeForEachPatternBeginning(
     ParsedKeywords.emplace_back("await");
 }
 
+void CodeCompletionCallbacksImpl::completeTypeAttrBeginning() {
+  CurDeclContext = P.CurDeclContext;
+  Kind = CompletionKind::TypeAttrBeginning;
+}
+
 static bool isDynamicLookup(Type T) {
   return T->getRValueType()->isAnyObject();
 }
@@ -5862,7 +5898,8 @@ addKeyword(CodeCompletionResultSink &Sink, StringRef Name,
 }
 
 static void addDeclKeywords(CodeCompletionResultSink &Sink,
-                            bool IsConcurrencyEnabled) {
+                            bool IsConcurrencyEnabled,
+                            bool IsDistributedEnabled) {
   auto AddDeclKeyword = [&](StringRef Name, CodeCompletionKeywordKind Kind,
                         Optional<DeclAttrKind> DAK) {
     if (Name == "let" || Name == "var") {
@@ -5878,6 +5915,11 @@ static void addDeclKeywords(CodeCompletionResultSink &Sink,
     // Remove keywords only available when concurrency is enabled.
     if (DAK.hasValue() && !IsConcurrencyEnabled &&
         DeclAttribute::isConcurrencyOnly(*DAK))
+      return;
+
+    // Remove keywords only available when distributed is enabled.
+    if (DAK.hasValue() && !IsDistributedEnabled &&
+        DeclAttribute::isDistributedOnly(*DAK))
       return;
 
     addKeyword(Sink, Name, Kind);
@@ -5970,6 +6012,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
   case CompletionKind::KeyPathExprSwift:
   case CompletionKind::PrecedenceGroup:
   case CompletionKind::StmtLabel:
+  case CompletionKind::TypeAttrBeginning:
     break;
 
   case CompletionKind::EffectsSpecifier: {
@@ -6000,7 +6043,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
     LLVM_FALLTHROUGH;
   }
   case CompletionKind::StmtOrExpr:
-    addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency);
+    addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency, Context.LangOpts.EnableExperimentalDistributed);
     addStmtKeywords(Sink, MaybeFuncBody);
     LLVM_FALLTHROUGH;
   case CompletionKind::ReturnStmtExpr:
@@ -6068,7 +6111,7 @@ void CodeCompletionCallbacksImpl::addKeywords(CodeCompletionResultSink &Sink,
         .Default(false);
     }) != ParsedKeywords.end();
     if (!HasDeclIntroducer) {
-      addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency);
+      addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency, Context.LangOpts.EnableExperimentalDistributed);
       addLetVarKeywords(Sink);
     }
     break;
@@ -6209,6 +6252,25 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
   llvm::SmallPtrSet<Identifier, 8> seenModuleNames;
   std::vector<RequestedCachedModule> RequestedModules;
 
+  SmallPtrSet<ModuleDecl *, 4> explictlyImportedModules;
+  {
+    // Collect modules directly imported in this SourceFile.
+    SmallVector<ImportedModule, 4> directImport;
+    SF.getImportedModules(directImport,
+                          {ModuleDecl::ImportFilterKind::Default,
+                           ModuleDecl::ImportFilterKind::ImplementationOnly});
+    for (auto import : directImport)
+      explictlyImportedModules.insert(import.importedModule);
+
+    // Exclude modules implicitly imported in the current module.
+    auto implicitImports = SF.getParentModule()->getImplicitImports();
+    for (auto import : implicitImports.imports)
+      explictlyImportedModules.erase(import.module.importedModule);
+
+    // Consider the current module "explicit".
+    explictlyImportedModules.insert(SF.getParentModule());
+  }
+
   for (auto &Request: Lookup.RequestedCachedResults) {
     llvm::DenseSet<CodeCompletionCache::Key> ImportsSeen;
     auto handleImport = [&](ImportedModule Import) {
@@ -6257,8 +6319,11 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
         RequestedModules.push_back({std::move(K), TheModule,
           Request.OnlyTypes, Request.OnlyPrecedenceGroups});
 
+        auto TheModuleName = TheModule->getName();
         if (Request.IncludeModuleQualifier &&
-            seenModuleNames.insert(TheModule->getName()).second)
+            (!Lookup.isHiddenModuleName(TheModuleName) ||
+             explictlyImportedModules.contains(TheModule)) &&
+            seenModuleNames.insert(TheModuleName).second)
           Lookup.addModuleName(TheModule);
       }
     };
@@ -6855,7 +6920,7 @@ void CodeCompletionCallbacksImpl::doneParsing() {
 
         if (CurDeclContext->isTypeContext()) {
           // Override completion (CompletionKind::NominalMemberBeginning).
-          addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency);
+          addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency, Context.LangOpts.EnableExperimentalDistributed);
           addLetVarKeywords(Sink);
           SmallVector<StringRef, 0> ParsedKeywords;
           CompletionOverrideLookup OverrideLookup(Sink, Context, CurDeclContext,
@@ -6863,7 +6928,7 @@ void CodeCompletionCallbacksImpl::doneParsing() {
           OverrideLookup.getOverrideCompletions(SourceLoc());
         } else {
           // Global completion (CompletionKind::PostfixExprBeginning).
-          addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency);
+          addDeclKeywords(Sink, Context.LangOpts.EnableExperimentalConcurrency, Context.LangOpts.EnableExperimentalDistributed);
           addStmtKeywords(Sink, MaybeFuncBody);
           addSuperKeyword(Sink);
           addLetVarKeywords(Sink);
@@ -6987,6 +7052,15 @@ void CodeCompletionCallbacksImpl::doneParsing() {
     SourceLoc Loc = P.Context.SourceMgr.getCodeCompletionLoc();
     Lookup.getStmtLabelCompletions(Loc, ParentStmtKind == StmtKind::Continue);
     break;
+  }
+  case CompletionKind::TypeAttrBeginning: {
+    Lookup.getTypeAttributeKeywordCompletions();
+
+    // Type names at attribute position after '@'.
+    Lookup.getTypeCompletionsInDeclContext(
+      P.Context.SourceMgr.getCodeCompletionLoc());
+    break;
+
   }
   case CompletionKind::AfterIfStmtElse:
   case CompletionKind::CaseStmtKeyword:
