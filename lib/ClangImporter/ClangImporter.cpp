@@ -730,7 +730,11 @@ importer::addCommonInvocationArguments(
     std::vector<std::string> &invocationArgStrs,
     ASTContext &ctx) {
   using ImporterImpl = ClangImporter::Implementation;
-  const llvm::Triple &triple = ctx.LangOpts.Target;
+  llvm::Triple triple = ctx.LangOpts.Target;
+  // Use clang specific target triple if given.
+  if (ctx.LangOpts.ClangTarget.hasValue()) {
+    triple = ctx.LangOpts.ClangTarget.getValue();
+  }
   SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
   const ClangImporterOptions &importerOpts = ctx.ClangImporterOpts;
 
@@ -953,7 +957,7 @@ ClangImporter::getClangArguments(ASTContext &ctx) {
   std::vector<std::string> invocationArgStrs;
   // Clang expects this to be like an actual command line. So we need to pass in
   // "clang" for argv[0]
-  invocationArgStrs.push_back(ctx.ClangImporterOpts.clangPath);
+  invocationArgStrs.push_back("clang");
   switch (ctx.ClangImporterOpts.Mode) {
   case ClangImporterOptions::Modes::Normal:
   case ClangImporterOptions::Modes::PrecompiledModule:

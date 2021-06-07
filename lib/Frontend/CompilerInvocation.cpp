@@ -66,11 +66,6 @@ void CompilerInvocation::setMainExecutablePath(StringRef Path) {
       Path, FrontendOpts.UseSharedResourceFolder, LibPath);
   setRuntimeResourcePath(LibPath.str());
 
-  llvm::SmallString<128> clangPath(Path);
-  llvm::sys::path::remove_filename(clangPath);
-  llvm::sys::path::append(clangPath, "clang");
-  ClangImporterOpts.clangPath = std::string(clangPath);
-
   llvm::SmallString<128> DiagnosticDocsPath(Path);
   llvm::sys::path::remove_filename(DiagnosticDocsPath); // Remove /swift
   llvm::sys::path::remove_filename(DiagnosticDocsPath); // Remove /bin
@@ -691,6 +686,20 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
     Opts.TargetVariant = llvm::Triple(A->getValue());
   }
 
+  // Collect -clang-target value if specified in the front-end invocation.
+  // Usually, the driver will pass down a clang target with the
+  // exactly same value as the main target, so we could dignose the usage of
+  // unavailable APIs.
+  // The reason we cannot infer clang target from -target is that not all
+  // front-end invocation will include a -target to start with. For instance,
+  // when compiling a Swift module from a textual interface, -target isn't
+  // necessary because the textual interface hardcoded the proper target triple
+  // to use. Inferring -clang-target there will always give us the default
+  // target triple.
+  if (const Arg *A = Args.getLastArg(OPT_clang_target)) {
+    Opts.ClangTarget = llvm::Triple(A->getValue());
+  }
+
   Opts.EnableCXXInterop |= Args.hasArg(OPT_enable_cxx_interop);
   Opts.EnableObjCInterop =
       Args.hasFlag(OPT_enable_objc_interop, OPT_disable_objc_interop,
@@ -940,18 +949,6 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
                                    DiagnosticEngine &Diags,
                                    StringRef workingDirectory) {
   using namespace options;
-
-  if (const Arg *a = Args.getLastArg(OPT_tools_directory)) {
-    // If a custom tools directory is specified, try to find Clang there.
-    // This is useful when the Swift executable is located in a different
-    // directory than the Clang/LLVM executables, for example, when building
-    // the Swift project itself.
-    llvm::SmallString<128> clangPath(a->getValue());
-    llvm::sys::path::append(clangPath, "clang");
-    if (llvm::sys::fs::exists(clangPath)) {
-      Opts.clangPath = std::string(clangPath);
-    }
-  }
 
   if (const Arg *A = Args.getLastArg(OPT_module_cache_path)) {
     Opts.ModuleCachePath = A->getValue();
