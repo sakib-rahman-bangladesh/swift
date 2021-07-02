@@ -374,7 +374,7 @@ option(SWIFT_RUNTIME_CLOBBER_FREED_OBJECTS
     "${SWIFT_RUNTIME_CLOBBER_FREED_OBJECTS_default}")
 
 option(SWIFT_STDLIB_SIL_DEBUGGING
-    "Compile the Swift standard library with -gsil to enable debugging and profiling on SIL level"
+    "Compile the Swift standard library with -sil-based-debuginfo to enable debugging and profiling on SIL level"
     FALSE)
 
 option(SWIFT_CHECK_INCREMENTAL_COMPILATION
@@ -480,7 +480,9 @@ endif()
 
 set(SWIFT_BUILD_HOST_DISPATCH FALSE)
 if(SWIFT_ENABLE_DISPATCH AND NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
-  if(SWIFT_BUILD_SYNTAXPARSERLIB OR SWIFT_BUILD_SOURCEKIT)
+  # Only build libdispatch for the host if the host tools are being built and
+  # specifically if these two libraries that depend on it are built.
+  if(SWIFT_INCLUDE_TOOLS AND (SWIFT_BUILD_SYNTAXPARSERLIB OR SWIFT_BUILD_SOURCEKIT))
     set(SWIFT_BUILD_HOST_DISPATCH TRUE)
   endif()
 
@@ -509,6 +511,8 @@ message(STATUS "C Compiler (${CMAKE_C_COMPILER}) Version: ${CMAKE_C_COMPILER_VER
 message(STATUS "C++ Compiler (${CMAKE_CXX_COMPILER}) Version: ${CMAKE_CXX_COMPILER_VERSION}")
 if (CMAKE_Swift_COMPILER)
   message(STATUS "Swift Compiler (${CMAKE_Swift_COMPILER}) Version: ${CMAKE_Swift_COMPILER_VERSION}")
+elseif (SWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER)
+  message(FATAL_ERROR "Swift Compiler not found and SWIFT_BUILD_RUNTIME_WITH_HOST_COMPILER is set")
 else()
   message(STATUS "Swift Compiler (None).")
 endif()

@@ -7720,7 +7720,7 @@ static bool isNonFinalClass(Type type) {
     type = dynamicSelf->getSelfType();
 
   if (auto classDecl = type->getClassOrBoundGenericClass())
-    return !classDecl->isFinal();
+    return !classDecl->isSemanticallyFinal();
 
   if (auto archetype = type->getAs<ArchetypeType>())
     if (auto super = archetype->getSuperclass())
@@ -9515,7 +9515,12 @@ ConstraintSystem::simplifyKeyPathConstraint(
     case KeyPathExpr::Component::Kind::Invalid:
     case KeyPathExpr::Component::Kind::Identity:
       break;
-      
+
+    case KeyPathExpr::Component::Kind::CodeCompletion: {
+      anyComponentsUnresolved = true;
+      capability = ReadOnly;
+      break;
+    }
     case KeyPathExpr::Component::Kind::Property:
     case KeyPathExpr::Component::Kind::Subscript:
     case KeyPathExpr::Component::Kind::UnresolvedProperty:
