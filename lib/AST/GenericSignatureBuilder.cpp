@@ -4202,8 +4202,9 @@ static ConstraintResult visitInherited(
   ASTContext &ctx = typeDecl ? typeDecl->getASTContext()
                              : extDecl->getASTContext();
   auto &evaluator = ctx.evaluator;
-  ArrayRef<TypeLoc> inheritedTypes = typeDecl ? typeDecl->getInherited()
-                                              : extDecl->getInherited();
+  ArrayRef<InheritedEntry> inheritedTypes =
+      typeDecl ? typeDecl->getInherited()
+               : extDecl->getInherited();
   for (unsigned index : indices(inheritedTypes)) {
     Type inheritedType
       = evaluateOrDefault(evaluator,
@@ -8145,6 +8146,8 @@ void GenericSignatureBuilder::enumerateRequirements(
                                RequirementRHS rhs) {
     if (auto req = createRequirement(kind, depTy, rhs, genericParams))
       requirements.push_back(*req);
+    else
+      Impl->HadAnyError = true;
   };
 
   // Collect all non-same type requirements.
@@ -8488,6 +8491,8 @@ GenericSignature GenericSignatureBuilder::rebuildSignatureWithoutRedundantRequir
       auto newReq = stripBoundDependentMemberTypes(*optReq);
       newBuilder.addRequirement(newReq, getRebuiltSource(req.getSource()),
                                 nullptr);
+    } else {
+      Impl->HadAnyError = true;
     }
   }
 

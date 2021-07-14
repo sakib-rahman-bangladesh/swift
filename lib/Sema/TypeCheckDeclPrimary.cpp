@@ -35,7 +35,6 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
-#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/NameLookupRequests.h"
@@ -73,7 +72,7 @@ using namespace swift;
 static void checkInheritanceClause(
     llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> declUnion) {
   const DeclContext *DC;
-  ArrayRef<TypeLoc> inheritedClause;
+  ArrayRef<InheritedEntry> inheritedClause;
   const ExtensionDecl *ext = nullptr;
   const TypeDecl *typeDecl = nullptr;
   const Decl *decl;
@@ -2406,18 +2405,12 @@ public:
 
     if (auto superclass = CD->getSuperclassDecl()) {
       // Actors cannot have superclasses, nor can they be superclasses.
-      if (CD->isActor()) {
+      if (CD->isActor() && !superclass->isNSObject())
         CD->diagnose(diag::actor_inheritance,
                      /*distributed=*/CD->isDistributedActor());
-        if (superclass->isNSObject() && !CD->isDistributedActor()) {
-          CD->diagnose(diag::actor_inheritance_nsobject, CD->getName())
-            .fixItInsert(CD->getAttributeInsertionLoc(/*forModifier=*/false),
-                         "@objc ");
-        }
-      } else if (superclass->isActor()) {
+      else if (superclass->isActor())
         CD->diagnose(diag::actor_inheritance,
                      /*distributed=*/CD->isDistributedActor());
-      }
     }
 
     // Force lowering of stored properties.
