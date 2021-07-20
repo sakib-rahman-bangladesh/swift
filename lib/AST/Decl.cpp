@@ -889,6 +889,9 @@ AvailabilityContext Decl::getAvailabilityForLinkage() const {
   if (auto *accessor = dyn_cast<AccessorDecl>(this))
     return accessor->getStorage()->getAvailabilityForLinkage();
 
+  if (auto *opaqueTypeDecl = dyn_cast<OpaqueTypeDecl>(this))
+    return opaqueTypeDecl->getNamingDecl()->getAvailabilityForLinkage();
+
   if (auto *ext = dyn_cast<ExtensionDecl>(this))
     if (auto *nominal = ext->getExtendedNominal())
       return nominal->getAvailabilityForLinkage();
@@ -913,6 +916,9 @@ bool Decl::isAlwaysWeakImported() const {
 
   if (auto *accessor = dyn_cast<AccessorDecl>(this))
     return accessor->getStorage()->isAlwaysWeakImported();
+
+  if (auto *opaqueTypeDecl = dyn_cast<OpaqueTypeDecl>(this))
+    return opaqueTypeDecl->getNamingDecl()->isAlwaysWeakImported();
 
   if (auto *ext = dyn_cast<ExtensionDecl>(this))
     if (auto *nominal = ext->getExtendedNominal())
@@ -1576,7 +1582,7 @@ SourceRange PatternBindingEntry::getSourceRange(bool omitAccessors) const {
 bool PatternBindingEntry::hasInitStringRepresentation() const {
   if (InitContextAndFlags.getInt().contains(PatternFlags::IsText))
     return !InitStringRepresentation.empty();
-  return getInit() && getInit()->getSourceRange().isValid();
+  return getOriginalInit() && getOriginalInit()->getSourceRange().isValid();
 }
 
 StringRef PatternBindingEntry::getInitStringRepresentation(
