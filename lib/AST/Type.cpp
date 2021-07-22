@@ -3003,7 +3003,8 @@ Type ArchetypeType::getExistentialType() const {
     constraintTypes.push_back(proto->getDeclaredInterfaceType());
   }
   return ProtocolCompositionType::get(
-     const_cast<ArchetypeType*>(this)->getASTContext(), constraintTypes, false);
+     const_cast<ArchetypeType*>(this)->getASTContext(), constraintTypes,
+                                      requiresClass());
 }
 
 PrimaryArchetypeType::PrimaryArchetypeType(const ASTContext &Ctx,
@@ -4312,8 +4313,16 @@ SubstitutionMap TypeBase::getMemberSubstitutionMap(
       LookUpConformanceInModule(module));
 }
 
+Type TypeBase::getTypeOfMember(ModuleDecl *module, const VarDecl *member) {
+  return getTypeOfMember(module, member, member->getInterfaceType());
+}
+
 Type TypeBase::getTypeOfMember(ModuleDecl *module, const ValueDecl *member,
                                Type memberType) {
+  assert(memberType);
+  assert(!memberType->is<GenericFunctionType>() &&
+         "Generic function types are not supported");
+
   if (is<ErrorType>())
     return ErrorType::get(getASTContext());
 
@@ -4321,12 +4330,6 @@ Type TypeBase::getTypeOfMember(ModuleDecl *module, const ValueDecl *member,
     auto objectTy = lvalue->getObjectType();
     return objectTy->getTypeOfMember(module, member, memberType);
   }
-
-  // If no member type was provided, use the member's type.
-  if (!memberType)
-    memberType = member->getInterfaceType();
-
-  assert(memberType);
 
   // Perform the substitution.
   auto substitutions = getMemberSubstitutionMap(module, member);

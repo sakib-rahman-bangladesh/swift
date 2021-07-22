@@ -4436,8 +4436,8 @@ NOTE(actor_isolated_sync_func,none,
      "implicitly asynchronous",
      (DescriptiveDeclKind, DeclName))
 NOTE(distributed_actor_isolated_method_note,none,
-      "only 'distributed' functions can be called from outside the distributed actor",
-      ())
+     "only 'distributed' functions can be called from outside the distributed actor", // TODO: improve error message
+     ())
 ERROR(distributed_actor_isolated_method,none,
       "only 'distributed' functions can be called from outside the distributed actor", // TODO: improve error message to be more like 'non-distributed' ... defined here
       ())
@@ -5323,6 +5323,10 @@ ERROR(availability_decl_only_version_newer, none,
 
 ERROR(availability_opaque_types_only_version_newer, none,
       "'some' return types are only available in %0 %1 or newer",
+      (StringRef, llvm::VersionTuple))
+
+ERROR(availability_concurrency_only_version_newer, none,
+      "concurrency is only available in %0 %1 or newer",
       (StringRef, llvm::VersionTuple))
 
 NOTE(availability_guard_with_version_check, none,
