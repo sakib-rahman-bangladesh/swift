@@ -1668,7 +1668,7 @@ public:
       // Force some requests, which can produce diagnostics.
 
       // Check redeclaration.
-      (void) evaluateOrDefault(decl->getASTContext().evaluator,
+      (void) evaluateOrDefault(Context.evaluator,
                                CheckRedeclarationRequest{VD}, {});
 
       // Compute access level.
@@ -1682,8 +1682,11 @@ public:
       (void) VD->isObjC();
       (void) VD->isDynamic();
 
-      // Check for actor isolation.
-      (void)getActorIsolation(VD);
+      // Check for actor isolation of top-level and local declarations.
+      // Declarations inside types are handled in checkConformancesInContext()
+      // to avoid cycles involving associated type inference.
+      if (!VD->getDeclContext()->isTypeContext())
+        (void) getActorIsolation(VD);
 
       // If this is a member of a nominal type, don't allow it to have a name of
       // "Type" or "Protocol" since we reserve the X.Type and X.Protocol
@@ -1694,7 +1697,7 @@ public:
            VD->getName().isSimpleName(Context.Id_Protocol)) &&
           VD->getNameLoc().isValid() &&
           Context.SourceMgr.extractText({VD->getNameLoc(), 1}) != "`") {
-        auto &DE = getASTContext().Diags;
+        auto &DE = Context.Diags;
         DE.diagnose(VD->getNameLoc(), diag::reserved_member_name,
                     VD->getName(), VD->getBaseIdentifier().str());
         DE.diagnose(VD->getNameLoc(), diag::backticks_to_escape)
@@ -2676,6 +2679,13 @@ public:
     return AFD->getResilienceExpansion() != ResilienceExpansion::Minimal;
   }
 
+  /// FIXME: This is an egregious hack to turn off availability checking
+  /// for specific functions that were missing availability in older versions
+  /// of existing libraries that we must nonethess still support.
+  static bool hasHistoricallyWrongAvailability(FuncDecl *func) {
+    return func->getName().isCompoundName("swift_deletedAsyncMethodError", { });
+  }
+
   void visitFuncDecl(FuncDecl *FD) {
     // Force these requests in case they emit diagnostics.
     (void) FD->getInterfaceType();
@@ -2721,7 +2731,8 @@ public:
 
     checkImplementationOnlyOverride(FD);
 
-    if (FD->getAsyncLoc().isValid())
+    if (FD->getAsyncLoc().isValid() &&
+        !hasHistoricallyWrongAvailability(FD))
       TypeChecker::checkConcurrencyAvailability(FD->getAsyncLoc(), FD);
     
     if (requiresDefinition(FD) && !FD->hasBody()) {
