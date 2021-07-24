@@ -41,7 +41,6 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/RawComment.h"
-#include "swift/AST/RequirementMachine.h"
 #include "swift/AST/SILLayout.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SourceFile.h"
@@ -67,6 +66,7 @@
 #include <algorithm>
 #include <memory>
 
+#include "RequirementMachine/RequirementMachine.h"
 #include "RequirementMachine/RewriteContext.h"
 
 using namespace swift;
@@ -420,7 +420,8 @@ struct ASTContext::Implementation {
       GenericSignatureBuilders;
 
     /// Stored requirement machines for canonical generic signatures.
-    llvm::DenseMap<GenericSignature, std::unique_ptr<RequirementMachine>>
+    llvm::DenseMap<GenericSignature,
+                   std::unique_ptr<rewriting::RequirementMachine>>
       RequirementMachines;
 
     /// The set of function types.
@@ -913,8 +914,7 @@ static VarDecl *getPointeeProperty(VarDecl *&cache,
   NominalTypeDecl *nominal = (ctx.*getNominal)();
   if (!nominal) return nullptr;
   auto sig = nominal->getGenericSignature();
-  if (!sig) return nullptr;
-  if (sig->getGenericParams().size() != 1) return nullptr;
+  if (sig.getGenericParams().size() != 1) return nullptr;
 
   // There must be a property named "pointee".
   auto identifier = ctx.getIdentifier("pointee");
@@ -924,7 +924,7 @@ static VarDecl *getPointeeProperty(VarDecl *&cache,
   // The property must have type T.
   auto *property = dyn_cast<VarDecl>(results[0]);
   if (!property) return nullptr;
-  if (!property->getInterfaceType()->isEqual(sig->getGenericParams()[0]))
+  if (!property->getInterfaceType()->isEqual(sig.getGenericParams()[0]))
     return nullptr;
 
   cache = property;
@@ -1776,8 +1776,8 @@ static AllocationArena getArena(GenericSignature genericSig) {
   if (!genericSig)
     return AllocationArena::Permanent;
 
-  if (genericSig->hasTypeVariable()) {
-    assert(false && "What's going on");
+  if (genericSig.hasTypeVariable()) {
+    assert(false && "Unsubstituted type variable leaked into generic signature");
     return AllocationArena::ConstraintSolver;
   }
 
@@ -1844,13 +1844,13 @@ GenericSignatureBuilder *ASTContext::getOrCreateGenericSignatureBuilder(
     reprocessedSig->print(llvm::errs());
     llvm::errs() << "\n";
 
-    if (sig->getGenericParams().size() ==
-          reprocessedSig->getGenericParams().size() &&
-        sig->getRequirements().size() ==
-          reprocessedSig->getRequirements().size()) {
-      for (unsigned i : indices(sig->getRequirements())) {
-        auto sigReq = sig->getRequirements()[i];
-        auto reprocessedReq = reprocessedSig->getRequirements()[i];
+    if (sig.getGenericParams().size() ==
+          reprocessedSig.getGenericParams().size() &&
+        sig.getRequirements().size() ==
+          reprocessedSig.getRequirements().size()) {
+      for (unsigned i : indices(sig.getRequirements())) {
+        auto sigReq = sig.getRequirements()[i];
+        auto reprocessedReq = reprocessedSig.getRequirements()[i];
         if (sigReq.getKind() != reprocessedReq.getKind()) {
           llvm::errs() << "Requirement mismatch:\n";
           llvm::errs() << "  Original: ";
@@ -1893,9 +1893,9 @@ GenericSignatureBuilder *ASTContext::getOrCreateGenericSignatureBuilder(
   return builder;
 }
 
-RequirementMachine *ASTContext::getOrCreateRequirementMachine(
-    CanGenericSignature sig) {
-  assert(!sig->hasTypeVariable());
+rewriting::RequirementMachine *
+ASTContext::getOrCreateRequirementMachine(CanGenericSignature sig) {
+  assert(!sig.hasTypeVariable());
 
   auto &rewriteCtx = getImpl().TheRewriteContext;
   if (!rewriteCtx)
@@ -1918,7 +1918,7 @@ RequirementMachine *ASTContext::getOrCreateRequirementMachine(
     return machine;
   }
 
-  auto *machine = new RequirementMachine(*rewriteCtx);
+  auto *machine = new rewriting::RequirementMachine(*rewriteCtx);
 
   // Store this requirement machine before adding the signature,
   // to catch re-entrant construction via addGenericSignature()
@@ -3608,12 +3608,12 @@ GenericTypeParamType *GenericTypeParamType::get(unsigned depth, unsigned index,
 
 TypeArrayView<GenericTypeParamType>
 GenericFunctionType::getGenericParams() const {
-  return Signature->getGenericParams();
+  return Signature.getGenericParams();
 }
 
 /// Retrieve the requirements of this polymorphic function type.
 ArrayRef<Requirement> GenericFunctionType::getRequirements() const {
-  return Signature->getRequirements();
+  return Signature.getRequirements();
 }
 
 void SILFunctionType::Profile(
@@ -3747,7 +3747,7 @@ SILFunctionType::SILFunctionType(
            "If all generic parameters are concrete, SILFunctionType should "
            "not have a generic signature at all");
 
-    for (auto gparam : genericSig->getGenericParams()) {
+    for (auto gparam : genericSig.getGenericParams()) {
       (void)gparam;
       assert(gparam->isCanonical() && "generic signature is not canonicalized");
     }
@@ -4123,7 +4123,7 @@ OpaqueTypeArchetypeType::get(OpaqueTypeDecl *Decl,
   // Same-type-constrain the arguments in the outer signature to their
   // replacements in the substitution map.
   if (auto outerSig = Decl->getGenericSignature()) {
-    for (auto outerParam : outerSig->getGenericParams()) {
+    for (auto outerParam : outerSig.getGenericParams()) {
       auto boundType = Type(outerParam).subst(Substitutions);
       newRequirements.push_back(
           Requirement(RequirementKind::SameType, Type(outerParam), boundType));
@@ -4138,7 +4138,7 @@ OpaqueTypeArchetypeType::get(OpaqueTypeDecl *Decl,
   (void)newRequirements;
 # ifndef NDEBUG
   for (auto reqt :
-                Decl->getOpaqueInterfaceGenericSignature()->getRequirements()) {
+                Decl->getOpaqueInterfaceGenericSignature().getRequirements()) {
     auto reqtBase = reqt.getFirstType()->getRootGenericParam();
     if (reqtBase->isEqual(Decl->getUnderlyingInterfaceType())) {
       assert(reqt.getKind() != RequirementKind::SameType
@@ -4261,7 +4261,7 @@ GenericEnvironment *OpenedArchetypeType::getGenericEnvironment() const {
   // Create a generic environment to represent the opened type.
   auto signature = ctx.getOpenedArchetypeSignature(Opened);
   auto *env = GenericEnvironment::getIncomplete(signature);
-  env->addMapping(signature->getGenericParams()[0], thisType);
+  env->addMapping(signature.getGenericParams().front().getPointer(), thisType);
   Environment = env;
   
   return env;
@@ -4419,7 +4419,7 @@ GenericEnvironment *GenericEnvironment::getIncomplete(
   auto &ctx = signature->getASTContext();
 
   // Allocate and construct the new environment.
-  unsigned numGenericParams = signature->getGenericParams().size();
+  unsigned numGenericParams = signature.getGenericParams().size();
   size_t bytes = totalSizeToAlloc<Type>(numGenericParams);
   void *mem = ctx.Allocate(bytes, alignof(GenericEnvironment));
   return new (mem) GenericEnvironment(signature);
@@ -4913,7 +4913,7 @@ CanGenericSignature ASTContext::getOpenedArchetypeSignature(Type type) {
   // The opened archetype signature for a protocol type is identical
   // to the protocol's own canonical generic signature.
   if (const auto protoTy = dyn_cast<ProtocolType>(existential)) {
-    return protoTy->getDecl()->getGenericSignature()->getCanonicalSignature();
+    return protoTy->getDecl()->getGenericSignature().getCanonicalSignature();
   }
 
   auto found = getImpl().ExistentialSignatures.find(existential);
@@ -4982,9 +4982,9 @@ ASTContext::getOverrideGenericSignature(const ValueDecl *base,
   unsigned derivedDepth = 0;
   unsigned baseDepth = 0;
   if (derivedClassSig)
-    derivedDepth = derivedClassSig->getGenericParams().back()->getDepth() + 1;
+    derivedDepth = derivedClassSig.getGenericParams().back()->getDepth() + 1;
   if (const auto baseClassSig = baseClass->getGenericSignature())
-    baseDepth = baseClassSig->getGenericParams().back()->getDepth() + 1;
+    baseDepth = baseClassSig.getGenericParams().back()->getDepth() + 1;
 
   SmallVector<GenericTypeParamType *, 2> addedGenericParams;
   if (const auto *gpList = derived->getAsGenericContext()->getGenericParams()) {
@@ -5018,7 +5018,7 @@ ASTContext::getOverrideGenericSignature(const ValueDecl *base,
   };
 
   SmallVector<Requirement, 2> addedRequirements;
-  for (auto reqt : baseGenericSig->getRequirements()) {
+  for (auto reqt : baseGenericSig.getRequirements()) {
     if (auto substReqt = reqt.subst(substFn, lookupConformanceFn)) {
       addedRequirements.push_back(*substReqt);
     }
@@ -5116,7 +5116,7 @@ CanSILBoxType SILBoxType::get(ASTContext &C,
 CanSILBoxType SILBoxType::get(CanType boxedType) {
   auto &ctx = boxedType->getASTContext();
   auto singleGenericParamSignature = ctx.getSingleGenericParameterSignature();
-  auto genericParam = singleGenericParamSignature->getGenericParams()[0];
+  auto genericParam = singleGenericParamSignature.getGenericParams()[0];
   auto layout = SILLayout::get(ctx, singleGenericParamSignature,
                                SILField(CanType(genericParam),
                                         /*mutable*/ true));
@@ -5274,9 +5274,7 @@ AutoDiffDerivativeFunctionIdentifier *AutoDiffDerivativeFunctionIdentifier::get(
   llvm::FoldingSetNodeID id;
   id.AddInteger((unsigned)kind);
   id.AddPointer(parameterIndices);
-  CanGenericSignature derivativeCanGenSig;
-  if (derivativeGenericSignature)
-    derivativeCanGenSig = derivativeGenericSignature->getCanonicalSignature();
+  auto derivativeCanGenSig = derivativeGenericSignature.getCanonicalSignature();
   id.AddPointer(derivativeCanGenSig.getPointer());
 
   void *insertPos;

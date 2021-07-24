@@ -965,18 +965,12 @@ GenericContext::GenericContext(DeclContextKind Kind, DeclContext *Parent,
 
 TypeArrayView<GenericTypeParamType>
 GenericContext::getInnermostGenericParamTypes() const {
-  if (auto sig = getGenericSignature())
-    return sig->getInnermostGenericParams();
-  else
-    return { };
+  return getGenericSignature().getInnermostGenericParams();
 }
 
 /// Retrieve the generic requirements.
 ArrayRef<Requirement> GenericContext::getGenericRequirements() const {
-  if (auto sig = getGenericSignature())
-    return sig->getRequirements();
-  else
-    return { };
+  return getGenericSignature().getRequirements();
 }
 
 GenericParamList *GenericContext::getGenericParams() const {
@@ -1007,10 +1001,7 @@ GenericSignature GenericContext::getGenericSignature() const {
 }
 
 GenericEnvironment *GenericContext::getGenericEnvironment() const {
-  if (auto genericSig = getGenericSignature())
-    return genericSig->getGenericEnvironment();
-
-  return nullptr;
+  return getGenericSignature().getGenericEnvironment();
 }
 
 void GenericContext::setGenericSignature(GenericSignature genericSig) {
@@ -2688,8 +2679,10 @@ static Type mapSignatureFunctionType(ASTContext &ctx, Type type,
   for (const auto &param : funcTy->getParams()) {
     auto newParamType = mapSignatureParamType(ctx, param.getPlainType());
 
-    // Don't allow overloading by @_nonEphemeral.
-    auto newFlags = param.getParameterFlags().withNonEphemeral(false);
+    // Don't allow overloading by @_nonEphemeral or isolated.
+    auto newFlags = param.getParameterFlags()
+        .withNonEphemeral(false)
+        .withIsolated(false);
 
     // For the 'self' of a method, strip off 'inout'.
     if (isMethod) {
