@@ -241,6 +241,9 @@ EmitVerboseSIL("emit-verbose-sil",
 static llvm::cl::opt<bool>
 EmitSIB("emit-sib", llvm::cl::desc("Emit serialized AST + SIL file(s)"));
 
+static llvm::cl::opt<bool>
+Serialize("serialize", llvm::cl::desc("Emit serialized AST + SIL file(s)"));
+
 static llvm::cl::opt<std::string>
 ModuleCachePath("module-cache-path", llvm::cl::desc("Clang module cache path"));
 
@@ -323,6 +326,11 @@ static llvm::cl::opt<bool>
     IgnoreAlwaysInline("ignore-always-inline",
                        llvm::cl::desc("Ignore [always_inline] attribute."),
                        llvm::cl::init(false));
+
+static llvm::cl::opt<std::string> EnableRequirementMachine(
+    "requirement-machine",
+    llvm::cl::desc("Control usage of experimental generics implementation: "
+                   "'on', 'off', or 'verify'."));
 
 static void runCommandLineSelectedPasses(SILModule *Module,
                                          irgen::IRGenModule *IRGenMod) {
@@ -410,6 +418,8 @@ int main(int argc, char **argv) {
   }
   Invocation.getLangOptions().EnableExperimentalConcurrency =
     EnableExperimentalConcurrency;
+  Invocation.getLangOptions().EnableExperimentalDistributed =
+    EnableExperimentalDistributed;
 
   Invocation.getLangOptions().EnableObjCInterop =
     EnableObjCInterop ? true :
@@ -432,6 +442,23 @@ int main(int argc, char **argv) {
 
   Invocation.getDiagnosticOptions().VerifyMode =
       VerifyMode ? DiagnosticOptions::Verify : DiagnosticOptions::NoVerify;
+
+  if (EnableRequirementMachine.size()) {
+    auto value = llvm::StringSwitch<Optional<RequirementMachineMode>>(
+        EnableRequirementMachine)
+      .Case("off", RequirementMachineMode::Disabled)
+      .Case("on", RequirementMachineMode::Enabled)
+      .Case("verify", RequirementMachineMode::Verify)
+      .Default(None);
+
+    if (value)
+      Invocation.getLangOptions().EnableRequirementMachine = *value;
+    else {
+      fprintf(stderr, "Invalid value for -requirement-machine flag: %s\n",
+              EnableRequirementMachine.c_str());
+      exit(-1);
+    }
+  }
 
   // Setup the SIL Options.
   SILOptions &SILOpts = Invocation.getSILOptions();
@@ -581,7 +608,7 @@ int main(int argc, char **argv) {
   }
   }
 
-  if (EmitSIB) {
+  if (EmitSIB || Serialize) {
     llvm::SmallString<128> OutputFile;
     if (OutputFilename.size()) {
       OutputFile = OutputFilename;
@@ -597,8 +624,8 @@ int main(int argc, char **argv) {
 
     SerializationOptions serializationOpts;
     serializationOpts.OutputPath = OutputFile.c_str();
-    serializationOpts.SerializeAllSIL = true;
-    serializationOpts.IsSIB = true;
+    serializationOpts.SerializeAllSIL = EmitSIB;
+    serializationOpts.IsSIB = EmitSIB;
 
     serialize(CI.getMainModule(), serializationOpts, SILMod.get());
   } else {

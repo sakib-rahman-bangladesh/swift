@@ -32,7 +32,7 @@ typedef struct {
 
 enum {
   BridgedOperandSize = 4 * sizeof(uintptr_t),
-  BridgedSuccessorSize = 5 * sizeof(uintptr_t)
+  BridgedSuccessorSize = 4 * sizeof(uintptr_t) + sizeof(uint64_t)
 };
 
 typedef struct {
@@ -191,6 +191,8 @@ OptionalBridgedInstruction SILInstruction_next(BridgedInstruction inst);
 OptionalBridgedInstruction SILInstruction_previous(BridgedInstruction inst);
 BridgedBasicBlock SILInstruction_getParent(BridgedInstruction inst);
 BridgedArrayRef SILInstruction_getOperands(BridgedInstruction inst);
+void SILInstruction_setOperand(BridgedInstruction inst, SwiftInt index,
+                               BridgedValue value);
 BridgedLocation SILInstruction_getLocation(BridgedInstruction inst);
 BridgedMemoryBehavior SILInstruction_getMemBehavior(BridgedInstruction inst);
 

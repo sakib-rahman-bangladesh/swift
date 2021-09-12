@@ -130,6 +130,11 @@ namespace {
     /// HadError - Have we seen an error parsing this function?
     bool HadError = false;
 
+    /// Transient state for parsing a multiple optional attributes
+    /// in parseSpecificSILInstruction:
+    ///   <regular syntax>[, keyword1][, keyword2]
+    bool parsedComma = false;
+
     /// Data structures used to perform name lookup of basic blocks.
     llvm::DenseMap<Identifier, SILBasicBlock*> BlocksByName;
     llvm::DenseMap<SILBasicBlock*,
@@ -243,6 +248,11 @@ namespace {
       return parseSILIdentifier(Result, L, Diagnostic(ID, Args...));
     }
 
+    template <typename T>
+    bool
+    parseSILQualifier(Optional<T> &result,
+                      llvm::function_ref<Optional<T>(StringRef)> parseName);
+
     bool parseVerbatim(StringRef identifier);
 
     template <typename T>
@@ -292,8 +302,8 @@ namespace {
         return false;
       }
 
-      StringRef AllOwnershipKinds[3] = {"unowned", "owned",
-                                        "guaranteed"};
+      StringRef AllOwnershipKinds[4] = {"unowned", "owned", "guaranteed",
+                                        "none"};
       return parseSILIdentifierSwitch(OwnershipKind, AllOwnershipKinds,
                                       diag::expected_sil_value_ownership_kind);
     }
@@ -367,8 +377,8 @@ namespace {
 
     bool parseSILLocation(SILLocation &L);
     bool parseScopeRef(SILDebugScope *&DS);
-    bool parseSILDebugLocation(SILLocation &L, SILBuilder &B,
-                               bool parsedComma = false);
+    bool parseForwardingOwnershipKind(ValueOwnershipKind &forwardingKind);
+    bool parseSILDebugLocation(SILLocation &L, SILBuilder &B);
     bool parseSpecificSILInstruction(SILBuilder &B, SILInstructionKind Opcode,
                                      SourceLoc OpcodeLoc, StringRef OpcodeName,
                                      SILInstruction *&ResultVal);
@@ -815,6 +825,38 @@ static bool parseSILOptional(bool &Result, SILParser &SP, StringRef Expected) {
     if (Optional != Expected)
       return true;
     Result = true;
+  }
+  return false;
+}
+
+// If the qualifier string is unrecognized, then diagnose and fail.
+//
+// If the qualifier is absent, then succeed and set the result to None.
+// The caller can decide how to proceed with an absent qualifier.
+//
+// Usage:
+// auto parseQualifierName = [](StringRef Str) {
+//   return llvm::StringSwitch<Optional<SomeQualifier>>(Str)
+//       .Case("one", SomeQualifier::One)
+//       .Case("two", SomeQualifier::Two)
+//       .Default(None);
+// };
+// if (parseSILQualifier<SomeQualifier>(Qualifier, parseQualifierName))
+//   return true;
+template <typename T>
+bool SILParser::parseSILQualifier(
+    Optional<T> &result, llvm::function_ref<Optional<T>(StringRef)> parseName) {
+  auto loc = P.Tok.getLoc();
+  StringRef Str;
+  // If we do not parse '[' ... ']',
+  if (!parseSILOptional(Str, *this)) {
+    result = None;
+    return false;
+  }
+  result = parseName(Str);
+  if (!result) {
+    P.diagnose(loc, Diagnostic(diag::unrecognized_sil_qualifier));
+    return true;
   }
   return false;
 }
@@ -1612,7 +1654,10 @@ bool SILParser::parseSILDebugInfoExpression(SILDebugInfoExpression &DIExpr) {
     return true;
 
   // All operators that we currently support
-  static const SILDIExprOperator AllOps[] = {SILDIExprOperator::Fragment};
+  static const SILDIExprOperator AllOps[] = {
+    SILDIExprOperator::Dereference,
+    SILDIExprOperator::Fragment
+  };
 
   do {
     P.consumeToken();
@@ -1752,6 +1797,8 @@ bool SILParser::parseSILDebugVar(SILDebugVariable &Var) {
       Var.Constant = false;
     } else if (Key == "loc") {
       Var.Constant = false;
+    } else if (Key == "implicit") {
+      Var.Implicit = true;
     } else {
       P.diagnose(P.Tok, diag::sil_dbg_unknown_key, Key);
       return true;
@@ -1976,9 +2023,26 @@ bool SILParser::parseScopeRef(SILDebugScope *&DS) {
   return false;
 }
 
+bool SILParser::parseForwardingOwnershipKind(
+    ValueOwnershipKind &forwardingKind) {
+  if (P.Tok.is(tok::comma)) {
+    P.consumeToken();
+    parsedComma = true;
+  }
+  if (!parsedComma)
+    return false;
+
+  if (P.Tok.is(tok::identifier) && P.Tok.getText() == "forwarding") {
+    parsedComma = false;
+    P.consumeToken();
+    return P.parseToken(tok::colon, diag::expected_tok_in_sil_instr, ":")
+           || parseSILOwnership(forwardingKind);
+  }
+  return false;
+};
+
 ///  (',' sil-loc)? (',' sil-scope-ref)?
-bool SILParser::parseSILDebugLocation(SILLocation &L, SILBuilder &B,
-                                      bool parsedComma) {
+bool SILParser::parseSILDebugLocation(SILLocation &L, SILBuilder &B) {
   // Parse the debug information, if any.
   if (P.Tok.is(tok::comma)) {
     P.consumeToken();
@@ -1989,6 +2053,7 @@ bool SILParser::parseSILDebugLocation(SILLocation &L, SILBuilder &B,
 
   bool requireScope = false;
   if (P.Tok.getText() == "loc") {
+    parsedComma = false;
     if (parseSILLocation(L))
       return true;
 
@@ -1998,6 +2063,7 @@ bool SILParser::parseSILDebugLocation(SILLocation &L, SILBuilder &B,
     }
   }
   if (P.Tok.getText() == "scope" || requireScope) {
+    parsedComma = false;
     parseVerbatim("scope");
     SILDebugScope *DS = nullptr;
     if (parseScopeRef(DS))
@@ -2005,84 +2071,6 @@ bool SILParser::parseSILDebugLocation(SILLocation &L, SILBuilder &B,
     if (DS)
       B.setCurrentDebugScope(DS);
   }
-  return false;
-}
-
-static bool parseLoadOwnershipQualifier(LoadOwnershipQualifier &Result,
-                                        SILParser &P) {
-  StringRef Str;
-  // If we do not parse '[' ... ']', we have unqualified. Set value and return.
-  if (!parseSILOptional(Str, P)) {
-    Result = LoadOwnershipQualifier::Unqualified;
-    return false;
-  }
-
-  // Then try to parse one of our other qualifiers. We do not support parsing
-  // unqualified here so we use that as our fail value.
-  auto Tmp = llvm::StringSwitch<LoadOwnershipQualifier>(Str)
-                 .Case("take", LoadOwnershipQualifier::Take)
-                 .Case("copy", LoadOwnershipQualifier::Copy)
-                 .Case("trivial", LoadOwnershipQualifier::Trivial)
-                 .Default(LoadOwnershipQualifier::Unqualified);
-
-  // Thus return true (following the conventions in this file) if we fail.
-  if (Tmp == LoadOwnershipQualifier::Unqualified)
-    return true;
-
-  // Otherwise, assign Result and return false.
-  Result = Tmp;
-  return false;
-}
-
-static bool parseStoreOwnershipQualifier(StoreOwnershipQualifier &Result,
-                                         SILParser &P) {
-  StringRef Str;
-  // If we do not parse '[' ... ']', we have unqualified. Set value and return.
-  if (!parseSILOptional(Str, P)) {
-    Result = StoreOwnershipQualifier::Unqualified;
-    return false;
-  }
-
-  // Then try to parse one of our other qualifiers. We do not support parsing
-  // unqualified here so we use that as our fail value.
-  auto Tmp = llvm::StringSwitch<StoreOwnershipQualifier>(Str)
-                 .Case("init", StoreOwnershipQualifier::Init)
-                 .Case("assign", StoreOwnershipQualifier::Assign)
-                 .Case("trivial", StoreOwnershipQualifier::Trivial)
-                 .Default(StoreOwnershipQualifier::Unqualified);
-
-  // Thus return true (following the conventions in this file) if we fail.
-  if (Tmp == StoreOwnershipQualifier::Unqualified)
-    return true;
-
-  // Otherwise, assign Result and return false.
-  Result = Tmp;
-  return false;
-}
-
-static bool parseAssignOwnershipQualifier(AssignOwnershipQualifier &Result,
-                                          SILParser &P) {
-  StringRef Str;
-  // If we do not parse '[' ... ']', we have unknown. Set value and return.
-  if (!parseSILOptional(Str, P)) {
-    Result = AssignOwnershipQualifier::Unknown;
-    return false;
-  }
-
-  // Then try to parse one of our other initialization kinds. We do not support
-  // parsing unknown here so we use that as our fail value.
-  auto Tmp = llvm::StringSwitch<AssignOwnershipQualifier>(Str)
-                 .Case("reassign", AssignOwnershipQualifier::Reassign)
-                 .Case("reinit", AssignOwnershipQualifier::Reinit)
-                 .Case("init", AssignOwnershipQualifier::Init)
-                 .Default(AssignOwnershipQualifier::Unknown);
-
-  // Thus return true (following the conventions in this file) if we fail.
-  if (Tmp == AssignOwnershipQualifier::Unknown)
-    return true;
-
-  // Otherwise, assign Result and return false.
-  Result = Tmp;
   return false;
 }
 
@@ -2600,6 +2588,7 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
   SILValue Val;
   SILType Ty;
   SILLocation InstLoc = RegularLocation(OpcodeLoc);
+  this->parsedComma = false;
 
   auto parseFormalTypeAndValue = [&](CanType &formalType,
                                      SILValue &value) -> bool {
@@ -2632,17 +2621,6 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
     return true;
   };
 
-  auto parseForwardingOwnershipKind =
-      [&](ValueOwnershipKind &forwardingKind) -> bool {
-    if (P.consumeIf(tok::comma) &&
-        P.Tok.is(tok::identifier) && P.Tok.getText() == "forwarding") {
-      P.consumeToken();
-      return P.parseToken(tok::colon, diag::expected_tok_in_sil_instr, ":") ||
-             parseSILOwnership(forwardingKind);
-    }
-    return false;
-  };
-
   CanType SourceType, TargetType;
   SILValue SourceAddr, DestAddr;
   auto parseSourceAndDestAddress = [&] {
@@ -2653,13 +2631,12 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
   Identifier SuccessBBName, FailureBBName;
   SourceLoc SuccessBBLoc, FailureBBLoc;
   auto parseConditionalBranchDestinations = [&] {
-    return P.parseToken(tok::comma, diag::expected_tok_in_sil_instr, ",") ||
-           parseSILIdentifier(SuccessBBName, SuccessBBLoc,
-                              diag::expected_sil_block_name) ||
-           P.parseToken(tok::comma, diag::expected_tok_in_sil_instr, ",") ||
-           parseSILIdentifier(FailureBBName, FailureBBLoc,
-                              diag::expected_sil_block_name) ||
-           parseSILDebugLocation(InstLoc, B);
+    return P.parseToken(tok::comma, diag::expected_tok_in_sil_instr, ",")
+           || parseSILIdentifier(SuccessBBName, SuccessBBLoc,
+                                 diag::expected_sil_block_name)
+           || P.parseToken(tok::comma, diag::expected_tok_in_sil_instr, ",")
+           || parseSILIdentifier(FailureBBName, FailureBBLoc,
+                                 diag::expected_sil_block_name);
   };
 
   // Validate the opcode name, and do opcode-specific parsing logic based on the
@@ -3058,8 +3035,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
     ResultVal =
         B.createOpenExistentialBoxValue(InstLoc, Val, Ty, forwardingOwnership);
@@ -3078,8 +3055,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     ResultVal =
@@ -3092,8 +3069,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     ResultVal =
@@ -3209,20 +3186,16 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
     break;
   }
 
-  case SILInstructionKind::DebugValueInst:
-  case SILInstructionKind::DebugValueAddrInst: {
+  case SILInstructionKind::DebugValueInst: {
     bool poisonRefs = false;
     SILDebugVariable VarInfo;
     if (parseSILOptional(poisonRefs, *this, "poison")
         || parseTypedValueRef(Val, B) || parseSILDebugVar(VarInfo) ||
         parseSILDebugLocation(InstLoc, B))
       return true;
-    if (Opcode == SILInstructionKind::DebugValueInst)
-      ResultVal = B.createDebugValue(InstLoc, Val, VarInfo, poisonRefs);
-    else {
-      assert(!poisonRefs && "debug_value_addr does not support poison");
-      ResultVal = B.createDebugValueAddr(InstLoc, Val, VarInfo);
-    }
+    if (Val->getType().isAddress())
+      assert(!poisonRefs && "debug_value w/ address value does not support poison");
+    ResultVal = B.createDebugValue(InstLoc, Val, VarInfo, poisonRefs);
     break;
   }
 
@@ -3250,15 +3223,23 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
   }
 
   case SILInstructionKind::LoadInst: {
-    LoadOwnershipQualifier Qualifier;
+    Optional<LoadOwnershipQualifier> Qualifier;
     SourceLoc AddrLoc;
-
-    if (parseLoadOwnershipQualifier(Qualifier, *this) ||
-        parseTypedValueRef(Val, AddrLoc, B) ||
-        parseSILDebugLocation(InstLoc, B))
+    auto parseLoadOwnership = [](StringRef Str) {
+      return llvm::StringSwitch<Optional<LoadOwnershipQualifier>>(Str)
+          .Case("take", LoadOwnershipQualifier::Take)
+          .Case("copy", LoadOwnershipQualifier::Copy)
+          .Case("trivial", LoadOwnershipQualifier::Trivial)
+          .Default(None);
+    };
+    if (parseSILQualifier<LoadOwnershipQualifier>(Qualifier, parseLoadOwnership)
+        || parseTypedValueRef(Val, AddrLoc, B)
+        || parseSILDebugLocation(InstLoc, B)) {
       return true;
-
-    ResultVal = B.createLoad(InstLoc, Val, Qualifier);
+    }
+    if (!Qualifier)
+      Qualifier = LoadOwnershipQualifier::Unqualified;
+    ResultVal = B.createLoad(InstLoc, Val, Qualifier.getValue());
     break;
   }
 
@@ -3276,11 +3257,21 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
   case SILInstructionKind::BeginBorrowInst: {
     SourceLoc AddrLoc;
 
+    bool defined = false;
+    StringRef attributeName;
+
+    if (parseSILOptional(attributeName, *this)) {
+      if (attributeName.equals("defined"))
+        defined = true;
+      else
+        return true;
+    }
+
     if (parseTypedValueRef(Val, AddrLoc, B) ||
         parseSILDebugLocation(InstLoc, B))
       return true;
 
-    ResultVal = B.createBeginBorrow(InstLoc, Val);
+    ResultVal = B.createBeginBorrow(InstLoc, Val, defined);
     break;
   }
 
@@ -3318,8 +3309,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     ResultVal = B.createMarkDependence(InstLoc, Val, Base, forwardingOwnership);
@@ -3518,7 +3509,7 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
         return true;
     }
 
-    if (parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true)) {
+    if (parseSILDebugLocation(InstLoc, B)) {
       return true;
     }
 
@@ -3636,8 +3627,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     ResultVal =
@@ -3714,8 +3705,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     auto opaque = Lowering::AbstractionPattern::getOpaque();
@@ -3735,17 +3726,24 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
         parseASTType(TargetType) || parseConditionalBranchDestinations())
       return true;
 
+    ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B)) {
+      return true;
+    }
+
     auto opaque = Lowering::AbstractionPattern::getOpaque();
     ResultVal = B.createCheckedCastBranch(
         InstLoc, isExact, Val, F->getLoweredType(opaque, TargetType),
         TargetType, getBBForReference(SuccessBBName, SuccessBBLoc),
-        getBBForReference(FailureBBName, FailureBBLoc));
+        getBBForReference(FailureBBName, FailureBBLoc), forwardingOwnership);
     break;
   }
   case SILInstructionKind::CheckedCastValueBranchInst: {
-    if (parseASTType(SourceType) || parseVerbatim("in") ||
-        parseTypedValueRef(Val, B) || parseVerbatim("to") ||
-        parseASTType(TargetType) || parseConditionalBranchDestinations())
+    if (parseASTType(SourceType) || parseVerbatim("in")
+        || parseTypedValueRef(Val, B) || parseVerbatim("to")
+        || parseASTType(TargetType) || parseConditionalBranchDestinations()
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     auto opaque = Lowering::AbstractionPattern::getOpaque();
@@ -3797,8 +3795,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-    if (parseForwardingOwnershipKind(forwardingOwnership) ||
-        parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+    if (parseForwardingOwnershipKind(forwardingOwnership)
+        || parseSILDebugLocation(InstLoc, B))
       return true;
 
     ResultVal =
@@ -3826,8 +3824,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
     SourceLoc ToLoc, AddrLoc;
     Identifier ToToken;
     SILValue AddrVal;
-    StoreOwnershipQualifier StoreQualifier;
-    AssignOwnershipQualifier AssignQualifier;
+    Optional<StoreOwnershipQualifier> StoreQualifier;
+    Optional<AssignOwnershipQualifier> AssignQualifier;
     bool IsStore = Opcode == SILInstructionKind::StoreInst;
     bool IsAssign = Opcode == SILInstructionKind::AssignInst;
     if (parseValueName(From) ||
@@ -3835,10 +3833,28 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
                            "to"))
       return true;
 
-    if (IsStore && parseStoreOwnershipQualifier(StoreQualifier, *this))
+    auto parseStoreOwnership = [](StringRef Str) {
+      return llvm::StringSwitch<Optional<StoreOwnershipQualifier>>(Str)
+          .Case("init", StoreOwnershipQualifier::Init)
+          .Case("assign", StoreOwnershipQualifier::Assign)
+          .Case("trivial", StoreOwnershipQualifier::Trivial)
+          .Default(None);
+    };
+    if (IsStore
+        && parseSILQualifier<StoreOwnershipQualifier>(StoreQualifier,
+                                                      parseStoreOwnership))
       return true;
 
-    if (IsAssign && parseAssignOwnershipQualifier(AssignQualifier, *this))
+    auto parseAssignOwnership = [](StringRef Str) {
+      return llvm::StringSwitch<Optional<AssignOwnershipQualifier>>(Str)
+          .Case("reassign", AssignOwnershipQualifier::Reassign)
+          .Case("reinit", AssignOwnershipQualifier::Reinit)
+          .Case("init", AssignOwnershipQualifier::Init)
+          .Default(None);
+    };
+    if (IsAssign
+        && parseSILQualifier<AssignOwnershipQualifier>(AssignQualifier,
+                                                       parseAssignOwnership))
       return true;
 
     if (parseTypedValueRef(AddrVal, AddrLoc, B) ||
@@ -3859,15 +3875,19 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
     SILType ValType = AddrVal->getType().getObjectType();
 
     if (IsStore) {
+      if (!StoreQualifier)
+        StoreQualifier = StoreOwnershipQualifier::Unqualified;
       ResultVal =
           B.createStore(InstLoc, getLocalValue(From, ValType, InstLoc, B),
-                        AddrVal, StoreQualifier);
+                        AddrVal, StoreQualifier.getValue());
     } else {
       assert(IsAssign);
+      if (!AssignQualifier)
+        AssignQualifier = AssignOwnershipQualifier::Unknown;
 
       ResultVal =
           B.createAssign(InstLoc, getLocalValue(From, ValType, InstLoc, B),
-                         AddrVal, AssignQualifier);
+                         AddrVal, AssignQualifier.getValue());
     }
 
     break;
@@ -4103,7 +4123,12 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       SILDebugVariable VarInfo;
       if (parseSILDebugVar(VarInfo) || parseSILDebugLocation(InstLoc, B))
         return true;
-      ResultVal = B.createAllocStack(InstLoc, Ty, VarInfo, hasDynamicLifetime);
+      // It doesn't make sense to attach a debug var info if the name is empty
+      if (VarInfo.Name.size())
+        ResultVal =
+            B.createAllocStack(InstLoc, Ty, VarInfo, hasDynamicLifetime);
+      else
+        ResultVal = B.createAllocStack(InstLoc, Ty, {}, hasDynamicLifetime);
     } else {
       assert(Opcode == SILInstructionKind::MetatypeInst);
       if (parseSILDebugLocation(InstLoc, B))
@@ -4271,8 +4296,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
             F && F->hasOwnership() ? mergeSILValueOwnership(OpList)
                                    : ValueOwnershipKind(OwnershipKind::None);
 
-        if (parseForwardingOwnershipKind(forwardingOwnership) ||
-            parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+        if (parseForwardingOwnershipKind(forwardingOwnership)
+            || parseSILDebugLocation(InstLoc, B))
           return true;
 
         ResultVal = B.createTuple(InstLoc, Ty2, OpList, forwardingOwnership);
@@ -4345,8 +4370,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
           Operand ? Operand.getOwnershipKind()
                   : ValueOwnershipKind(OwnershipKind::None);
 
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B))
         return true;
 
       ResultVal =
@@ -4368,7 +4393,7 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       if (Opcode == SILInstructionKind::UncheckedEnumDataInst)
         parseForwardingOwnershipKind(forwardingOwnership);
 
-      if (parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseSILDebugLocation(InstLoc, B))
         return true;
       EnumElementDecl *Elt = cast<EnumElementDecl>(EltRef.getDecl());
       auto ResultTy = Operand->getType().getEnumElementType(
@@ -4427,7 +4452,7 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
           return true;
       }
 
-      if (parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseSILDebugLocation(InstLoc, B))
         return true;
       auto ResultTy = TT->getElement(Field).getType()->getCanonicalType();
       if (Opcode == SILInstructionKind::TupleElementAddrInst)
@@ -4702,8 +4727,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       ValueOwnershipKind forwardingOwnership =
           F && F->hasOwnership() ? mergeSILValueOwnership(OpList)
                                  : ValueOwnershipKind(OwnershipKind::None);
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true)) {
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B)) {
         return true;
       }
       if (Opcode == SILInstructionKind::StructInst) {
@@ -4729,7 +4754,7 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
           return true;
       }
 
-      if (parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseSILDebugLocation(InstLoc, B))
         return true;
       if (!FieldV || !isa<VarDecl>(FieldV)) {
         P.diagnose(NameLoc, diag::sil_struct_inst_wrong_field);
@@ -4945,7 +4970,7 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
         if (parseForwardingOwnershipKind(forwardingOwnership))
           return true;
       }
-      if (parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseSILDebugLocation(InstLoc, B))
         return true;
 
       // Resolve the results.
@@ -4975,18 +5000,19 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
 
       SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 4> CaseBBs;
       SILBasicBlock *DefaultBB = nullptr;
+      ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
       while (!peekSILDebugLocation(P) && P.consumeIf(tok::comma)) {
+        parsedComma = true;
+
         Identifier BBName;
         SourceLoc BBLoc;
-        // Parse 'default' sil-identifier.
-        if (P.consumeIf(tok::kw_default)) {
-          parseSILIdentifier(BBName, BBLoc, diag::expected_sil_block_name);
-          DefaultBB = getBBForReference(BBName, BBLoc);
-          break;
-        }
-
         // Parse 'case' sil-decl-ref ':' sil-identifier.
         if (P.consumeIf(tok::kw_case)) {
+          parsedComma = false;
+          if (DefaultBB) {
+            P.diagnose(P.Tok, diag::case_after_default);
+            return true;
+          }
           SILDeclRef ElemRef;
           if (parseSILDeclRef(ElemRef))
             return true;
@@ -4998,18 +5024,27 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
           continue;
         }
 
+        // Parse 'default' sil-identifier.
+        if (P.consumeIf(tok::kw_default)) {
+          parsedComma = false;
+          parseSILIdentifier(BBName, BBLoc, diag::expected_sil_block_name);
+          DefaultBB = getBBForReference(BBName, BBLoc);
+          continue;
+        }
+        break;
+      }
+      if (Opcode == SILInstructionKind::SwitchEnumInst
+          && parseForwardingOwnershipKind(forwardingOwnership)) {
+        return true;
+      }
+      if (parseSILDebugLocation(InstLoc, B))
+        return true;
+
+      if (parsedComma || (CaseBBs.empty() && !DefaultBB)) {
         P.diagnose(P.Tok, diag::expected_tok_in_sil_instr, "case or default");
         return true;
       }
 
-      ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-      if (Opcode == SILInstructionKind::SwitchEnumInst) {
-        if (parseForwardingOwnershipKind(forwardingOwnership))
-          return true;
-      }
-
-      if (parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
-        return true;
       if (Opcode == SILInstructionKind::SwitchEnumInst) {
         ResultVal = B.createSwitchEnum(InstLoc, Val, DefaultBB, CaseBBs, None,
                                        ProfileCounter(), forwardingOwnership);
@@ -5257,8 +5292,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
         return true;
 
       ValueOwnershipKind forwardingOwnership = Val.getOwnershipKind();
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B))
         return true;
 
       ArrayRef<ProtocolConformanceRef> conformances =
@@ -5425,8 +5460,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       }
 
       ValueOwnershipKind forwardingOwnership(OwnershipKind::None);
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B))
         return true;
       auto *parameterIndices = IndexSubset::get(
           P.Context, fnType->getNumParameters(), rawParameterIndices);
@@ -5474,8 +5509,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       }
 
       ValueOwnershipKind forwardingOwnership(OwnershipKind::None);
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B))
         return true;
 
       auto *parameterIndicesSubset = IndexSubset::get(
@@ -5520,8 +5555,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
 
       ValueOwnershipKind forwardingOwnership =
           functionOperand.getOwnershipKind();
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B))
         return true;
 
       ResultVal = B.createDifferentiableFunctionExtract(
@@ -5548,8 +5583,8 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
 
       ValueOwnershipKind forwardingOwnership =
           functionOperand.getOwnershipKind();
-      if (parseForwardingOwnershipKind(forwardingOwnership) ||
-          parseSILDebugLocation(InstLoc, B, /*parsedComma=*/ true))
+      if (parseForwardingOwnershipKind(forwardingOwnership)
+          || parseSILDebugLocation(InstLoc, B))
         return true;
       ResultVal = B.createLinearFunctionExtract(
           InstLoc, extractee, functionOperand, forwardingOwnership);

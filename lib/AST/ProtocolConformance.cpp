@@ -186,13 +186,6 @@ ProtocolConformanceRef::getWitnessByName(Type type, DeclName name) const {
   return getConcrete()->getWitnessDeclRef(requirement);
 }
 
-void *ProtocolConformance::operator new(size_t bytes, ASTContext &context,
-                                        AllocationArena arena,
-                                        unsigned alignment) {
-  return context.Allocate(bytes, alignment, arena);
-
-}
-
 #define CONFORMANCE_SUBCLASS_DISPATCH(Method, Args)                          \
 switch (getKind()) {                                                         \
   case ProtocolConformanceKind::Normal:                                      \
@@ -1284,11 +1277,10 @@ void NominalTypeDecl::prepareConformanceTable() const {
 }
 
 bool NominalTypeDecl::lookupConformance(
-       ModuleDecl *module, ProtocolDecl *protocol,
+       ProtocolDecl *protocol,
        SmallVectorImpl<ProtocolConformance *> &conformances) const {
   prepareConformanceTable();
   return ConformanceTable->lookupConformance(
-           module,
            const_cast<NominalTypeDecl *>(this),
            protocol,
            conformances);
@@ -1320,9 +1312,9 @@ void NominalTypeDecl::getImplicitProtocols(
 }
 
 void NominalTypeDecl::registerProtocolConformance(
-       ProtocolConformance *conformance) {
+       ProtocolConformance *conformance, bool synthesized) {
   prepareConformanceTable();
-  ConformanceTable->registerProtocolConformance(conformance);
+  ConformanceTable->registerProtocolConformance(conformance, synthesized);
 }
 
 ArrayRef<ValueDecl *>
@@ -1591,10 +1583,13 @@ ProtocolConformanceRef::getCanonicalConformanceRef() const {
 BuiltinProtocolConformance::BuiltinProtocolConformance(
     Type conformingType, ProtocolDecl *protocol,
     GenericSignature genericSig,
-    ArrayRef<Requirement> conditionalRequirements
+    ArrayRef<Requirement> conditionalRequirements,
+    BuiltinConformanceKind kind
 ) : RootProtocolConformance(ProtocolConformanceKind::Builtin, conformingType),
     protocol(protocol), genericSig(genericSig),
-    numConditionalRequirements(conditionalRequirements.size()) {
+    numConditionalRequirements(conditionalRequirements.size()),
+    builtinConformanceKind(static_cast<unsigned>(kind))
+{
   std::uninitialized_copy(conditionalRequirements.begin(),
                           conditionalRequirements.end(),
                           getTrailingObjects<Requirement>());
@@ -1660,4 +1655,35 @@ SourceLoc swift::extractNearestSourceLoc(const ProtocolConformanceRef conformanc
     return extractNearestSourceLoc(conformanceRef.getConcrete());
   }
   return SourceLoc();
+}
+
+bool ProtocolConformanceRef::hasMissingConformance(ModuleDecl *module) const {
+  return forEachMissingConformance(module,
+      [](BuiltinProtocolConformance *builtin) {
+        return true;
+      });
+}
+
+bool ProtocolConformanceRef::forEachMissingConformance(
+    ModuleDecl *module,
+    llvm::function_ref<bool(BuiltinProtocolConformance *missing)> fn) const {
+  if (!isConcrete())
+    return false;
+
+  // Is this a missing conformance?
+  ProtocolConformance *concreteConf = getConcrete();
+  RootProtocolConformance *rootConf = concreteConf->getRootConformance();
+  if (auto builtinConformance = dyn_cast<BuiltinProtocolConformance>(rootConf)){
+    if (builtinConformance->isMissing() && fn(builtinConformance))
+      return true;
+  }
+
+  // Check conformances that are part of this conformance.
+  auto subMap = concreteConf->getSubstitutions(module);
+  for (auto conformance : subMap.getConformances()) {
+    if (conformance.forEachMissingConformance(module, fn))
+      return true;
+  }
+
+  return false;
 }

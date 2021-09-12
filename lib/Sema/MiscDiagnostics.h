@@ -54,15 +54,14 @@ void fixItAccess(InFlightDiagnostic &diag,
                  bool isForSetter = false,
                  bool shouldUseDefaultAccess = false);
 
-/// Emit fix-its to correct the argument labels in \p expr, which is the
-/// argument tuple or single argument of a call.
+/// Emit fix-its to correct the argument labels in \p argList.
 ///
 /// If \p existingDiag is null, the fix-its will be attached to an appropriate
 /// error diagnostic.
 ///
 /// \returns true if the issue was diagnosed
 bool diagnoseArgumentLabelError(ASTContext &ctx,
-                                Expr *expr,
+                                const ArgumentList *argList,
                                 ArrayRef<Identifier> newNames,
                                 bool isSubscript,
                                 InFlightDiagnostic *existingDiag = nullptr);
@@ -111,8 +110,8 @@ void fixItEncloseTrailingClosure(ASTContext &ctx,
 /// Check that we use the async version of a function where available
 ///
 /// If a completion-handler function is called from an async context and it has
-/// a '@completionHandlerAsync' attribute, we emit a diagnostic suggesting the
-/// async call.
+/// a '@available' attribute with renamed field pointing to an async function,
+/// we emit a diagnostic suggesting the async call.
 void checkFunctionAsyncUsage(AbstractFunctionDecl *decl);
 void checkPatternBindingDeclAsyncUsage(PatternBindingDecl *decl);
 } // namespace swift

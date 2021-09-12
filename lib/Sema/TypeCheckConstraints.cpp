@@ -295,7 +295,7 @@ void constraints::performSyntacticDiagnosticsForTarget(
   case SolutionApplicationTarget::Kind::stmtCondition:
   case SolutionApplicationTarget::Kind::caseLabelItem:
   case SolutionApplicationTarget::Kind::patternBinding:
-  case SolutionApplicationTarget::Kind::uninitializedWrappedVar:
+  case SolutionApplicationTarget::Kind::uninitializedVar:
     // Nothing to do for these.
     return;
   }
@@ -446,6 +446,7 @@ bool TypeChecker::typeCheckBinding(
   // Assign error types to the pattern and its variables, to prevent it from
   // being referenced by the constraint system.
   if (patternType->hasUnresolvedType() ||
+      patternType->hasPlaceholder() ||
       patternType->hasUnboundGenericType()) {
     pattern->setType(ErrorType::get(Context));
   }
@@ -508,23 +509,24 @@ bool TypeChecker::typeCheckPatternBinding(PatternBindingDecl *PBD,
   // given by the initializer.
   if (auto var = pattern->getSingleVar()) {
     if (auto opaque = var->getOpaqueResultTypeDecl()) {
-      if (auto convertedInit = dyn_cast<UnderlyingToOpaqueExpr>(init)) {
-        auto underlyingType = convertedInit->getSubExpr()->getType()
-            ->mapTypeOutOfContext();
-        auto underlyingSubs = SubstitutionMap::get(
-          opaque->getOpaqueInterfaceGenericSignature(),
-          [&](SubstitutableType *t) -> Type {
-            if (t->isEqual(opaque->getUnderlyingInterfaceType())) {
-              return underlyingType;
-            }
-            return Type(t);
-          },
-          LookUpConformanceInModule(opaque->getModuleContext()));
-        
-        opaque->setUnderlyingTypeSubstitutions(underlyingSubs);
-      } else {
-        var->diagnose(diag::opaque_type_var_no_underlying_type);
-      }
+      init->forEachChildExpr([&](Expr *expr) -> Expr * {
+        if (auto coercionExpr = dyn_cast<UnderlyingToOpaqueExpr>(expr)) {
+          auto underlyingType =
+              coercionExpr->getSubExpr()->getType()->mapTypeOutOfContext();
+          auto underlyingSubs = SubstitutionMap::get(
+              opaque->getOpaqueInterfaceGenericSignature(),
+              [&](SubstitutableType *t) -> Type {
+                if (t->isEqual(opaque->getUnderlyingInterfaceType())) {
+                  return underlyingType;
+                }
+                return Type(t);
+              },
+              LookUpConformanceInModule(opaque->getModuleContext()));
+
+          opaque->setUnderlyingTypeSubstitutions(underlyingSubs);
+        }
+        return expr;
+      });
     }
   }
 
@@ -631,11 +633,9 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
   PrettyStackTracePattern stackTrace(Context, "type-checking", EP);
 
   // Create a 'let' binding to stand in for the RHS value.
-  auto *matchVar = new (Context) VarDecl(/*IsStatic*/false,
-                                         VarDecl::Introducer::Let,
-                                         EP->getLoc(),
-                                         Context.getIdentifier("$match"),
-                                         DC);
+  auto *matchVar =
+      new (Context) VarDecl(/*IsStatic*/ false, VarDecl::Introducer::Let,
+                            EP->getLoc(), Context.Id_PatternMatchVar, DC);
   matchVar->setInterfaceType(rhsType->mapTypeOutOfContext());
 
   matchVar->setImplicit();
@@ -1878,7 +1878,7 @@ static Expr *lookThroughBridgeFromObjCCall(ASTContext &ctx, Expr *expr) {
 
   if (callee == ctx.getForceBridgeFromObjectiveC() ||
       callee == ctx.getConditionallyBridgeFromObjectiveC())
-    return cast<TupleExpr>(call->getArg())->getElement(0);
+    return call->getArgs()->getExpr(0);
 
   return nullptr;
 }

@@ -16,9 +16,13 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Statistic.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/Support/Allocator.h"
-#include "RewriteSystem.h"
+#include "Debug.h"
+#include "Histogram.h"
+#include "Symbol.h"
+#include "Term.h"
 
 namespace swift {
 
@@ -42,25 +46,43 @@ class RewriteContext final {
   /// Folding set for uniquing terms.
   llvm::FoldingSet<Term::Storage> Terms;
 
+  /// Cache for associated type declarations.
+  llvm::DenseMap<Symbol, AssociatedTypeDecl *> AssocTypes;
+
+  /// Cache for merged associated type symbols.
+  llvm::DenseMap<std::pair<Symbol, Symbol>, Symbol> MergedAssocTypes;
+
+  ASTContext &Context;
+
+  DebugOptions Debug;
+
   RewriteContext(const RewriteContext &) = delete;
   RewriteContext(RewriteContext &&) = delete;
   RewriteContext &operator=(const RewriteContext &) = delete;
   RewriteContext &operator=(RewriteContext &&) = delete;
 
-  ASTContext &Context;
-
 public:
-  /// Statistical counters.
+  /// Statistics.
   UnifiedStatsReporter *Stats;
 
-  RewriteContext(ASTContext &ctx) : Context(ctx), Stats(ctx.Stats) {}
+  /// Histograms.
+  Histogram SymbolHistogram;
+  Histogram TermHistogram;
+  Histogram RuleTrieHistogram;
+  Histogram RuleTrieRootHistogram;
+  Histogram PropertyTrieHistogram;
+  Histogram PropertyTrieRootHistogram;
+
+  explicit RewriteContext(ASTContext &ctx);
+
+  DebugOptions getDebugOptions() const { return Debug; }
 
   Term getTermForType(CanType paramType, const ProtocolDecl *proto);
 
   MutableTerm getMutableTermForType(CanType paramType,
                                     const ProtocolDecl *proto);
 
-  ASTContext &getASTContext() { return Context; }
+  ASTContext &getASTContext() const { return Context; }
 
   Type getTypeForTerm(Term term,
                       TypeArrayView<GenericTypeParamType> genericParams,
@@ -73,6 +95,14 @@ public:
   Type getRelativeTypeForTerm(
                       const MutableTerm &term, const MutableTerm &prefix,
                       const ProtocolGraph &protos) const;
+
+  AssociatedTypeDecl *getAssociatedTypeForSymbol(Symbol symbol,
+                                                 const ProtocolGraph &protos);
+
+  Symbol mergeAssociatedTypes(Symbol lhs, Symbol rhs,
+                              const ProtocolGraph &protos);
+
+  ~RewriteContext();
 };
 
 } // end namespace rewriting

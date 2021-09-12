@@ -435,11 +435,12 @@ ERROR(deprecated_operator_body_use_group,PointsToFirstBadToken,
       "use a precedence group instead", ())
 ERROR(operator_decl_no_fixity,none,
       "operator must be declared as 'prefix', 'postfix', or 'infix'", ())
+ERROR(operator_decl_expected_precedencegroup, none,
+      "expected precedence group name after ':' in operator declaration", ())
 
-ERROR(operator_decl_expected_type,none,
-      "expected designated type in operator declaration", ())
-ERROR(operator_decl_trailing_comma,none,
-      "trailing comma in operator declaration", ())
+WARNING(operator_decl_remove_designated_types,none,
+        "designated types are no longer used by the compiler; please remove "
+        "the designated type list from this operator declaration", ())
 
 // PrecedenceGroup
 ERROR(precedencegroup_not_infix,none,
@@ -487,6 +488,7 @@ ERROR(referenced_value_no_accessor,none,
       "referenced declaration has no %select{getter|setter}0", (unsigned))
 ERROR(expected_sil_value_ownership_kind,none,
       "expected value ownership kind in SIL code", ())
+ERROR(unrecognized_sil_qualifier,none, "unrecognized SIL qualifier", ())
 ERROR(silfunc_and_silarg_have_incompatible_sil_value_ownership,none,
       "SILFunction and SILArgument have mismatching ValueOwnershipKinds. "
       "Function type specifies: '@%0'. SIL argument specifies: '@%1'.",
@@ -1703,11 +1705,6 @@ ERROR(sil_inst_autodiff_invalid_witness_generic_signature,PointsToFirstBadToken,
       "parameters as original function generic signature '%1'",
       (StringRef, StringRef))
 
-// completionHandlerAsync
-ERROR(attr_completion_handler_async_invalid_name, none,
-      "argument of '%0' attribute must be an identifier or full function name",
-      (StringRef))
-
 //------------------------------------------------------------------------------
 // MARK: Generics parsing diagnostics
 //------------------------------------------------------------------------------
@@ -1841,6 +1838,11 @@ ERROR(availability_query_repeated_platform, none,
 ERROR(attr_requires_concurrency, none,
       "'%0' %select{attribute|modifier}1 is only valid when experimental "
       "concurrency is enabled",
+      (StringRef, bool))
+
+ERROR(attr_requires_distributed, none,
+      "'%0' %select{attribute|modifier}1 is only valid when experimental "
+      "distributed support is enabled",
       (StringRef, bool))
 
 //------------------------------------------------------------------------------

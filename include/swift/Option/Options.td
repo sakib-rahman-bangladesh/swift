@@ -418,6 +418,11 @@ def define_availability : Separate<["-"], "define-availability">,
   HelpText<"Define an availability macro in the format 'macroName : iOS 13.0, macOS 10.15'">,
   MetaVarName<"<macro>">;
 
+def library_level : Separate<["-"], "library-level">,
+  MetaVarName<"<level>">,
+  Flags<[HelpHidden, FrontendOption, ModuleInterfaceOption]>,
+  HelpText<"Library distribution level 'api', 'spi' or 'other' (the default)">;
+
 def module_name : Separate<["-"], "module-name">,
   Flags<[FrontendOption, ModuleInterfaceOption, SwiftAPIExtractOption,
          SwiftSymbolGraphExtractOption]>,
@@ -580,16 +585,6 @@ def enable_experimental_concise_pound_file : Flag<["-"],
   Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"Enable experimental concise '#file' identifier">;
 
-def disable_fuzzy_forward_scan_trailing_closure_matching : Flag<["-"],
-    "disable-fuzzy-forward-scan-trailing-closure-matching">,
-  Flags<[FrontendOption]>,
-  HelpText<"Disable fuzzy forward-scan trailing closure matching">;
-
-def enable_fuzzy_forward_scan_trailing_closure_matching : Flag<["-"],
-    "enable-fuzzy-forward-scan-trailing-closure-matching">,
-  Flags<[FrontendOption]>,
-  HelpText<"Enable fuzzy forward-scan trailing closure matching">;
-
 def enable_experimental_cxx_interop :
   Flag<["-"], "enable-experimental-cxx-interop">,
   HelpText<"Allow importing C++ modules into Swift (experimental feature)">;
@@ -600,8 +595,17 @@ def experimental_cxx_stdlib :
 
 def experimental_emit_module_separately:
   Flag<["-"], "experimental-emit-module-separately">,
-  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
-  HelpText<"Schedule a swift module emission job instead of a merge-modules job (new Driver only)">;
+  Flags<[NoInteractiveOption, HelpHidden]>,
+  HelpText<"Emit module files as a distinct job (new Driver only)">;
+
+def no_emit_module_separately:
+  Flag<["-"], "no-emit-module-separately">,
+  Flags<[NoInteractiveOption, HelpHidden]>,
+  HelpText<"Force using merge-module as the incremental build mode (new Driver only)">;
+
+def requirement_machine_EQ : Joined<["-"], "requirement-machine=">,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
+  HelpText<"Control usage of experimental generics implementation: 'on', 'off', or 'verify'">;
 
 // Diagnostic control options
 def suppress_warnings : Flag<["-"], "suppress-warnings">,
@@ -655,7 +659,7 @@ def warn_swift3_objc_inference : Flag<["-"], "warn-swift3-objc-inference">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild, HelpHidden]>;
 
 def warn_concurrency : Flag<["-"], "warn-concurrency">,
-  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ModuleInterfaceOptionIgnorable]>,
   HelpText<"Warn about code that is unsafe according to the Swift Concurrency "
            "model and will become ill-formed in a future language version">;
 
@@ -697,7 +701,7 @@ def libc : Separate<["-"], "libc">, HelpText<"libc runtime library to use">;
 
 def linker_option_Group : OptionGroup<"<linker-specific options>">;
 
-def l : Joined<["-"], "l">, Group<linker_option_Group>,
+def l : JoinedOrSeparate<["-"], "l">, Group<linker_option_Group>,
     Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
     HelpText<"Specifies a library which should be linked against">;
 def framework : Separate<["-"], "framework">, Group<linker_option_Group>,

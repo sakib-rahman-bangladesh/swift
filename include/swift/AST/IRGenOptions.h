@@ -343,6 +343,8 @@ public:
   /// Whether to disable using mangled names for accessing concrete type metadata.
   unsigned DisableConcreteTypeMetadataMangledNameAccessors : 1;
 
+  unsigned EnableGlobalISel : 1;
+
   /// The number of threads for multi-threaded code generation.
   unsigned NumThreads = 0;
 
@@ -398,7 +400,8 @@ public:
         UseTypeLayoutValueHandling(true),
         GenerateProfile(false), EnableDynamicReplacementChaining(false),
         DisableRoundTripDebugTypes(false), DisableDebuggerShadowCopies(false),
-        DisableConcreteTypeMetadataMangledNameAccessors(false), CmdArgs(),
+        DisableConcreteTypeMetadataMangledNameAccessors(false),
+        EnableGlobalISel(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
         TypeInfoFilter(TypeInfoDumpFilter::All) {}
 

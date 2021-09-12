@@ -152,10 +152,6 @@ static ParserStatus parseDefaultArgument(
 /// Determine whether we are at the start of a parameter name when
 /// parsing a parameter.
 bool Parser::startsParameterName(bool isClosure) {
-  // '_' cannot be a type, so it must be a parameter name.
-  if (Tok.is(tok::kw__))
-    return true;
-
   // To have a parameter name here, we need a name.
   if (!Tok.canBeArgumentLabel())
     return false;
@@ -168,7 +164,8 @@ bool Parser::startsParameterName(bool isClosure) {
   // If the next token can be an argument label, we might have a name.
   if (nextTok.canBeArgumentLabel()) {
     // If the first name wasn't "isolated", we're done.
-    if (!Tok.isContextualKeyword("isolated"))
+    if (!Tok.isContextualKeyword("isolated") &&
+        !Tok.isContextualKeyword("some"))
       return true;
 
     // "isolated" can be an argument label, but it's also a contextual keyword,
@@ -1055,24 +1052,16 @@ ParserResult<Pattern> Parser::parseTypedPattern() {
           contextChange.emplace(*this, CurDeclContext, &dummyContext);
         }
         
-        SourceLoc lParenLoc, rParenLoc;
-        SmallVector<Expr *, 2> args;
-        SmallVector<Identifier, 2> argLabels;
-        SmallVector<SourceLoc, 2> argLabelLocs;
-        SmallVector<TrailingClosure, 2> trailingClosures;
-        ParserStatus status = parseExprList(tok::l_paren, tok::r_paren,
-                                            /*isPostfix=*/true,
-                                            /*isExprBasic=*/false,
-                                            lParenLoc, args, argLabels,
-                                            argLabelLocs, rParenLoc,
-                                            trailingClosures,
-                                            SyntaxKind::Unknown);
-        if (status.isSuccess() && !status.hasCodeCompletion()) {
+        SmallVector<ExprListElt, 2> elts;
+        auto argListResult = parseArgumentList(tok::l_paren, tok::r_paren,
+                                               /*isExprBasic*/ false);
+        if (!argListResult.isParseErrorOrHasCompletion()) {
           backtrack.cancelBacktrack();
           
           // Suggest replacing ':' with '='
-          diagnose(lParenLoc, diag::initializer_as_typed_pattern)
-            .highlight({Ty.get()->getStartLoc(), rParenLoc})
+          auto *args = argListResult.get();
+          diagnose(args->getLParenLoc(), diag::initializer_as_typed_pattern)
+            .highlight({Ty.get()->getStartLoc(), args->getRParenLoc()})
             .fixItReplace(colonLoc, " = ");
           result.setIsParseError();
         }

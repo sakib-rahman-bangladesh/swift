@@ -17,6 +17,7 @@
 #ifndef SWIFT_AST_ASTCONTEXT_H
 #define SWIFT_AST_ASTCONTEXT_H
 
+#include "swift/AST/ASTAllocated.h"
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
@@ -37,6 +38,7 @@
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Allocator.h"
@@ -105,6 +107,7 @@ namespace swift {
   class InheritedProtocolConformance;
   class SelfProtocolConformance;
   class SpecializedProtocolConformance;
+  enum class BuiltinConformanceKind;
   class BuiltinProtocolConformance;
   enum class ProtocolConformanceState;
   class Pattern;
@@ -142,22 +145,6 @@ namespace rewriting {
 namespace syntax {
   class SyntaxArena;
 }
-
-/// The arena in which a particular ASTContext allocation will go.
-enum class AllocationArena {
-  /// The permanent arena, which is tied to the lifetime of
-  /// the ASTContext.
-  ///
-  /// All global declarations and types need to be allocated into this arena.
-  /// At present, everything that is not a type involving a type variable is
-  /// allocated in this arena.
-  Permanent,
-  /// The constraint solver's temporary arena, which is tied to the
-  /// lifetime of a particular instance of the constraint solver.
-  ///
-  /// Any type involving a type variable is allocated in this arena.
-  ConstraintSolver
-};
 
 /// Lists the set of "known" Foundation entities that are used in the
 /// compiler.
@@ -751,12 +738,19 @@ public:
   /// Get the runtime availability of support for concurrency.
   AvailabilityContext getConcurrencyAvailability();
 
+  /// Get the back-deployed availability for concurrency.
+  AvailabilityContext getBackDeployedConcurrencyAvailability();
+
   /// Get the runtime availability of support for differentiation.
   AvailabilityContext getDifferentiationAvailability();
 
   /// Get the runtime availability of getters and setters of multi payload enum
   /// tag single payloads.
   AvailabilityContext getMultiPayloadEnumTagSinglePayload();
+
+  /// Get the runtime availability of the Objective-C enabled
+  /// swift_isUniquelyReferenced functions.
+  AvailabilityContext getObjCIsUniquelyReferencedAvailability();
 
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
@@ -777,6 +771,11 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.6
   /// compiler for the target platform.
   AvailabilityContext getSwift56Availability();
+
+  // Note: Update this function if you add a new getSwiftXYAvailability above.
+  /// Get the runtime availability for a particular version of Swift (5.0+).
+  AvailabilityContext
+  getSwift5PlusAvailability(llvm::VersionTuple swiftVersion);
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
@@ -853,6 +852,13 @@ public:
       StringRef moduleName,
       ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate);
+
+  /// Compute the extra implicit framework search paths on Apple platforms:
+  /// $SDKROOT/System/Library/Frameworks/ and $SDKROOT/Library/Frameworks/.
+  std::vector<std::string> getDarwinImplicitFrameworkSearchPaths() const;
+
+  /// Return a set of all possible filesystem locations where modules can be found.
+  llvm::StringSet<> getAllModuleSearchPathsSet() const;
 
   /// Load extensions to the given nominal type from the external
   /// module loaders.
@@ -1034,7 +1040,8 @@ public:
   BuiltinProtocolConformance *
   getBuiltinConformance(Type type, ProtocolDecl *protocol,
                         GenericSignature genericSig,
-                        ArrayRef<Requirement> conditionalRequirements);
+                        ArrayRef<Requirement> conditionalRequirements,
+                        BuiltinConformanceKind kind);
 
   /// A callback used to produce a diagnostic for an ill-formed protocol
   /// conformance that was type-checked before we're actually walking the
@@ -1171,6 +1178,11 @@ public:
   /// Retrieve or create a term rewriting system for answering queries on
   /// type parameters written against the given generic signature.
   rewriting::RequirementMachine *getOrCreateRequirementMachine(
+      CanGenericSignature sig);
+
+  /// This is a hack to break cycles. Don't introduce new callers of this
+  /// method.
+  bool isRecursivelyConstructingRequirementMachine(
       CanGenericSignature sig);
 
   /// Retrieve a generic signature with a single unconstrained type parameter,

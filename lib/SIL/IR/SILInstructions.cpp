@@ -138,6 +138,7 @@ TailAllocatedDebugVariable::TailAllocatedDebugVariable(
   Bits.Data.HasValue = true;
   Bits.Data.Constant = Var->Constant;
   Bits.Data.ArgNo = Var->ArgNo;
+  Bits.Data.Implicit = Var->Implicit;
   Bits.Data.NameLength = Var->Name.size();
   assert(Bits.Data.ArgNo == Var->ArgNo && "Truncation");
   assert(Bits.Data.NameLength == Var->Name.size() && "Truncation");
@@ -160,19 +161,59 @@ StringRef TailAllocatedDebugVariable::getName(const char *buf) const {
   return StringRef();
 }
 
+Optional<SILDebugVariable>
+SILDebugVariable::createFromAllocation(const AllocationInst *AI) {
+  Optional<SILDebugVariable> VarInfo;
+  if (const auto *ASI = dyn_cast_or_null<AllocStackInst>(AI))
+    VarInfo = ASI->getVarInfo();
+  // TODO: Support AllocBoxInst
+
+  if (!VarInfo)
+    return VarInfo;
+
+  // Copy everything but the DIExpr
+  VarInfo->DIExpr.clear();
+
+  // Coalesce the debug loc attached on AI into VarInfo
+  SILType Type = AI->getType();
+  SILLocation InstLoc = AI->getLoc();
+  const SILDebugScope *InstDS = AI->getDebugScope();
+  if (!VarInfo->Type)
+    VarInfo->Type = Type;
+  if (!VarInfo->Loc)
+    VarInfo->Loc = InstLoc;
+  if (!VarInfo->Scope)
+    VarInfo->Scope = InstDS;
+
+  return VarInfo;
+}
+
 AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
                                ArrayRef<SILValue> TypeDependentOperands,
-                               SILFunction &F,
-                               Optional<SILDebugVariable> Var,
+                               SILFunction &F, Optional<SILDebugVariable> Var,
                                bool hasDynamicLifetime)
     : InstructionBase(Loc, elementType.getAddressType()),
-    dynamicLifetime(hasDynamicLifetime) {
+      SILDebugVariableSupplement(Var ? Var->DIExpr.getNumElements() : 0,
+                                 Var ? Var->Type.hasValue() : false,
+                                 Var ? Var->Loc.hasValue() : false,
+                                 Var ? Var->Scope != nullptr : false),
+      dynamicLifetime(hasDynamicLifetime) {
   SILNode::Bits.AllocStackInst.NumOperands =
     TypeDependentOperands.size();
   assert(SILNode::Bits.AllocStackInst.NumOperands ==
          TypeDependentOperands.size() && "Truncation");
   SILNode::Bits.AllocStackInst.VarInfo =
-    TailAllocatedDebugVariable(Var, getTrailingObjects<char>()).getRawValue();
+      TailAllocatedDebugVariable(Var, getTrailingObjects<char>(),
+                                 getTrailingObjects<SILType>(),
+                                 getTrailingObjects<SILLocation>(),
+                                 getTrailingObjects<const SILDebugScope *>(),
+                                 getTrailingObjects<SILDIExprElement>())
+          .getRawValue();
+  if (auto *VD = Loc.getLocation().getAsASTNode<VarDecl>()) {
+    TailAllocatedDebugVariable DbgVar(SILNode::Bits.AllocStackInst.VarInfo);
+    DbgVar.setImplicit(VD->isImplicit() || DbgVar.isImplicit());
+    SILNode::Bits.AllocStackInst.VarInfo = DbgVar.getRawValue();
+  }
   TrailingOperandsList::InitOperandsList(getAllOperands().begin(), this,
                                          TypeDependentOperands);
 }
@@ -297,14 +338,15 @@ SILType AllocBoxInst::getAddressType() const {
 DebugValueInst::DebugValueInst(SILDebugLocation DebugLoc, SILValue Operand,
                                SILDebugVariable Var, bool poisonRefs)
     : UnaryInstructionBase(DebugLoc, Operand),
-      NumDIExprOperands(Var.DIExpr.getNumElements()),
-      HasAuxDebugVariableType(Var.Type.hasValue()),
-      AuxVariableSourceLoc((Var.Loc.hasValue() ? SILSourceLocKind::Loc : 0) |
-                           (Var.Scope ? SILSourceLocKind::Scope : 0)),
+      SILDebugVariableSupplement(Var.DIExpr.getNumElements(),
+                                 Var.Type.hasValue(), Var.Loc.hasValue(),
+                                 Var.Scope),
       VarInfo(Var, getTrailingObjects<char>(), getTrailingObjects<SILType>(),
               getTrailingObjects<SILLocation>(),
               getTrailingObjects<const SILDebugScope *>(),
               getTrailingObjects<SILDIExprElement>()) {
+  if (auto *VD = DebugLoc.getLocation().getAsASTNode<VarDecl>())
+    VarInfo.setImplicit(VD->isImplicit() || VarInfo.isImplicit());
   setPoisonRefs(poisonRefs);
 }
 
@@ -315,29 +357,30 @@ DebugValueInst *DebugValueInst::create(SILDebugLocation DebugLoc,
   return ::new (buf) DebugValueInst(DebugLoc, Operand, Var, poisonRefs);
 }
 
-DebugValueAddrInst::DebugValueAddrInst(SILDebugLocation DebugLoc,
-                                       SILValue Operand, SILDebugVariable Var)
-    : UnaryInstructionBase(DebugLoc, Operand),
-      NumDIExprOperands(Var.DIExpr.getNumElements()),
-      HasAuxDebugVariableType(Var.Type.hasValue()),
-      AuxVariableSourceLoc((Var.Loc.hasValue() ? SILSourceLocKind::Loc : 0) |
-                           (Var.Scope ? SILSourceLocKind::Scope : 0)),
-      VarInfo(Var, getTrailingObjects<char>(), getTrailingObjects<SILType>(),
-              getTrailingObjects<SILLocation>(),
-              getTrailingObjects<const SILDebugScope *>(),
-              getTrailingObjects<SILDIExprElement>()) {}
+DebugValueInst *DebugValueInst::createAddr(SILDebugLocation DebugLoc,
+                                           SILValue Operand, SILModule &M,
+                                           SILDebugVariable Var) {
+  // For alloc_stack, debug_value is used to annotate the associated
+  // memory location, so we shouldn't attach op_deref.
+  if (!isa<AllocStackInst>(Operand))
+    Var.DIExpr.prependElements(
+      {SILDIExprElement::createOperator(SILDIExprOperator::Dereference)});
+  void *buf = allocateDebugVarCarryingInst<DebugValueInst>(M, Var);
+  return ::new (buf) DebugValueInst(DebugLoc, Operand, Var,
+                                    /*poisonRefs=*/false);
+}
 
-DebugValueAddrInst *DebugValueAddrInst::create(SILDebugLocation DebugLoc,
-                                               SILValue Operand, SILModule &M,
-                                               SILDebugVariable Var) {
-  void *buf = allocateDebugVarCarryingInst<DebugValueAddrInst>(M, Var);
-  return ::new (buf) DebugValueAddrInst(DebugLoc, Operand, Var);
+bool DebugValueInst::exprStartsWithDeref() const {
+  if (!NumDIExprOperands)
+    return false;
+
+  llvm::ArrayRef<SILDIExprElement> DIExprElements(
+      getTrailingObjects<SILDIExprElement>(), NumDIExprOperands);
+  return DIExprElements.front().getAsOperator()
+          == SILDIExprOperator::Dereference;
 }
 
 VarDecl *DebugValueInst::getDecl() const {
-  return getLoc().getAsASTNode<VarDecl>();
-}
-VarDecl *DebugValueAddrInst::getDecl() const {
   return getLoc().getAsASTNode<VarDecl>();
 }
 
@@ -2851,4 +2894,69 @@ ReturnInst::ReturnInst(SILFunction &func, SILDebugLocation debugLoc,
   assert(ownershipKind &&
          "Conflicting ownership kinds when creating term inst from function "
          "result info?!");
+}
+
+// This may be called in an invalid SIL state. SILCombine creates new
+// terminators in non-terminator position and defers deleting the original
+// terminator until after all modification.
+SILPhiArgument *OwnershipForwardingTermInst::createResult(SILBasicBlock *succ,
+                                                          SILType resultTy) {
+  // The forwarding instruction declares a forwarding ownership kind that
+  // determines the ownership of its results.
+  auto resultOwnership = getForwardingOwnershipKind();
+
+  // Trivial results have no ownership. Although it is valid for a trivially
+  // typed value to have ownership, it is never necessary and less efficient.
+  if (resultTy.isTrivial(*getFunction())) {
+    resultOwnership = OwnershipKind::None;
+
+  } else if (resultOwnership == OwnershipKind::None) {
+    // switch_enum strangely allows results to acquire ownership out of thin
+    // air whenever the operand has no ownership and result is nontrivial:
+    //     %e = enum $Optional<AnyObject>, #Optional.none!enumelt
+    //     switch_enum %e : $Optional<AnyObject>,
+    //                 case #Optional.some!enumelt: bb2...
+    //   bb2(%arg : @guaranteed T):
+    //
+    // We can either use None or Guaranteed. None would correctly propagate
+    // ownership and would maintain the invariant that guaranteed values are
+    // always within a borrow scope. However it would result in a nontrivial
+    // type without ownership. The lifetime verifier does not like that.
+    resultOwnership = OwnershipKind::Guaranteed;
+  }
+  return succ->createPhiArgument(resultTy, resultOwnership);
+}
+
+SILPhiArgument *SwitchEnumInst::createDefaultResult() {
+  auto *f = getFunction();
+  if (!f->hasOwnership())
+    return nullptr;
+
+  if (!hasDefault())
+    return nullptr;
+
+  assert(getDefaultBB()->getNumArguments() == 0 && "precondition");
+
+  auto enumTy = getOperand()->getType();
+  NullablePtr<EnumElementDecl> uniqueCase = getUniqueCaseForDefault();
+
+  // Without a unique default case, the OSSA result simply forwards the
+  // switch_enum operand.
+  if (!uniqueCase)
+    return createResult(getDefaultBB(), enumTy);
+
+  // With a unique default case, the result is materialized exactly the same way
+  // as a matched result. It has a value iff the unique case has a payload.
+  if (!uniqueCase.get()->hasAssociatedValues())
+    return nullptr;
+
+  auto resultTy = enumTy.getEnumElementType(uniqueCase.get(), f->getModule(),
+                                            f->getTypeExpansionContext());
+  return createResult(getDefaultBB(), resultTy);
+}
+
+SILPhiArgument *SwitchEnumInst::createOptionalSomeResult() {
+  auto someDecl = getModule().getASTContext().getOptionalSomeDecl();
+  auto someBB = getCaseDestination(someDecl);
+  return createResult(someBB, getOperand()->getType().unwrapOptionalType());
 }

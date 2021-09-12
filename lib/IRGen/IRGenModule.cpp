@@ -802,6 +802,17 @@ namespace RuntimeConstants {
     }
     return RuntimeAvailability::AlwaysAvailable;
   }
+
+  RuntimeAvailability
+  ObjCIsUniquelyReferencedAvailability(ASTContext &context) {
+    auto featureAvailability =
+        context.getObjCIsUniquelyReferencedAvailability();
+    if (!isDeploymentAvailabilityContainedIn(context, featureAvailability)) {
+      return RuntimeAvailability::ConditionallyAvailable;
+    }
+    return RuntimeAvailability::AlwaysAvailable;
+  }
+
 } // namespace RuntimeConstants
 
 // We don't use enough attributes to justify generalizing the
@@ -1691,7 +1702,7 @@ bool IRGenModule::shouldPrespecializeGenericMetadata() {
       (Triple.isOSDarwin() ||
        (Triple.isOSLinux() && !(Triple.isARM() && Triple.isArch32Bit())));
   if (canPrespecializeTarget && isStandardLibrary()) {
-    return true;
+    return IRGen.Opts.PrespecializeGenericMetadata;
   }
   auto &context = getSwiftModule()->getASTContext();
   auto deploymentAvailability =

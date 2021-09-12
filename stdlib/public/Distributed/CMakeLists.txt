@@ -13,6 +13,7 @@
 set(swift_distributed_link_libraries
   swiftCore)
 
+
 add_swift_target_library(swift_Distributed ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB
   AssertDistributed.swift
   ActorTransport.swift
@@ -34,7 +35,7 @@ add_swift_target_library(swift_Distributed ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
     -parse-stdlib
     -Xfrontend -enable-experimental-distributed
     -Xfrontend -define-availability
-    -Xfrontend \"SwiftStdlib 5.5:macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0\"
+    -Xfrontend "SwiftStdlib 5.5:macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0"
   LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
 
   SWIFT_MODULE_DEPENDS _Concurrency

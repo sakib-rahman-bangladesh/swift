@@ -589,8 +589,7 @@ namespace {
       auto nominal = element->getAnyNominal();
       auto simdscalar = Impl.SwiftContext.getProtocol(KnownProtocolKind::SIMDScalar);
       SmallVector<ProtocolConformance *, 2> conformances;
-      if (simdscalar && nominal->lookupConformance(nominal->getParentModule(),
-                                                   simdscalar, conformances)) {
+      if (simdscalar && nominal->lookupConformance(simdscalar, conformances)) {
         // Element type conforms to SIMDScalar. Get the SIMDn generic type
         // if it exists.
         SmallString<8> name("SIMD");
@@ -1828,12 +1827,17 @@ ImportedType ClangImporter::Implementation::importFunctionParamsAndReturnType(
   bool allowNSUIntegerAsInt =
       shouldAllowNSUIntegerAsInt(isFromSystemModule, clangDecl);
 
+  // Only eagerly import the return type if it's not too expensive (the current
+  // huristic for that is if it's not a record type).
   ImportedType importedType;
   if (auto templateType =
           dyn_cast<clang::TemplateTypeParmType>(clangDecl->getReturnType())) {
     importedType = {findGenericTypeInGenericDecls(templateType, genericParams),
                     false};
-  } else {
+  } else if (!isa<clang::RecordType>(clangDecl->getReturnType()) ||
+             // TODO: we currently don't lazily load operator return types, but
+             // this should be trivial to add.
+             clangDecl->isOverloadedOperator()) {
     importedType =
         importFunctionReturnType(dc, clangDecl, allowNSUIntegerAsInt);
     if (!importedType)
@@ -2807,8 +2811,7 @@ bool ClangImporter::Implementation::matchesHashableBound(Type type) {
     auto hashable = SwiftContext.getProtocol(KnownProtocolKind::Hashable);
     SmallVector<ProtocolConformance *, 2> conformances;
     return hashable &&
-      nominal->lookupConformance(nominal->getParentModule(), hashable,
-                                 conformances);
+      nominal->lookupConformance(hashable, conformances);
   }
 
   return false;

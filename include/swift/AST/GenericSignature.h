@@ -140,9 +140,6 @@ public:
 
   explicit operator bool() const { return Ptr != 0; }
 
-  /// Whether the given set of requirements involves a type variable.
-  static bool hasTypeVariable(ArrayRef<Requirement> requirements);
-
   friend llvm::hash_code hash_value(GenericSignature sig) {
     using llvm::hash_value;
     return hash_value(sig.getPointer());
@@ -199,13 +196,13 @@ public:
   /// Retrieve the requirements.
   ArrayRef<Requirement> getRequirements() const;
 
-  /// Whether this generic signature involves a type variable.
-  bool hasTypeVariable() const;
-
   /// Returns the generic environment that provides fresh contextual types
   /// (archetypes) that correspond to the interface types in this generic
   /// signature.
   GenericEnvironment *getGenericEnvironment() const;
+
+  /// Check invariants.
+  void verify() const;
 };
 
 /// A reference to a canonical generic signature.
@@ -373,7 +370,8 @@ public:
   /// T: Foo or T == U (etc.) with the information it knows. This includes
   /// checking against global state, if any/all of the types in the requirement
   /// are concrete, not type parameters.
-  bool isRequirementSatisfied(Requirement requirement) const;
+  bool isRequirementSatisfied(
+      Requirement requirement, bool allowMissing = false) const;
 
   /// Return the requirements of this generic signature that are not also
   /// satisfied by \c otherSig.
@@ -476,6 +474,11 @@ inline bool CanGenericSignature::isActuallyCanonicalOrNull() const {
              llvm::DenseMapInfo<GenericSignatureImpl *>::getTombstoneKey() ||
          getPointer()->isCanonical();
 }
+
+int compareAssociatedTypes(AssociatedTypeDecl *assocType1,
+                           AssociatedTypeDecl *assocType2);
+
+int compareDependentTypes(Type type1, Type type2);
 
 } // end namespace swift
 

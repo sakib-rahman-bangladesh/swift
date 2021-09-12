@@ -133,6 +133,9 @@ enum class TypeResolverContext : uint8_t {
 
   /// Whether this is an "inherited" type.
   Inherited,
+
+  /// Whether this is a custom attribute.
+  CustomAttr
 };
 
 /// Options that determine how type resolution should work.
@@ -215,6 +218,7 @@ public:
     case Context::ImmediateOptionalTypeArgument:
     case Context::AbstractFunctionDecl:
     case Context::Inherited:
+    case Context::CustomAttr:
       return false;
     }
     llvm_unreachable("unhandled kind");
@@ -281,7 +285,9 @@ public:
 /// \returns the \c null type on failure.
 using OpenUnboundGenericTypeFn = llvm::function_ref<Type(UnboundGenericType *)>;
 
-/// A function reference used to handle a PlaceholderTypeRepr.
+/// A function reference used to handle a \c PlaceholderTypeRepr. If the
+/// function returns a null type, then the unmodified \c PlaceholderType will be
+/// used.
 using HandlePlaceholderTypeReprFn =
     llvm::function_ref<Type(ASTContext &, PlaceholderTypeRepr *)>;
 

@@ -460,10 +460,22 @@ CodeCompletionComments("code-completion-comments",
                        llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
+CodeCompletionSourceText("code-completion-sourcetext",
+                         llvm::cl::desc("Include source texts in code completion results"),
+                         llvm::cl::cat(Category),
+                         llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
 CodeCOmpletionAnnotateResults("code-completion-annotate-results",
                               llvm::cl::desc("annotate completion results with XML"),
                               llvm::cl::cat(Category),
                               llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+CodeCompletionSourceFileInfo("code-completion-sourcefileinfo",
+                             llvm::cl::desc("print module source file information"),
+                             llvm::cl::cat(Category),
+                             llvm::cl::init(false));
 
 static llvm::cl::opt<std::string>
 DebugClientDiscriminator("debug-client-discriminator",
@@ -767,10 +779,9 @@ DisableImplicitConcurrencyImport("disable-implicit-concurrency-module-import",
                                  llvm::cl::desc("Disable implicit import of _Concurrency module"),
                                  llvm::cl::init(false));
 
-static llvm::cl::opt<bool> EnableExperimentalOpaqueReturnTypes(
-    "enable-experimental-opaque-return-types",
-    llvm::cl::desc(
-        "Enable experimental extensions to opaque return type support"),
+static llvm::cl::opt<bool> EnableExperimentalNamedOpaqueTypes(
+    "enable-experimental-named-opaque-types",
+    llvm::cl::desc("Enable experimental support for named opaque result types"),
     llvm::cl::Hidden, llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
@@ -914,7 +925,9 @@ static int doCodeCompletion(const CompilerInvocation &InitInvok,
                             bool CodeCompletionDiagnostics,
                             bool CodeCompletionKeywords,
                             bool CodeCompletionComments,
-                            bool CodeCompletionAnnotateResults) {
+                            bool CodeCompletionAnnotateResults,
+                            bool CodeCompletionSourceFileInfo,
+                            bool CodeCompletionSourceText) {
   std::unique_ptr<ide::OnDiskCodeCompletionCache> OnDiskCache;
   if (!options::CompletionCachePath.empty()) {
     OnDiskCache = std::make_unique<ide::OnDiskCodeCompletionCache>(
@@ -923,12 +936,13 @@ static int doCodeCompletion(const CompilerInvocation &InitInvok,
   ide::CodeCompletionCache CompletionCache(OnDiskCache.get());
   ide::CodeCompletionContext CompletionContext(CompletionCache);
   CompletionContext.setAnnotateResult(CodeCompletionAnnotateResults);
+  CompletionContext.setRequiresSourceFileInfo(CodeCompletionSourceFileInfo);
 
   // Create a CodeCompletionConsumer.
   std::unique_ptr<ide::CodeCompletionConsumer> Consumer(
       new ide::PrintingCodeCompletionConsumer(
           llvm::outs(), CodeCompletionKeywords, CodeCompletionComments,
-          CodeCompletionAnnotateResults));
+          CodeCompletionSourceText, CodeCompletionAnnotateResults));
 
   // Create a factory for code completion callbacks that will feed the
   // Consumer.
@@ -1117,7 +1131,10 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
                                  StringRef SourceFilename,
                                  bool CodeCompletionDiagnostics,
                                  bool CodeCompletionKeywords,
-                                 bool CodeCompletionComments) {
+                                 bool CodeCompletionComments,
+                                 bool CodeCompletionAnnotateResults,
+                                 bool CodeCompletionSourceFileInfo,
+                                 bool CodeCompletionSourceText) {
   auto FileBufOrErr = llvm::MemoryBuffer::getFile(SourceFilename);
   if (!FileBufOrErr) {
     llvm::errs() << "error opening input file: "
@@ -1229,6 +1246,9 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
     if (Token.IncludeComments)
       IncludeComments = *Token.IncludeComments;
 
+    auto IncludeSourceText = CodeCompletionSourceText;
+    // TODO: Implement per token 'sourcetext' option.
+
     // Store the result to a string.
     std::string ResultStr;
     llvm::raw_string_ostream OS(ResultStr);
@@ -1248,11 +1268,15 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
           // Create a CodeCompletionConsumer.
           std::unique_ptr<ide::CodeCompletionConsumer> Consumer(
               new ide::PrintingCodeCompletionConsumer(OS, IncludeKeywords,
-                                                      IncludeComments));
+                                                      IncludeComments,
+                                                      CodeCompletionAnnotateResults,
+                                                      IncludeSourceText));
 
           // Create a factory for code completion callbacks that will feed the
           // Consumer.
           ide::CodeCompletionContext CompletionContext(CompletionCache);
+          CompletionContext.setAnnotateResult(CodeCompletionAnnotateResults);
+          CompletionContext.setRequiresSourceFileInfo(CodeCompletionSourceFileInfo);
           std::unique_ptr<CodeCompletionCallbacksFactory> callbacksFactory(
               ide::makeCodeCompletionCallbacksFactory(CompletionContext,
                                                       *Consumer));
@@ -3807,6 +3831,7 @@ int main(int argc, char *argv[]) {
     ide::PrintingCodeCompletionConsumer Consumer(
         llvm::outs(), options::CodeCompletionKeywords,
         options::CodeCompletionComments,
+        options::CodeCompletionSourceText,
         options::CodeCOmpletionAnnotateResults);
     for (StringRef filename : options::InputFilenames) {
       auto resultsOpt = ide::OnDiskCodeCompletionCache::getFromFile(filename);
@@ -3875,8 +3900,8 @@ int main(int argc, char *argv[]) {
   if (options::DisableImplicitConcurrencyImport) {
     InitInvok.getLangOptions().DisableImplicitConcurrencyModuleImport = true;
   }
-  if (options::EnableExperimentalOpaqueReturnTypes) {
-    InitInvok.getLangOptions().EnableExperimentalOpaqueReturnTypes = true;
+  if (options::EnableExperimentalNamedOpaqueTypes) {
+    InitInvok.getLangOptions().EnableExperimentalNamedOpaqueTypes = true;
   }
 
   if (options::EnableExperimentalDistributed) {
@@ -4041,7 +4066,10 @@ int main(int argc, char *argv[]) {
                                      options::SourceFilename,
                                      options::CodeCompletionDiagnostics,
                                      options::CodeCompletionKeywords,
-                                     options::CodeCompletionComments);
+                                     options::CodeCompletionComments,
+                                     options::CodeCOmpletionAnnotateResults,
+                                     options::CodeCompletionSourceFileInfo,
+                                     options::CodeCompletionSourceText);
     break;
 
   case ActionType::CodeCompletion:
@@ -4056,7 +4084,9 @@ int main(int argc, char *argv[]) {
                                 options::CodeCompletionDiagnostics,
                                 options::CodeCompletionKeywords,
                                 options::CodeCompletionComments,
-                                options::CodeCOmpletionAnnotateResults);
+                                options::CodeCOmpletionAnnotateResults,
+                                options::CodeCompletionSourceFileInfo,
+                                options::CodeCompletionSourceText);
     break;
 
   case ActionType::REPLCodeCompletion:

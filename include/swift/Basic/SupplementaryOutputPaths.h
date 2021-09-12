@@ -140,18 +140,17 @@ struct SupplementaryOutputPaths {
   /// \sa ModuleInterfaceOutputPath
   std::string PrivateModuleInterfaceOutputPath;
 
-  /// The path to a .c file where we should declare $ld$add symbols for those
-  /// symbols moved to the current module.
-  /// When symbols are moved to this module, this module declares them as HIDE
-  /// for the OS versions prior to when the move happened. On the other hand, the
-  /// original module should ADD them for these OS versions. An executable
-  /// can choose the right library to link against depending on the deployment target.
-  /// This is a walk-around that linker directives cannot specify other install
-  /// name per symbol, we should eventually remove this.
-  std::string LdAddCFilePath;
-
   /// The path to which we should emit module summary file.
   std::string ModuleSummaryOutputPath;
+
+  /// The output path to generate ABI baseline.
+  std::string ABIDescriptorOutputPath;
+
+  /// The output path for YAML optimization record file.
+  std::string YAMLOptRecordPath;
+
+  /// The output path for bitstream optimization record file.
+  std::string BitstreamOptRecordPath;
 
   SupplementaryOutputPaths() = default;
   SupplementaryOutputPaths(const SupplementaryOutputPaths &) = default;
@@ -182,10 +181,14 @@ struct SupplementaryOutputPaths {
       fn(ModuleInterfaceOutputPath); 
     if (!PrivateModuleInterfaceOutputPath.empty())
       fn(PrivateModuleInterfaceOutputPath); 
-    if (!LdAddCFilePath.empty())
-      fn(LdAddCFilePath); 
     if (!ModuleSummaryOutputPath.empty())
       fn(ModuleSummaryOutputPath);
+    if (!ABIDescriptorOutputPath.empty())
+      fn(ABIDescriptorOutputPath);
+    if (!YAMLOptRecordPath.empty())
+      fn(YAMLOptRecordPath);
+    if (!BitstreamOptRecordPath.empty())
+      fn(BitstreamOptRecordPath);
   }
 
   bool empty() const {
@@ -194,7 +197,8 @@ struct SupplementaryOutputPaths {
            ReferenceDependenciesFilePath.empty() &&
            SerializedDiagnosticsPath.empty() && LoadedModuleTracePath.empty() &&
            TBDPath.empty() && ModuleInterfaceOutputPath.empty() &&
-           ModuleSourceInfoOutputPath.empty() && LdAddCFilePath.empty();
+           ModuleSourceInfoOutputPath.empty() && ABIDescriptorOutputPath.empty() &&
+           YAMLOptRecordPath.empty() && BitstreamOptRecordPath.empty();
   }
 };
 } // namespace swift

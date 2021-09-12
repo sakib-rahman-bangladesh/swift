@@ -274,7 +274,24 @@ public:
 
     return new (Context) ExprPattern(E, nullptr, nullptr);
   }
-  
+
+  /// Turn an argument list into a matching tuple or paren pattern.
+  Pattern *composeTupleOrParenPattern(ArgumentList *args) {
+    assert(!args->hasAnyInOutArgs());
+    if (auto *unary = args->getUnlabeledUnaryExpr()) {
+      auto *subPattern = getSubExprPattern(unary);
+      return new (Context)
+          ParenPattern(args->getLParenLoc(), subPattern, args->getRParenLoc());
+    }
+    SmallVector<TuplePatternElt, 4> elts;
+    for (auto arg : *args) {
+      auto *subPattern = getSubExprPattern(arg.getExpr());
+      elts.emplace_back(arg.getLabel(), arg.getLabelLoc(), subPattern);
+    }
+    return TuplePattern::create(Context, args->getLParenLoc(), elts,
+                                args->getRParenLoc());
+  }
+
   // Handle productions that are always leaf patterns or are already resolved.
 #define ALWAYS_RESOLVED_PATTERN(Id) \
   Pattern *visit##Id##Pattern(Id##Pattern *P) { return P; }
@@ -477,7 +494,9 @@ public:
         },
         // FIXME: Don't let placeholder types escape type resolution.
         // For now, just return the placeholder type.
-        PlaceholderType::get);
+        [](auto &ctx, auto *originator) {
+          return Type();
+        });
     const auto ty = resolution.resolveType(repr);
     auto *enumDecl = dyn_cast_or_null<EnumDecl>(ty->getAnyNominal());
     if (!enumDecl)
@@ -552,7 +571,7 @@ public:
         return nullptr;
 
       auto *EEP = cast<EnumElementPattern>(P);
-      EEP->setSubPattern(getSubExprPattern(ce->getArg()));
+      EEP->setSubPattern(composeTupleOrParenPattern(ce->getArgs()));
       EEP->setUnresolvedOriginalExpr(ce);
 
       return P;
@@ -599,7 +618,9 @@ public:
               },
               // FIXME: Don't let placeholder types escape type resolution.
               // For now, just return the placeholder type.
-              PlaceholderType::get)
+              [](auto &ctx, auto *originator) {
+                return Type();
+              })
               .resolveType(prefixRepr);
       auto *enumDecl = dyn_cast_or_null<EnumDecl>(enumTy->getAnyNominal());
       if (!enumDecl)
@@ -621,7 +642,7 @@ public:
     assert(!isa<GenericIdentTypeRepr>(tailComponent) &&
            "should be handled above");
 
-    auto *subPattern = getSubExprPattern(ce->getArg());
+    auto *subPattern = composeTupleOrParenPattern(ce->getArgs());
     return new (Context) EnumElementPattern(
         baseTE, SourceLoc(), tailComponent->getNameLoc(),
         tailComponent->getNameRef(), referencedElement, subPattern);
@@ -707,7 +728,7 @@ static Type validateTypedPattern(TypedPattern *TP, TypeResolution resolution) {
   // property definition.
   auto &Context = resolution.getASTContext();
   auto *Repr = TP->getTypeRepr();
-  if (Repr && isa<OpaqueReturnTypeRepr>(Repr)) {
+  if (Repr && Repr->hasOpaque()) {
     auto named = dyn_cast<NamedPattern>(
                            TP->getSubPattern()->getSemanticsProvidingPattern());
     if (!named) {
@@ -809,7 +830,9 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
       };
       // FIXME: Don't let placeholder types escape type resolution.
       // For now, just return the placeholder type.
-      placeholderHandler = PlaceholderType::get;
+      placeholderHandler = [](auto &ctx, auto *originator) {
+        return Type();
+      };
     }
     return validateTypedPattern(
         cast<TypedPattern>(P),
@@ -877,7 +900,9 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
         };
         // FIXME: Don't let placeholder types escape type resolution.
         // For now, just return the placeholder type.
-        placeholderHandler = PlaceholderType::get;
+        placeholderHandler = [](auto &ctx, auto *originator) {
+          return Type();
+        };
       }
       TypedPattern *TP = cast<TypedPattern>(somePat->getSubPattern());
       const auto type = validateTypedPattern(

@@ -46,7 +46,22 @@ namespace {
 void forEachTargetModuleBasename(const ASTContext &Ctx,
                                  llvm::function_ref<void(StringRef)> body) {
   auto normalizedTarget = getTargetSpecificModuleTriple(Ctx.LangOpts.Target);
+
+  // An arm64 module can import an arm64e module.
+  Optional<llvm::Triple> normalizedAltTarget;
+  if ((normalizedTarget.getArch() == llvm::Triple::ArchType::aarch64) &&
+      (normalizedTarget.getSubArch() !=
+       llvm::Triple::SubArchType::AArch64SubArch_arm64e)) {
+    auto altTarget = normalizedTarget;
+    altTarget.setArchName("arm64e");
+    normalizedAltTarget = getTargetSpecificModuleTriple(altTarget);
+  }
+
   body(normalizedTarget.str());
+
+  if (normalizedAltTarget) {
+    body(normalizedAltTarget->str());
+  }
 
   // We used the un-normalized architecture as a target-specific
   // module name. Fall back to that behavior.
@@ -60,6 +75,10 @@ void forEachTargetModuleBasename(const ASTContext &Ctx,
   // new names.
   if (Ctx.LangOpts.Target.getArch() == llvm::Triple::ArchType::arm) {
     body("arm");
+  }
+
+  if (normalizedAltTarget) {
+    body(normalizedAltTarget->getArchName());
   }
 }
 
@@ -88,18 +107,10 @@ Optional<bool> forEachModuleSearchPath(
   // Apple platforms have extra implicit framework search paths:
   // $SDKROOT/System/Library/Frameworks/ and $SDKROOT/Library/Frameworks/.
   if (Ctx.LangOpts.Target.isOSDarwin()) {
-    SmallString<128> scratch;
-    scratch = Ctx.SearchPathOpts.SDKPath;
-    llvm::sys::path::append(scratch, "System", "Library", "Frameworks");
-    if (auto result =
-            callback(scratch, SearchPathKind::Framework, /*isSystem=*/true))
-      return result;
-
-    scratch = Ctx.SearchPathOpts.SDKPath;
-    llvm::sys::path::append(scratch, "Library", "Frameworks");
-    if (auto result =
-            callback(scratch, SearchPathKind::Framework, /*isSystem=*/true))
-      return result;
+    for (const auto &path : Ctx.getDarwinImplicitFrameworkSearchPaths())
+      if (auto result =
+          callback(path, SearchPathKind::Framework, /*isSystem=*/true))
+        return result;
   }
 
   for (auto importPath : Ctx.SearchPathOpts.RuntimeLibraryImportPaths) {
@@ -431,7 +442,7 @@ std::error_code ImplicitSerializedModuleLoader::findModuleFilesInDirectory(
     std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-    bool IsFramework) {
+    bool skipBuildingInterface, bool IsFramework) {
   assert(((ModuleBuffer && ModuleDocBuffer) ||
           (!ModuleBuffer && !ModuleDocBuffer)) &&
          "Module and Module Doc buffer must both be initialized or NULL");
@@ -524,7 +535,7 @@ SerializedModuleLoaderBase::findModule(ImportPath::Element moduleID,
            std::unique_ptr<llvm::MemoryBuffer> *moduleBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *moduleDocBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *moduleSourceInfoBuffer,
-           bool &isFramework, bool &isSystemModule) {
+           bool skipBuildingInterface, bool &isFramework, bool &isSystemModule) {
   SmallString<32> moduleName(moduleID.Item.str());
   SerializedModuleBaseName genericBaseName(moduleName);
 
@@ -562,6 +573,7 @@ SerializedModuleLoaderBase::findModule(ImportPath::Element moduleID,
                         moduleInterfacePath,
                         moduleBuffer, moduleDocBuffer,
                         moduleSourceInfoBuffer,
+                        skipBuildingInterface,
                         IsFramework);
       if (!result) {
         return true;
@@ -619,7 +631,8 @@ SerializedModuleLoaderBase::findModule(ImportPath::Element moduleID,
 
           auto result = findModuleFilesInDirectory(
               moduleID, absoluteBaseName, moduleInterfacePath,
-              moduleBuffer, moduleDocBuffer, moduleSourceInfoBuffer, isFramework);
+              moduleBuffer, moduleDocBuffer, moduleSourceInfoBuffer,
+              skipBuildingInterface, isFramework);
           if (!result)
             return true;
           else if (result == std::errc::not_supported)
@@ -736,6 +749,8 @@ LoadedFile *SerializedModuleLoaderBase::loadAST(
       M.setHasIncrementalInfo();
     if (!loadedModuleFile->getModuleABIName().empty())
       M.setABIName(Ctx.getIdentifier(loadedModuleFile->getModuleABIName()));
+    if (loadedModuleFile->isConcurrencyChecked())
+      M.setIsConcurrencyChecked();
     M.setUserModuleVersion(loadedModuleFile->getUserModuleVersion());
     auto diagLocOrInvalid = diagLoc.getValueOr(SourceLoc());
     loadInfo.status = loadedModuleFile->associateWithFileContext(
@@ -1073,7 +1088,8 @@ bool SerializedModuleLoaderBase::canImportModule(
 
   auto found = findModule(mID, unusedModuleInterfacePath, unusedModuleBuffer,
                           unusedModuleDocBuffer, unusedModuleSourceInfoBuffer,
-                          isFramework, isSystemModule);
+                          /* skipBuildingInterface */ true, isFramework,
+                          isSystemModule);
   // If we cannot find the module, don't continue.
   if (!found)
     return false;
@@ -1089,7 +1105,7 @@ bool SerializedModuleLoaderBase::canImportModule(
   }
   // If failing to extract the user version from the interface file, try the binary
   // format, if present.
-  if (currentVersion.empty() && unusedModuleBuffer) {
+  if (currentVersion.empty() && *unusedModuleBuffer) {
     auto metaData =
       serialization::validateSerializedAST((*unusedModuleBuffer)->getBuffer());
     currentVersion = metaData.userModuleVersion;
@@ -1143,7 +1159,7 @@ SerializedModuleLoaderBase::loadModule(SourceLoc importLoc,
   // Look on disk.
   if (!findModule(moduleID, &moduleInterfacePath, &moduleInputBuffer,
                   &moduleDocInputBuffer, &moduleSourceInfoInputBuffer,
-                  isFramework, isSystemModule)) {
+                  /* skipBuildingInterface */ false, isFramework, isSystemModule)) {
     return nullptr;
   }
 
@@ -1257,7 +1273,7 @@ std::error_code MemoryBufferSerializedModuleLoader::findModuleFilesInDirectory(
     std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
     std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-    bool IsFramework) {
+    bool skipBuildingInterface, bool IsFramework) {
   // This is a soft error instead of an llvm_unreachable because this API is
   // primarily used by LLDB which makes it more likely that unwitting changes to
   // the Swift compiler accidentally break the contract.

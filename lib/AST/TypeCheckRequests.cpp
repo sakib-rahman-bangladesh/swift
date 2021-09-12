@@ -254,31 +254,6 @@ void ExistentialConformsToSelfRequest::cacheResult(bool value) const {
 }
 
 //----------------------------------------------------------------------------//
-// existentialTypeSupported computation.
-//----------------------------------------------------------------------------//
-
-void ExistentialTypeSupportedRequest::diagnoseCycle(DiagnosticEngine &diags) const {
-  auto decl = std::get<0>(getStorage());
-  diags.diagnose(decl, diag::circular_protocol_def, decl->getName());
-}
-
-void ExistentialTypeSupportedRequest::noteCycleStep(DiagnosticEngine &diags) const {
-  auto requirement = std::get<0>(getStorage());
-  diags.diagnose(requirement, diag::kind_declname_declared_here,
-                 DescriptiveDeclKind::Protocol, requirement->getName());
-}
-
-Optional<bool> ExistentialTypeSupportedRequest::getCachedResult() const {
-  auto decl = std::get<0>(getStorage());
-  return decl->getCachedExistentialTypeSupported();
-}
-
-void ExistentialTypeSupportedRequest::cacheResult(bool value) const {
-  auto decl = std::get<0>(getStorage());
-  decl->setCachedExistentialTypeSupported(value);
-}
-
-//----------------------------------------------------------------------------//
 // isFinal computation.
 //----------------------------------------------------------------------------//
 
@@ -763,6 +738,22 @@ void GenericSignatureRequest::cacheResult(GenericSignature value) const {
   GC->GenericSigAndBit.setPointerAndInt(value, true);
 }
 
+void GenericSignatureRequest::diagnoseCycle(DiagnosticEngine &diags) const {
+  auto *GC = std::get<0>(getStorage());
+  auto *D = GC->getAsDecl();
+
+  if (auto *VD = dyn_cast<ValueDecl>(D)) {
+    VD->diagnose(diag::recursive_generic_signature,
+                 VD->getDescriptiveKind(), VD->getBaseName());
+  } else {
+    auto *ED = cast<ExtensionDecl>(D);
+    auto *NTD = ED->getExtendedNominal();
+
+    ED->diagnose(diag::recursive_generic_signature_extension,
+                 NTD->getDescriptiveKind(), NTD->getName());
+  }
+}
+
 //----------------------------------------------------------------------------//
 // InferredGenericSignatureRequest computation.
 //----------------------------------------------------------------------------//
@@ -957,7 +948,6 @@ void InterfaceTypeRequest::cacheResult(Type type) const {
   auto *decl = std::get<0>(getStorage());
   if (type) {
     assert(!type->hasTypeVariable() && "Type variable in interface type");
-    assert(!type->hasPlaceholder() && "Type placeholder in interface type");
     assert(!type->is<InOutType>() && "Interface type must be materializable");
     assert(!type->hasArchetype() && "Archetype in interface type");
   }
@@ -1034,10 +1024,13 @@ void swift::simple_display(llvm::raw_ostream &out,
     out << "resolve Decodable.init(from:)";
     break;
   case ImplicitMemberAction::ResolveDistributedActor:
-    out << "resolve DistributedActor[init(transport:), init(resolve:using:)]";
+    out << "resolve DistributedActor";
     break;
   case ImplicitMemberAction::ResolveDistributedActorIdentity:
     out << "resolve DistributedActor.id";
+    break;
+  case ImplicitMemberAction::ResolveDistributedActorTransport:
+    out << "resolve DistributedActor.actorTransport";
     break;
   }
 }
@@ -1318,7 +1311,7 @@ Optional<BraceStmt *> TypeCheckFunctionBodyRequest::getCachedResult() const {
   auto *afd = std::get<0>(getStorage());
   switch (afd->getBodyKind()) {
   case BodyKind::Deserialized:
-  case BodyKind::MemberwiseInitializer:
+  case BodyKind::SILSynthesize:
   case BodyKind::None:
   case BodyKind::Skipped:
     // These cases don't have any body available.

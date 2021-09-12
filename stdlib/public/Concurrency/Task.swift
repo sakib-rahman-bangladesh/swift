@@ -37,7 +37,7 @@ import Swift
 /// with by end-users directly, unless implementing a scheduler.
 @available(SwiftStdlib 5.5, *)
 @frozen
-public struct Task<Success, Failure: Error>: Sendable {
+public struct Task<Success: Sendable, Failure: Error>: Sendable {
   @usableFromInline
   internal let _task: Builtin.NativeObject
 
@@ -269,7 +269,7 @@ extension Task where Success == Never, Failure == Never {
       }
 
       // Otherwise, query the system.
-      return TaskPriority(rawValue: UInt8(0))
+      return TaskPriority(rawValue: UInt8(_getCurrentThreadPriority()))
     }
   }
 }
@@ -632,11 +632,10 @@ extension Task where Success == Never, Failure == Never {
   /// As such,
   /// this method isn't necessarily a way to avoid resource starvation.
   public static func yield() async {
-    let currentTask = Builtin.getCurrentAsyncTask()
-    let priority = getJobFlags(currentTask).priority ?? Task.currentPriority._downgradeUserInteractive
-
     return await Builtin.withUnsafeContinuation { (continuation: Builtin.RawUnsafeContinuation) -> Void in
-      let job = _taskCreateNullaryContinuationJob(priority: Int(priority.rawValue), continuation: continuation)
+      let job = _taskCreateNullaryContinuationJob(
+          priority: Int(Task.currentPriority.rawValue),
+          continuation: continuation)
       _enqueueJobGlobal(job)
     }
   }
@@ -708,7 +707,8 @@ public struct UnsafeCurrentTask {
   /// - SeeAlso: `TaskPriority`
   /// - SeeAlso: `Task.currentPriority`
   public var priority: TaskPriority {
-    getJobFlags(_task).priority ?? .unspecified
+    getJobFlags(_task).priority ?? TaskPriority(
+        rawValue: UInt8(_getCurrentThreadPriority()))
   }
 
   /// Cancel the current task.
@@ -756,7 +756,7 @@ func _enqueueJobGlobalWithDelay(_ delay: UInt64, _ task: Builtin.Job)
 public func _asyncMainDrainQueue() -> Never
 
 @available(SwiftStdlib 5.5, *)
-public func _runAsyncMain(_ asyncFun: @escaping () async throws -> ()) {
+public func _runAsyncMain(@_unsafeSendable _ asyncFun: @escaping () async throws -> ()) {
   Task.detached {
     do {
 #if !os(Windows)
@@ -824,7 +824,14 @@ func _getCurrentThreadPriority() -> Int
 @_alwaysEmitIntoClient
 @usableFromInline
 internal func _runTaskForBridgedAsyncMethod(@_inheritActorContext _ body: __owned @Sendable @escaping () async -> Void) {
+#if compiler(>=5.6)
   Task(operation: body)
+#else
+  Task<Int, Error> {
+    await body()
+    return 0
+  }
+#endif
 }
 
 #endif

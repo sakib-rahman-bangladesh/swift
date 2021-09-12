@@ -1979,35 +1979,6 @@ bool EquivalenceClass::isConformanceSatisfiedBySuperclass(
   return false;
 }
 
-/// Compare two associated types.
-static int compareAssociatedTypes(AssociatedTypeDecl *assocType1,
-                                  AssociatedTypeDecl *assocType2) {
-  // - by name.
-  if (int result = assocType1->getName().str().compare(
-                                              assocType2->getName().str()))
-    return result;
-
-  // Prefer an associated type with no overrides (i.e., an anchor) to one
-  // that has overrides.
-  bool hasOverridden1 = !assocType1->getOverriddenDecls().empty();
-  bool hasOverridden2 = !assocType2->getOverriddenDecls().empty();
-  if (hasOverridden1 != hasOverridden2)
-    return hasOverridden1 ? +1 : -1;
-
-  // - by protocol, so t_n_m.`P.T` < t_n_m.`Q.T` (given P < Q)
-  auto proto1 = assocType1->getProtocol();
-  auto proto2 = assocType2->getProtocol();
-  if (int compareProtocols = TypeDecl::compare(proto1, proto2))
-    return compareProtocols;
-
-  // Error case: if we have two associated types with the same name in the
-  // same protocol, just tie-break based on address.
-  if (assocType1 != assocType2)
-    return assocType1 < assocType2 ? -1 : +1;
-
-  return 0;
-}
-
 static void lookupConcreteNestedType(NominalTypeDecl *decl,
                                      Identifier name,
                                      SmallVectorImpl<TypeDecl *> &concreteDecls) {
@@ -2509,44 +2480,6 @@ auto PotentialArchetype::getRepresentative() const -> PotentialArchetype * {
   }
 
   return result;
-}
-
-/// Canonical ordering for dependent types.
-int swift::compareDependentTypes(Type type1, Type type2) {
-  // Fast-path check for equality.
-  if (type1->isEqual(type2)) return 0;
-
-  // Ordering is as follows:
-  // - Generic params
-  auto gp1 = type1->getAs<GenericTypeParamType>();
-  auto gp2 = type2->getAs<GenericTypeParamType>();
-  if (gp1 && gp2)
-    return GenericParamKey(gp1) < GenericParamKey(gp2) ? -1 : +1;
-
-  // A generic parameter is always ordered before a nested type.
-  if (static_cast<bool>(gp1) != static_cast<bool>(gp2))
-    return gp1 ? -1 : +1;
-
-  // - Dependent members
-  auto depMemTy1 = type1->castTo<DependentMemberType>();
-  auto depMemTy2 = type2->castTo<DependentMemberType>();
-
-  // - by base, so t_0_n.`P.T` < t_1_m.`P.T`
-  if (int compareBases =
-        compareDependentTypes(depMemTy1->getBase(), depMemTy2->getBase()))
-    return compareBases;
-
-  // - by name, so t_n_m.`P.T` < t_n_m.`P.U`
-  if (int compareNames = depMemTy1->getName().str().compare(
-                                                  depMemTy2->getName().str()))
-    return compareNames;
-
-  auto *assocType1 = depMemTy1->getAssocType();
-  auto *assocType2 = depMemTy2->getAssocType();
-  if (int result = compareAssociatedTypes(assocType1, assocType2))
-    return result;
-
-  return 0;
 }
 
 /// Compare two dependent paths to determine which is better.
@@ -3973,11 +3906,18 @@ bool GenericSignatureBuilder::addGenericParameterRequirements(
 void GenericSignatureBuilder::addGenericParameter(GenericTypeParamType *GenericParam) {
   auto params = getGenericParams();
   (void)params;
-  assert(params.empty() ||
-         ((GenericParam->getDepth() == params.back()->getDepth() &&
-           GenericParam->getIndex() == params.back()->getIndex() + 1) ||
-          (GenericParam->getDepth() > params.back()->getDepth() &&
-           GenericParam->getIndex() == 0)));
+
+#ifndef NDEBUG
+  if (params.empty()) {
+    assert(GenericParam->getDepth() == 0);
+    assert(GenericParam->getIndex() == 0);
+  } else {
+    assert((GenericParam->getDepth() == params.back()->getDepth() &&
+            GenericParam->getIndex() == params.back()->getIndex() + 1) ||
+           (GenericParam->getDepth() > params.back()->getDepth() &&
+            GenericParam->getIndex() == 0));
+  }
+#endif
 
   // Create a potential archetype for this type parameter.
   auto PA = new (Impl->Allocator) PotentialArchetype(GenericParam);
@@ -4072,7 +4012,7 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
     // Add all of the inherited protocol requirements, recursively.
     auto inheritedReqResult =
       addInheritedRequirements(proto, selfType.getUnresolvedType(), source,
-                               proto->getModuleContext());
+                               nullptr);
     if (isErrorResult(inheritedReqResult))
       return inheritedReqResult;
   }
@@ -4494,7 +4434,7 @@ bool GenericSignatureBuilder::updateSuperclass(
 
     auto layout =
       LayoutConstraint::getLayoutConstraint(
-        superclass->getClassOrBoundGenericClass()->isObjC()
+        superclass->getClassOrBoundGenericClass()->usesObjCObjectModel()
           ? LayoutConstraintKind::Class
           : LayoutConstraintKind::NativeClass,
         getASTContext());
@@ -5701,6 +5641,11 @@ GenericSignatureBuilder::isValidRequirementDerivationPath(
 
     auto otherSubjectType = otherReq.getSubjectType();
 
+    auto *equivClass = resolveEquivalenceClass(otherSubjectType,
+                                         ArchetypeResolutionKind::AlreadyKnown);
+    assert(equivClass &&
+           "Explicit requirement names an unknown equivalence class?");
+
     // If our requirement is based on a path involving some other
     // redundant requirement, see if we can derive the redundant
     // requirement using requirements we haven't visited yet.
@@ -5719,11 +5664,6 @@ GenericSignatureBuilder::isValidRequirementDerivationPath(
       // redundant; there's no other derivation that would not be redundant.
       if (!otherSource->isDerivedNonRootRequirement())
         return None;
-
-      auto *equivClass = resolveEquivalenceClass(otherSubjectType,
-                                           ArchetypeResolutionKind::AlreadyKnown);
-      assert(equivClass &&
-             "Explicit requirement names an unknown equivalence class?");
 
       switch (otherReq.getKind()) {
       case RequirementKind::Conformance: {
@@ -5804,20 +5744,22 @@ GenericSignatureBuilder::isValidRequirementDerivationPath(
       }
     }
 
-    if (auto *depMemType = otherSubjectType->getAs<DependentMemberType>()) {
+    auto anchor = equivClass->getAnchor(*this, { });
+
+    if (auto *depMemType = anchor->getAs<DependentMemberType>()) {
       // If 'req' is based on some other conformance requirement
       // `T.[P.]A : Q', we want to make sure that we have a
       // non-redundant derivation for 'T : P'.
       auto baseType = depMemType->getBase();
       auto *proto = depMemType->getAssocType()->getProtocol();
 
-      auto *equivClass = resolveEquivalenceClass(baseType,
+      auto *baseEquivClass = resolveEquivalenceClass(baseType,
                                            ArchetypeResolutionKind::AlreadyKnown);
-      assert(equivClass &&
+      assert(baseEquivClass &&
              "Explicit requirement names an unknown equivalence class?");
 
-      auto found = equivClass->conformsTo.find(proto);
-      assert(found != equivClass->conformsTo.end());
+      auto found = baseEquivClass->conformsTo.find(proto);
+      assert(found != baseEquivClass->conformsTo.end());
 
       bool foundValidDerivation = false;
       for (const auto &constraint : found->second) {
@@ -7913,43 +7855,9 @@ static Optional<Requirement> createRequirement(RequirementKind kind,
   }
 }
 
-/// Determine the canonical ordering of requirements.
-static unsigned getRequirementKindOrder(RequirementKind kind) {
-  switch (kind) {
-  case RequirementKind::Conformance: return 2;
-  case RequirementKind::Superclass: return 0;
-  case RequirementKind::SameType: return 3;
-  case RequirementKind::Layout: return 1;
-  }
-  llvm_unreachable("unhandled kind");
-}
-
 static int compareRequirements(const Requirement *lhsPtr,
                                const Requirement *rhsPtr) {
-  auto &lhs = *lhsPtr;
-  auto &rhs = *rhsPtr;
-
-  int compareLHS =
-    compareDependentTypes(lhs.getFirstType(), rhs.getFirstType());
-
-  if (compareLHS != 0)
-    return compareLHS;
-
-  int compareKind = (getRequirementKindOrder(lhs.getKind()) -
-                     getRequirementKindOrder(rhs.getKind()));
-
-  if (compareKind != 0)
-    return compareKind;
-
-  // We should only have multiple conformance requirements.
-  assert(lhs.getKind() == RequirementKind::Conformance);
-
-  int compareProtos =
-    TypeDecl::compare(lhs.getProtocolDecl(), rhs.getProtocolDecl());
-
-  assert(compareProtos != 0 && "Duplicate conformance requirement");
-
-  return compareProtos;
+  return lhsPtr->compare(*rhsPtr);
 }
 
 void GenericSignatureBuilder::enumerateRequirements(
@@ -8089,6 +7997,9 @@ static void checkGenericSignature(CanGenericSignature canSig,
 
   auto canonicalRequirements = canSig.getRequirements();
 
+  // We collect conformance requirements to check that they're minimal.
+  llvm::SmallDenseMap<CanType, SmallVector<ProtocolDecl *, 2>, 2> conformances;
+
   // Check that the signature is canonical.
   for (unsigned idx : indices(canonicalRequirements)) {
     debugStack.setRequirement(idx);
@@ -8139,6 +8050,10 @@ static void checkGenericSignature(CanGenericSignature canSig,
              "Left-hand side must be a type parameter");
       assert(isa<ProtocolType>(reqt.getSecondType().getPointer()) &&
              "Right-hand side of conformance isn't a protocol type");
+
+      // Collect all conformance requirements on each type parameter.
+      conformances[CanType(reqt.getFirstType())].push_back(
+          reqt.getProtocolDecl());
       break;
     }
 
@@ -8178,8 +8093,24 @@ static void checkGenericSignature(CanGenericSignature canSig,
              "Concrete subject type should not have any other requirements");
     }
 
-    assert(compareRequirements(&prevReqt, &reqt) < 0 &&
+    assert(prevReqt.compare(reqt) < 0 &&
            "Out-of-order requirements");
+  }
+
+  // Make sure we don't have redundant protocol conformance requirements.
+  for (auto pair : conformances) {
+    const auto &protos = pair.second;
+    auto canonicalProtos = protos;
+
+    // canonicalizeProtocols() will sort them and filter out any protocols that
+    // are refined by other protocols in the list. It should be a no-op at this
+    // point.
+    ProtocolType::canonicalizeProtocols(canonicalProtos);
+
+    assert(protos.size() == canonicalProtos.size() &&
+           "redundant conformance requirements");
+    assert(std::equal(protos.begin(), protos.end(), canonicalProtos.begin()) &&
+           "out-of-order conformance requirements");
   }
 }
 #endif
@@ -8279,24 +8210,42 @@ GenericSignature GenericSignatureBuilder::rebuildSignatureWithoutRedundantRequir
     }
 
     auto subjectType = req.getSubjectType();
-    subjectType = stripBoundDependentMemberTypes(subjectType);
-    auto resolvedSubjectType =
-        resolveDependentMemberTypes(*this, subjectType,
-                                    ArchetypeResolutionKind::WellFormed);
+    auto resolvedSubject =
+        maybeResolveEquivalenceClass(subjectType,
+                                     ArchetypeResolutionKind::WellFormed,
+                                     /*wantExactPotentialArchetype=*/false);
+
+    auto *resolvedEquivClass = resolvedSubject.getEquivalenceClass(*this);
+    Type resolvedSubjectType;
+    if (resolvedEquivClass != nullptr)
+      resolvedSubjectType = resolvedEquivClass->getAnchor(*this, { });
 
     // This can occur if the combination of a superclass requirement and
     // protocol conformance requirement force a type to become concrete.
     //
     // FIXME: Is there a more principled formulation of this?
-    if (req.getKind() == RequirementKind::Superclass &&
-        !resolvedSubjectType->isTypeParameter()) {
-      newBuilder.addRequirement(Requirement(RequirementKind::SameType,
-                                            subjectType, resolvedSubjectType),
-                                getRebuiltSource(req.getSource()), nullptr);
-      continue;
+    if (req.getKind() == RequirementKind::Superclass) {
+      if (resolvedSubject.getAsConcreteType()) {
+        auto unresolvedSubjectType = stripBoundDependentMemberTypes(subjectType);
+        newBuilder.addRequirement(Requirement(RequirementKind::SameType,
+                                              unresolvedSubjectType,
+                                              resolvedSubject.getAsConcreteType()),
+                                  getRebuiltSource(req.getSource()), nullptr);
+        continue;
+      }
+
+      if (resolvedEquivClass->concreteType) {
+        auto unresolvedSubjectType = stripBoundDependentMemberTypes(
+            resolvedSubjectType);
+        newBuilder.addRequirement(Requirement(RequirementKind::SameType,
+                                              unresolvedSubjectType,
+                                              resolvedEquivClass->concreteType),
+                                  getRebuiltSource(req.getSource()), nullptr);
+        continue;
+      }
     }
 
-    assert(resolvedSubjectType->isTypeParameter());
+    assert(resolvedSubjectType && resolvedSubjectType->isTypeParameter());
 
     if (auto optReq = createRequirement(req.getKind(), resolvedSubjectType,
                                         req.getRHS(), getGenericParams())) {
@@ -8335,6 +8284,40 @@ GenericSignature GenericSignatureBuilder::rebuildSignatureWithoutRedundantRequir
       }
     };
 
+    // If we have a same-type requirement where the right hand side is concrete,
+    // canonicalize the left hand side, in case dropping some redundant
+    // conformance requirement turns the original left hand side into an
+    // unresolvable type.
+    if (!req.getRHS().get<Type>()->isTypeParameter()) {
+      auto resolvedSubject =
+          maybeResolveEquivalenceClass(req.getSubjectType(),
+                                       ArchetypeResolutionKind::WellFormed,
+                                       /*wantExactPotentialArchetype=*/false);
+
+      auto *resolvedEquivClass = resolvedSubject.getEquivalenceClass(*this);
+      auto resolvedSubjectType = resolvedEquivClass->getAnchor(*this, { });
+
+      auto constraintType = resolveType(req.getRHS().get<Type>());
+
+      auto newReq = stripBoundDependentMemberTypes(
+          Requirement(RequirementKind::SameType,
+                      resolvedSubjectType, constraintType));
+
+      if (Impl->DebugRedundantRequirements) {
+        llvm::dbgs() << "=> ";
+        newReq.dump(llvm::dbgs());
+        llvm::dbgs() << "\n";
+      }
+      newBuilder.addRequirement(newReq, getRebuiltSource(req.getSource()),
+                                nullptr);
+
+      continue;
+    }
+
+    // Otherwise, we can't canonicalize the two sides of the requirement, since
+    // doing so will produce a trivial same-type requirement T == T. Instead,
+    // apply some ad-hoc rules to improve the odds that the requirement will
+    // resolve in the rebuilt GSB.
     auto subjectType = resolveType(req.getSubjectType());
     auto constraintType = resolveType(req.getRHS().get<Type>());
 
@@ -8422,7 +8405,10 @@ GenericSignature GenericSignatureBuilder::computeGenericSignature(
   auto sig = GenericSignature::get(getGenericParams(), requirements);
 
 #ifndef NDEBUG
-  if (!Impl->HadAnyError) {
+  bool hadAnyError = Impl->HadAnyError;
+
+  if (requirementSignatureSelfProto &&
+      !hadAnyError) {
     checkGenericSignature(sig.getCanonicalSignature(), *this);
   }
 #endif
@@ -8444,6 +8430,13 @@ GenericSignature GenericSignatureBuilder::computeGenericSignature(
   // Wipe out the internal state, ensuring that nobody uses this builder for
   // anything more.
   Impl.reset();
+
+#ifndef NDEBUG
+  if (!requirementSignatureSelfProto &&
+      !hadAnyError) {
+    sig.verify();
+  }
+#endif
 
   return sig;
 }

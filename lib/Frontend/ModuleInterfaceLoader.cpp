@@ -1007,7 +1007,7 @@ class ModuleInterfaceLoaderImpl {
       ModuleInterfaceBuilder builder(
         ctx.SourceMgr, diagsToUse,
         astDelegate, interfacePath, moduleName, cacheDir,
-        prebuiltCacheDir, backupInterfaceDir,
+        prebuiltCacheDir, backupInterfaceDir, StringRef(),
         Opts.disableInterfaceLock, diagnosticLoc,
         dependencyTracker);
       // If we found an out-of-date .swiftmodule, we still want to add it as
@@ -1039,7 +1039,7 @@ class ModuleInterfaceLoaderImpl {
       // the genericSubInvocation we'll need to use to compute the cache paths.
       ModuleInterfaceBuilder fallbackBuilder(
         ctx.SourceMgr, &ctx.Diags, astDelegate, backupPath, moduleName, cacheDir,
-        prebuiltCacheDir, backupInterfaceDir,
+        prebuiltCacheDir, backupInterfaceDir, StringRef(),
         Opts.disableInterfaceLock, diagnosticLoc,
         dependencyTracker);
       if (rebuildInfo.sawOutOfDateModule(modulePath))
@@ -1083,7 +1083,7 @@ std::error_code ModuleInterfaceLoader::findModuleFilesInDirectory(
   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-  bool IsFramework) {
+  bool skipBuildingInterface, bool IsFramework) {
 
   // If running in OnlySerialized mode, ModuleInterfaceLoader
   // should not have been constructed at all.
@@ -1109,6 +1109,16 @@ std::error_code ModuleInterfaceLoader::findModuleFilesInDirectory(
   // If present, use the private interface instead of the public one.
   if (fs.exists(PrivateInPath)) {
     InPath = PrivateInPath;
+  }
+
+  // If we've been told to skip building interfaces, we are done here and do
+  // not need to have the module actually built. For example, if we are
+  // currently answering a `canImport` query, it is enough to have found
+  // the interface.
+  if (skipBuildingInterface) {
+    if (ModuleInterfacePath)
+      *ModuleInterfacePath = InPath;
+    return std::error_code();
   }
 
   // Create an instance of the Impl to do the heavy lifting.
@@ -1208,7 +1218,8 @@ bool ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
     const ClangImporterOptions &ClangOpts, StringRef CacheDir,
     StringRef PrebuiltCacheDir, StringRef BackupInterfaceDir,
     StringRef ModuleName, StringRef InPath,
-    StringRef OutPath, bool SerializeDependencyHashes,
+    StringRef OutPath, StringRef ABIOutputPath,
+    bool SerializeDependencyHashes,
     bool TrackSystemDependencies, ModuleInterfaceLoaderOptions LoaderOpts,
     RequireOSSAModules_t RequireOSSAModules) {
   InterfaceSubContextDelegateImpl astDelegate(
@@ -1218,7 +1229,7 @@ bool ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
       SerializeDependencyHashes, TrackSystemDependencies, RequireOSSAModules);
   ModuleInterfaceBuilder builder(SourceMgr, &Diags, astDelegate, InPath,
                                  ModuleName, CacheDir, PrebuiltCacheDir,
-                                 BackupInterfaceDir,
+                                 BackupInterfaceDir, ABIOutputPath,
                                  LoaderOpts.disableInterfaceLock);
   // FIXME: We really only want to serialize 'important' dependencies here, if
   //        we want to ship the built swiftmodules to another machine.
@@ -1236,7 +1247,7 @@ bool ModuleInterfaceLoader::buildSwiftModuleFromSwiftInterface(
   assert(!backInPath.empty());
   ModuleInterfaceBuilder backupBuilder(SourceMgr, &Diags, astDelegate, backInPath,
                                        ModuleName, CacheDir, PrebuiltCacheDir,
-                                       BackupInterfaceDir,
+                                       BackupInterfaceDir, ABIOutputPath,
                                        LoaderOpts.disableInterfaceLock);
   // Ensure we can rebuild module after user changed the original interface file.
   backupBuilder.addExtraDependency(InPath);
@@ -1290,6 +1301,13 @@ void InterfaceSubContextDelegateImpl::inheritOptionsForBuildingInterface(
   genericSubInvocation.setImportSearchPaths(SearchPathOpts.ImportSearchPaths);
   genericSubInvocation.setFrameworkSearchPaths(SearchPathOpts.FrameworkSearchPaths);
   if (!SearchPathOpts.SDKPath.empty()) {
+    // Add -sdk arguments to the module building commands.
+    // Module building commands need this because dependencies sometimes use
+    // sdk-relative paths (prebuilt modules for example). Without -sdk, the command
+    // will not be able to local these dependencies, leading to unnecessary
+    // building from textual interfaces.
+    GenericArgs.push_back("-sdk");
+    GenericArgs.push_back(ArgSaver.save(SearchPathOpts.SDKPath));
     genericSubInvocation.setSDKPath(SearchPathOpts.SDKPath);
   }
 
@@ -1434,8 +1452,6 @@ InterfaceSubContextDelegateImpl::InterfaceSubContextDelegateImpl(
     genericSubInvocation.getFrontendOptions().DisableImplicitModules = true;
     GenericArgs.push_back("-disable-implicit-swift-modules");
   }
-  genericSubInvocation.getSearchPathOptions().ExplicitSwiftModules =
-    searchPathOpts.ExplicitSwiftModules;
   // Pass down -explicit-swift-module-map-file
   // FIXME: we shouldn't need this. Remove it?
   StringRef explictSwiftModuleMap = searchPathOpts.ExplicitSwiftModuleMap;
@@ -1705,7 +1721,7 @@ bool ExplicitSwiftModuleLoader::findModule(ImportPath::Element ModuleID,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-           bool &IsFramework, bool &IsSystemModule) {
+           bool skipBuildingInterface, bool &IsFramework, bool &IsSystemModule) {
   StringRef moduleName = ModuleID.Item.str();
   auto it = Impl.ExplicitModuleMap.find(moduleName);
   // If no explicit module path is given matches the name, return with an
@@ -1714,15 +1730,10 @@ bool ExplicitSwiftModuleLoader::findModule(ImportPath::Element ModuleID,
     return false;
   }
   auto &moduleInfo = it->getValue();
-  if (moduleInfo.moduleBuffer) {
-    // We found an explicit module matches the given name, give the buffer
-    // back to the caller side.
-    *ModuleBuffer = std::move(moduleInfo.moduleBuffer);
-    return true;
-  }
 
   // Set IsFramework bit according to the moduleInfo
   IsFramework = moduleInfo.isFramework;
+  IsSystemModule = moduleInfo.isSystem;
 
   auto &fs = *Ctx.SourceMgr.getFileSystem();
   // Open .swiftmodule file
@@ -1782,7 +1793,7 @@ std::error_code ExplicitSwiftModuleLoader::findModuleFilesInDirectory(
   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-  bool IsFramework) {
+  bool skipBuildingInterface, bool IsFramework) {
   llvm_unreachable("Not supported in the Explicit Swift Module Loader.");
   return std::make_error_code(std::errc::not_supported);
 }
@@ -1808,7 +1819,6 @@ void ExplicitSwiftModuleLoader::collectVisibleTopLevelModuleNames(
 std::unique_ptr<ExplicitSwiftModuleLoader>
 ExplicitSwiftModuleLoader::create(ASTContext &ctx,
     DependencyTracker *tracker, ModuleLoadingMode loadMode,
-    ArrayRef<std::string> ExplicitModulePaths,
     StringRef ExplicitSwiftModuleMap,
     bool IgnoreSwiftSourceInfoFile) {
   auto result = std::unique_ptr<ExplicitSwiftModuleLoader>(
@@ -1819,24 +1829,6 @@ ExplicitSwiftModuleLoader::create(ASTContext &ctx,
   if (!ExplicitSwiftModuleMap.empty()) {
     // Parse a JSON file to collect explicitly built modules.
     Impl.parseSwiftExplicitModuleMap(ExplicitSwiftModuleMap);
-  }
-  // Collect .swiftmodule paths from -swift-module-path
-  // FIXME: remove these.
-  for (auto path: ExplicitModulePaths) {
-    std::string name;
-    // Load the explicit module into a buffer and get its name.
-    std::unique_ptr<llvm::MemoryBuffer> buffer = getModuleName(ctx, path, name);
-    if (buffer) {
-      // Register this module for future loading.
-      auto &entry = Impl.ExplicitModuleMap[name];
-      entry.modulePath = path;
-      entry.moduleBuffer = std::move(buffer);
-    } else {
-      // We cannot read the module content, diagnose.
-      ctx.Diags.diagnose(SourceLoc(),
-                         diag::error_opening_explicit_module_file,
-                         path);
-    }
   }
 
   return result;

@@ -62,20 +62,6 @@ SILValue swift::getUnderlyingObject(SILValue v) {
   }
 }
 
-SILValue
-swift::getUnderlyingObjectStoppingAtObjectToAddrProjections(SILValue v) {
-  if (!v->getType().isAddress())
-    return SILValue();
-
-  while (true) {
-    auto v2 = lookThroughAddressToAddressProjections(v);
-    v2 = stripIndexingInsts(v2);
-    if (v2 == v)
-      return v2;
-    v = v2;
-  }
-}
-
 SILValue swift::getUnderlyingObjectStopAtMarkDependence(SILValue v) {
   while (true) {
     SILValue v2 = stripCastsWithoutMarkDependence(v);
@@ -135,11 +121,13 @@ SILValue swift::stripSinglePredecessorArgs(SILValue V) {
 SILValue swift::stripCastsWithoutMarkDependence(SILValue v) {
   while (true) {
     v = stripSinglePredecessorArgs(v);
+    if (isa<MarkDependenceInst>(v))
+      return v;
+
     if (auto *svi = dyn_cast<SingleValueInstruction>(v)) {
-      if (isRCIdentityPreservingCast(svi)
-          || isa<UncheckedTrivialBitCastInst>(v)
-          || isa<BeginAccessInst>(v)
-          || isa<EndCOWMutationInst>(v)) {
+      if (isIdentityPreservingRefCast(svi) ||
+          isa<UncheckedTrivialBitCastInst>(v) || isa<BeginAccessInst>(v) ||
+          isa<EndCOWMutationInst>(v)) {
         v = svi->getOperand(0);
         continue;
       }
@@ -152,10 +140,9 @@ SILValue swift::stripCasts(SILValue v) {
   while (true) {
     v = stripSinglePredecessorArgs(v);
     if (auto *svi = dyn_cast<SingleValueInstruction>(v)) {
-      if (isRCIdentityPreservingCast(svi)
-          || isa<UncheckedTrivialBitCastInst>(v)
-          || isa<MarkDependenceInst>(v)
-          || isa<BeginAccessInst>(v)) {
+      if (isIdentityPreservingRefCast(svi) ||
+          isa<UncheckedTrivialBitCastInst>(v) || isa<MarkDependenceInst>(v) ||
+          isa<BeginAccessInst>(v)) {
         v = cast<SingleValueInstruction>(v)->getOperand(0);
         continue;
       }
@@ -291,14 +278,13 @@ bool swift::isEndOfScopeMarker(SILInstruction *user) {
     return false;
   case SILInstructionKind::EndAccessInst:
   case SILInstructionKind::EndBorrowInst:
-  case SILInstructionKind::EndLifetimeInst:
     return true;
   }
 }
 
 bool swift::isIncidentalUse(SILInstruction *user) {
   return isEndOfScopeMarker(user) || user->isDebugInstruction() ||
-         isa<FixLifetimeInst>(user);
+         isa<FixLifetimeInst>(user) || isa<EndLifetimeInst>(user);
 }
 
 bool swift::onlyAffectsRefCount(SILInstruction *user) {

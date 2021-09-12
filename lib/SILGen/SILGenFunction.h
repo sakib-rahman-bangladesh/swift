@@ -252,6 +252,9 @@ public:
   /// code by #function.
   DeclName MagicFunctionName;
   std::string MagicFunctionString;
+  
+  /// The abstraction pattern against which the function is being lowered.
+  Optional<AbstractionPattern> OrigFnType;
 
   ASTContext &getASTContext() const { return SGM.M.getASTContext(); }
 
@@ -375,6 +378,10 @@ public:
   /// emitted. The map is queried to produce the lvalue for a DeclRefExpr to
   /// a local variable.
   llvm::DenseMap<ValueDecl*, VarLoc> VarLocs;
+
+  /// The local auxiliary declarations for the parameters of this function that
+  /// need to be emitted inside the next brace statement.
+  llvm::SmallVector<VarDecl *, 2> LocalAuxiliaryDecls;
 
   // Context information for tracking an `async let` child task.
   struct AsyncLetChildTask {
@@ -608,7 +615,8 @@ public:
   }
 
   std::unique_ptr<Initialization>
-  prepareIndirectResultInit(CanType formalResultType,
+  prepareIndirectResultInit(AbstractionPattern origResultType,
+                            CanType formalResultType,
                             SmallVectorImpl<SILValue> &directResultsBuffer,
                             SmallVectorImpl<CleanupHandle> &cleanups);
 
@@ -624,10 +632,6 @@ public:
   /// emits the body code from the DestructorDecl, calls the base class
   /// destructor, then implicitly releases the elements of the class.
   void emitDestroyingDestructor(DestructorDecl *dd);
-
-  /// Inject distributed actor and transport interaction code into the destructor.
-  void injectDistributedActorDestructorLifecycleCall(
-      DestructorDecl *dd, SILValue selfValue, SILBasicBlock *continueBB);
 
   /// Generates code for an artificial top-level function that starts an
   /// application based on a main type and optionally a main type.
@@ -686,9 +690,6 @@ public:
   /// new task.
   SILFunction *emitNativeAsyncToForeignThunk(SILDeclRef thunk);
 
-  /// Generates a thunk from an actor function
-  void emitDistributedThunk(SILDeclRef thunk);
-
   /// Generate a nullary function that returns the given value.
   /// If \p emitProfilerIncrement is set, emit a profiler increment for
   /// \p value.
@@ -734,11 +735,10 @@ public:
   /// \returns Lowered index arguments.
   /// \param subscript - The subscript decl who's arguments are being lowered.
   /// \param subs - Used to get subscript function type and to substitute generic args.
-  /// \param indexExpr - An expression holding the indices of the
-  /// subscript (either a TupleExpr or a ParenExpr).
+  /// \param argList - The argument list of the subscript.
   SmallVector<ManagedValue, 4>
   emitKeyPathSubscriptOperands(SubscriptDecl *subscript, SubstitutionMap subs,
-                               Expr *indexExpr);
+                               ArgumentList *argList);
 
   /// Convert a block to a native function with a thunk.
   ManagedValue emitBlockToFunc(SILLocation loc,
@@ -907,12 +907,14 @@ public:
   void emitProlog(CaptureInfo captureInfo,
                   ParameterList *paramList, ParamDecl *selfParam,
                   DeclContext *DC, Type resultType,
-                  bool throws, SourceLoc throwsLoc);
+                  bool throws, SourceLoc throwsLoc,
+                  Optional<AbstractionPattern> origClosureType = None);
   /// A simpler version of emitProlog
   /// \returns the number of variables in paramPatterns.
   uint16_t emitBasicProlog(ParameterList *paramList, ParamDecl *selfParam,
                            Type resultType, DeclContext *DC,
-                           bool throws, SourceLoc throwsLoc);
+                           bool throws, SourceLoc throwsLoc,
+                           Optional<AbstractionPattern> origClosureType = None);
 
   /// Create SILArguments in the entry block that bind a single value
   /// of the given parameter suitably for being forwarded.
@@ -927,12 +929,14 @@ public:
   /// Create (but do not emit) the epilog branch, and save the
   /// current cleanups depth as the destination for return statement branches.
   ///
-  /// \param hasDirectResults  If true, the epilog block will be created with
-  ///                    arguments for each direct result of this function.
+  /// \param directResultType  If given a value, the epilog block will be
+  ///                    created with arguments for each direct result of this
+  ///                    function, corresponding to the formal return type.
   /// \param isThrowing  If true, create an error epilog block.
   /// \param L           The SILLocation which should be associated with
   ///                    cleanup instructions.
-  void prepareEpilog(bool hasDirectResults, bool isThrowing, CleanupLocation L);
+  void prepareEpilog(Optional<Type> directResultType,
+                     bool isThrowing, CleanupLocation L);
   void prepareRethrowEpilog(CleanupLocation l);
   void prepareCoroutineUnwindEpilog(CleanupLocation l);
   
@@ -1364,12 +1368,13 @@ public:
   ManagedValue emitClosureValue(SILLocation loc,
                                 SILDeclRef function,
                                 CanType expectedType,
-                                SubstitutionMap subs);
+                                SubstitutionMap subs,
+                                bool alreadyConverted);
 
   PreparedArguments prepareSubscriptIndices(SubscriptDecl *subscript,
                                             SubstitutionMap subs,
                                             AccessStrategy strategy,
-                                            Expr *indices);
+                                            ArgumentList *argList);
 
   ArgumentSource prepareAccessorBaseArg(SILLocation loc, ManagedValue base,
                                         CanType baseFormalType,
@@ -1876,14 +1881,16 @@ public:
                                        SILValue foreignErrorSlot,
                                  const ForeignErrorConvention &foreignError);
 
-  void emitForeignErrorBlock(SILLocation loc, SILBasicBlock *errorBB,
-                             Optional<ManagedValue> errorSlot);
+  SILValue emitForeignErrorBlock(SILLocation loc, SILBasicBlock *errorBB,
+                                 Optional<ManagedValue> errorSlot,
+                                 Optional<ForeignAsyncConvention> foreignAsync);
 
-  void emitForeignErrorCheck(SILLocation loc,
-                             SmallVectorImpl<ManagedValue> &directResults,
-                             ManagedValue errorSlot,
-                             bool suppressErrorCheck,
-                             const ForeignErrorConvention &foreignError);
+  SILValue emitForeignErrorCheck(SILLocation loc,
+                                 SmallVectorImpl<ManagedValue> &directResults,
+                                 ManagedValue errorSlot,
+                                 bool suppressErrorCheck,
+                                 const ForeignErrorConvention &foreignError,
+                                 Optional<ForeignAsyncConvention> foreignAsync);
 
   //===--------------------------------------------------------------------===//
   // Re-abstraction thunks
@@ -1994,6 +2001,34 @@ public:
                                            CanSILFunctionType toType,
                                            bool reorderSelf);
 
+  //===---------------------------------------------------------------------===//
+  // Distributed Actors
+  //===---------------------------------------------------------------------===//
+
+  /// Initialize the distributed actors transport and id.
+  void initializeDistributedActorImplicitStorageInit(
+      ConstructorDecl *ctor, ManagedValue selfArg);
+
+  /// Given a function representing a distributed actor factory, emits the
+  /// corresponding SIL function for it.
+  void emitDistributedActorFactory(FuncDecl *fd);
+
+  /// Generates a thunk from an actor function
+  void emitDistributedThunk(SILDeclRef thunk);
+
+  /// Notify transport that actor has initialized successfully,
+  /// and is ready to receive messages.
+  void emitDistributedActorReady(
+      ConstructorDecl *ctor, ManagedValue selfArg);
+
+  /// Inject distributed actor and transport interaction code into the destructor.
+  void emitDistributedActor_resignAddress(
+      DestructorDecl *dd, SILValue selfValue, SILBasicBlock *continueBB);
+
+  void emitDistributedActorClassMemberDestruction(
+      SILLocation cleanupLoc, ManagedValue selfValue, ClassDecl *cd,
+      SILBasicBlock *normalMemberDestroyBB, SILBasicBlock *finishBB);
+
   //===--------------------------------------------------------------------===//
   // Declarations
   //===--------------------------------------------------------------------===//
@@ -2086,6 +2121,9 @@ public:
 
   /// Destroy and deallocate an initialized local variable.
   void destroyLocalVariable(SILLocation L, VarDecl *D);
+
+  /// Destroy the class member.
+  void destroyClassMember(SILLocation L, ManagedValue selfValue, VarDecl *D);
 
   /// Enter a cleanup to deallocate a stack variable.
   CleanupHandle enterDeallocStackCleanup(SILValue address);

@@ -18,6 +18,7 @@
 #ifndef SWIFT_TYPES_H
 #define SWIFT_TYPES_H
 
+#include "swift/AST/ASTAllocated.h"
 #include "swift/AST/AutoDiff.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/ExtInfo.h"
@@ -53,6 +54,7 @@ namespace swift {
 
 enum class AllocationArena;
 class ArchetypeType;
+class ArgumentList;
 class AssociatedTypeDecl;
 class ASTContext;
 enum BufferPointerTypeKind : unsigned;
@@ -293,7 +295,8 @@ using TypeMatchOptions = OptionSet<TypeMatchFlags>;
 /// Base class for all types which describe the Swift and SIL ASTs.
 ///
 /// See TypeNodes.def for a succinct description of the full class hierarchy.
-class alignas(1 << TypeAlignInBits) TypeBase {
+class alignas(1 << TypeAlignInBits) TypeBase
+    : public ASTAllocated<std::aligned_storage<8, 8>::type> {
   
   friend class ASTContext;
   TypeBase(const TypeBase&) = delete;
@@ -1232,17 +1235,6 @@ public:
   /// return `None`.
   Optional<TangentSpace>
   getAutoDiffTangentSpace(LookupConformanceFn lookupConformance);
-
-private:
-  // Make vanilla new/delete illegal for Types.
-  void *operator new(size_t Bytes) throw() = delete;
-  void operator delete(void *Data) throw() = delete;
-public:
-  // Only allow allocation of Types using the allocator in ASTContext
-  // or by doing a placement new.
-  void *operator new(size_t bytes, const ASTContext &ctx,
-                     AllocationArena arena, unsigned alignment = 8);
-  void *operator new(size_t Bytes, void *Mem) throw() { return Mem; }
 };
 
 /// AnyGenericType - This abstract class helps types ensure that fields
@@ -1823,12 +1815,6 @@ protected:
   SugarType(TypeKind K, Type type, RecursiveTypeProperties properties)
       : TypeBase(K, nullptr, properties), UnderlyingType(type.getPointer()) {
     Bits.SugarType.HasCachedType = true;
-  }
-
-  void setUnderlyingType(Type type) {
-    assert(!Bits.SugarType.HasCachedType && "Cached type already set");
-    Bits.SugarType.HasCachedType = true;
-    UnderlyingType = type.getPointer();
   }
 
 public:
@@ -3018,20 +3004,12 @@ protected:
   }
 
 public:
-  /// Break an input type into an array of \c AnyFunctionType::Params.
-  static void decomposeInput(Type type,
-                             SmallVectorImpl<Param> &result);
-
-  /// Take an array of parameters and turn it into an input type.
+  /// Take an array of parameters and turn it into a tuple or paren type.
   ///
-  /// The result type is only there as a way to extract the ASTContext when
-  /// needed.
-  static Type composeInput(ASTContext &ctx, ArrayRef<Param> params,
-                           bool canonicalVararg);
-  static Type composeInput(ASTContext &ctx, CanParamArrayRef params,
-                           bool canonicalVararg) {
-    return composeInput(ctx, params.getOriginalArray(), canonicalVararg);
-  }
+  /// \param wantParamFlags Whether to preserve the parameter flags from the
+  /// given set of parameters.
+  static Type composeTuple(ASTContext &ctx, ArrayRef<Param> params,
+                           bool wantParamFlags = true);
 
   /// Given two arrays of parameters determine if they are equal in their
   /// canonicalized form. Internal labels and type sugar is *not* taken into
@@ -3043,11 +3021,11 @@ public:
   /// account.
   static bool equalParams(CanParamArrayRef a, CanParamArrayRef b);
 
-  /// Given an array of parameters and an array of labels of the
+  /// Given an array of parameters and an argument list of the
   /// same length, update each parameter to have the corresponding label.
   /// The internal parameter labels remain the same.
   static void relabelParams(MutableArrayRef<Param> params,
-                            ArrayRef<Identifier> labels);
+                            ArgumentList *argList);
 
   Type getResult() const { return Output; }
   ArrayRef<Param> getParams() const;
@@ -5048,6 +5026,21 @@ public:
   }
 };
 
+/// The type T..., which is sugar for a sequence of argument values.
+class VariadicSequenceType : public UnarySyntaxSugarType {
+  VariadicSequenceType(const ASTContext &ctx, Type base,
+                       RecursiveTypeProperties properties)
+    : UnarySyntaxSugarType(TypeKind::VariadicSequence, ctx, base, properties) {}
+
+public:
+  /// Return a uniqued variadic sequence type with the specified base type.
+  static VariadicSequenceType *get(Type baseTy);
+
+  static bool classof(const TypeBase *T) {
+    return T->getKind() == TypeKind::VariadicSequence;
+  }
+};
+
 /// ProtocolType - A protocol type describes an abstract interface implemented
 /// by another type.
 class ProtocolType : public NominalType {
@@ -5475,13 +5468,13 @@ class OpaqueTypeArchetypeType final : public ArchetypeType,
   GenericEnvironment *Environment;
   
 public:
-  /// Get 
-  
   /// Get an opaque archetype representing the underlying type of the given
-  /// opaque type decl.
-  static OpaqueTypeArchetypeType *get(OpaqueTypeDecl *Decl,
+  /// opaque type decl's opaque param with ordinal `ordinal`. For example, in
+  /// `(some P, some Q)`, `some P`'s type param would have ordinal 0 and `some
+  /// Q`'s type param would have ordinal 1.
+  static OpaqueTypeArchetypeType *get(OpaqueTypeDecl *Decl, unsigned ordinal,
                                       SubstitutionMap Substitutions);
-  
+
   OpaqueTypeDecl *getDecl() const {
     return OpaqueDecl;
   }
@@ -5512,7 +5505,7 @@ public:
   ///
   /// then the underlying type of `some P` would be ordinal 0, and `some Q` would be ordinal 1.
   unsigned getOrdinal() const {
-    // TODO: multiple opaque types
+    // TODO [OPAQUE SUPPORT]: multiple opaque types
     return 0;
   }
   
@@ -6242,7 +6235,7 @@ inline bool CanType::isActuallyCanonicalOrNull() const {
 
 inline Type TupleTypeElt::getVarargBaseTy() const {
   TypeBase *T = getType().getPointer();
-  if (auto *AT = dyn_cast<ArraySliceType>(T))
+  if (auto *AT = dyn_cast<VariadicSequenceType>(T))
     return AT->getBaseType();
   if (auto *BGT = dyn_cast<BoundGenericType>(T)) {
     // It's the stdlib Array<T>.

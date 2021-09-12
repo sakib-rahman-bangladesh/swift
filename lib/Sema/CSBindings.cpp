@@ -1338,7 +1338,6 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::KeyPath:
   case ConstraintKind::FunctionInput:
   case ConstraintKind::FunctionResult:
-  case ConstraintKind::OpaqueUnderlyingType:
     // Constraints from which we can't do anything.
     break;
 
@@ -1902,6 +1901,11 @@ TypeVariableBinding::fixForHole(ConstraintSystem &cs) const {
       return None;
 
     ConstraintFix *fix = SpecifyKeyPathRootType::create(cs, dstLocator);
+    return std::make_pair(fix, defaultImpact);
+  }
+
+  if (srcLocator->isLastElement<LocatorPathElt::PlaceholderType>()) {
+    ConstraintFix *fix = SpecifyTypeForPlaceholder::create(cs, srcLocator);
     return std::make_pair(fix, defaultImpact);
   }
 

@@ -48,7 +48,8 @@ enum : unsigned { NumTypeReprKindBits =
   countBitsUsed(static_cast<unsigned>(TypeReprKind::Last_TypeRepr)) };
 
 /// Representation of a type as written in source.
-class alignas(1 << TypeReprAlignInBits) TypeRepr {
+class alignas(1 << TypeReprAlignInBits) TypeRepr
+    : public ASTAllocated<TypeRepr> {
   TypeRepr(const TypeRepr&) = delete;
   void operator=(const TypeRepr&) = delete;
 
@@ -150,19 +151,21 @@ public:
     return walk(walker);
   }
 
+  /// Look through the given type and its children to find a type for
+  /// which the given predicate returns true.
+  ///
+  /// \param pred A predicate function object. It should return true if the
+  /// given type node satisfies the criteria.
+  ///
+  /// \returns true if the predicate returns true for the given type or any of
+  /// its children.
+  bool findIf(llvm::function_ref<bool(TypeRepr *)> pred);
+
+  /// Check recursively whether this type repr or any of its decendants are
+  /// opaque return type reprs.
+  bool hasOpaque();
+
   //*** Allocation Routines ************************************************/
-
-  void *operator new(size_t bytes, const ASTContext &C,
-                     unsigned Alignment = alignof(TypeRepr));
-
-  void *operator new(size_t bytes, void *data) {
-    assert(data);
-    return data;
-  }
-
-  // Make placement new and vanilla new/delete illegal for TypeReprs.
-  void *operator new(size_t bytes) = delete;
-  void operator delete(void *data) = delete;
 
   void print(raw_ostream &OS, const PrintOptions &Opts = PrintOptions()) const;
   void print(ASTPrinter &Printer, const PrintOptions &Opts) const;
@@ -1108,9 +1111,9 @@ private:
 /// A TypeRepr for a type with a generic parameter list of named opaque return
 /// types.
 ///
-/// This can occur only as the return type of a function declaration, to specify
-/// subtypes which should be abstracted from callers, given a set of generic
-/// constraints that the concrete types satisfy:
+/// This can occur only as the return type of a function declaration, or the
+/// type of a property, to specify types which should be abstracted from
+/// callers, given a set of generic constraints that the concrete types satisfy:
 ///
 /// func foo() -> <T: Collection> T { return [1] }
 class NamedOpaqueReturnTypeRepr : public TypeRepr {

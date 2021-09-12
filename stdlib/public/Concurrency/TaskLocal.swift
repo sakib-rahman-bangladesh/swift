@@ -95,8 +95,7 @@ import Swift
 /// value for lookups in the task local storage.
 @propertyWrapper
 @available(SwiftStdlib 5.5, *)
-// TODO: add Sendable enforcement when we're ready to do so rdar://77441933
-public final class TaskLocal<Value>: UnsafeSendable, CustomStringConvertible {
+public final class TaskLocal<Value: Sendable>: Sendable, CustomStringConvertible {
   let defaultValue: Value
 
   public init(wrappedValue defaultValue: Value) {
@@ -189,6 +188,7 @@ public final class TaskLocal<Value>: UnsafeSendable, CustomStringConvertible {
   // the type-checker that this property-wrapper never wants to have an enclosing
   // instance (it is impossible to declare a property wrapper inside the `Never`
   // type).
+  @available(*, unavailable, message: "property wrappers cannot be instance members")
   public static subscript(
     _enclosingInstance object: Never,
     wrapped wrappedKeyPath: ReferenceWritableKeyPath<Never, Value>,

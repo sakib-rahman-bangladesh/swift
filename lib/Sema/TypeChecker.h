@@ -231,7 +231,6 @@ enum class CheckedCastContextKind {
 };
 
 namespace TypeChecker {
-Type getArraySliceType(SourceLoc loc, Type elementType);
 Type getOptionalType(SourceLoc loc, Type elementType);
 
 /// Bind an UnresolvedDeclRefExpr by performing name lookup and
@@ -242,22 +241,6 @@ Type getOptionalType(SourceLoc loc, Type elementType);
 /// to replace any discovered invalid member references with `ErrorExpr`.
 Expr *resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
                          bool replaceInvalidRefsWithErrors);
-
-/// Check for unsupported protocol types in the given declaration.
-void checkUnsupportedProtocolType(Decl *decl);
-
-/// Check for unsupported protocol types in the given statement.
-void checkUnsupportedProtocolType(ASTContext &ctx, Stmt *stmt);
-
-/// Check for unsupported protocol types in the given generic requirement
-/// list.
-void checkUnsupportedProtocolType(ASTContext &ctx,
-                                  TrailingWhereClause *whereClause);
-
-/// Check for unsupported protocol types in the given generic requirement
-/// list.
-void checkUnsupportedProtocolType(ASTContext &ctx,
-                                  GenericParamList *genericParams);
 
 /// Substitute the given base type into the type of the given nested type,
 /// producing the effective type that the nested type will have.
@@ -420,7 +403,6 @@ void addImplicitDynamicAttribute(Decl *D);
 void checkDeclAttributes(Decl *D);
 void checkClosureAttributes(ClosureExpr *closure);
 void checkParameterList(ParameterList *params, DeclContext *owner);
-void checkResultType(Type resultType, DeclContext *owner);
 
 void diagnoseDuplicateBoundVars(Pattern *pattern);
 
@@ -516,6 +498,14 @@ bool checkContextualRequirements(GenericTypeDecl *decl,
 /// Add any implicitly-defined constructors required for the given
 /// struct, class or actor.
 void addImplicitConstructors(NominalTypeDecl *typeDecl);
+
+/// Synthesize and add a '_remote' counterpart of the passed in `func` to `decl`.
+///
+/// \param decl the actor type to add the '_remote' definition to
+/// \param func the 'distributed func' that the '_remote' func should mirror
+/// \return the synthesized function
+AbstractFunctionDecl *addImplicitDistributedActorRemoteFunction(
+    ClassDecl* decl, AbstractFunctionDecl *func);
 
 /// Fold the given sequence expression into an (unchecked) expression
 /// tree.
@@ -962,6 +952,10 @@ AvailabilityContext overApproximateAvailabilityAtLocation(
 /// Walk the AST to build the hierarchy of TypeRefinementContexts
 void buildTypeRefinementContextHierarchy(SourceFile &SF);
 
+/// Walk the AST to complete the hierarchy of TypeRefinementContexts for
+/// the delayed function body of \p AFD.
+void buildTypeRefinementContextHierarchyDelayed(SourceFile &SF, AbstractFunctionDecl *AFD);
+
 /// Build the hierarchy of TypeRefinementContexts for the entire
 /// source file, if it has not already been built. Returns the root
 /// TypeRefinementContext for the source file.
@@ -1021,6 +1015,9 @@ diagnosePotentialOpaqueTypeUnavailability(SourceRange ReferenceRange,
                                           const DeclContext *ReferenceDC,
                                           const UnavailabilityReason &Reason);
 
+/// Type check a 'distributed actor' declaration.
+void checkDistributedActor(ClassDecl *decl);
+
 void checkConcurrencyAvailability(SourceRange ReferenceRange,
                                   const DeclContext *ReferenceDC);
 
@@ -1036,10 +1033,8 @@ void diagnosePotentialAccessorUnavailability(
 const AvailableAttr *getDeprecated(const Decl *D);
 
 /// Emits a diagnostic for a reference to a declaration that is deprecated.
-void diagnoseIfDeprecated(SourceRange SourceRange,
-                          const ExportContext &Where,
-                          const ValueDecl *DeprecatedDecl,
-                          const ApplyExpr *Call);
+void diagnoseIfDeprecated(SourceRange SourceRange, const ExportContext &Where,
+                          const ValueDecl *DeprecatedDecl, const Expr *Call);
 
 /// Emits a diagnostic for a reference to a conformnace that is deprecated.
 bool diagnoseIfDeprecated(SourceLoc loc,
@@ -1162,23 +1157,20 @@ bool typeSupportsBuilderOp(Type builderType, DeclContext *dc, Identifier fnName,
 /// once.
 void applyAccessNote(ValueDecl *VD);
 
+/// Returns true if the given type conforms to `Differentiable` in the
+/// module of `dc`. If `tangentVectorEqualsSelf` is true, returns true iff
+/// the given type additionally satisfies `Self == Self.TangentVector`.
+bool isDifferentiable(Type type, bool tangentVectorEqualsSelf, DeclContext *dc,
+                      Optional<TypeResolutionStage> stage);
+
+/// Emits diagnostics if the given function type's parameter/result types are
+/// not compatible with the ext info. Returns whether an error was diagnosed.
+bool diagnoseInvalidFunctionType(FunctionType *fnTy, SourceLoc loc,
+                                 Optional<FunctionTypeRepr *>repr,
+                                 DeclContext *dc,
+                                 Optional<TypeResolutionStage> stage);
+
 }; // namespace TypeChecker
-
-/// Temporary on-stack storage and unescaping for encoded diagnostic
-/// messages.
-///
-///
-class EncodedDiagnosticMessage {
-  llvm::SmallString<128> Buf;
-
-public:
-  /// \param S A string with an encoded message
-  EncodedDiagnosticMessage(StringRef S)
-      : Message(Lexer::getEncodedStringSegment(S, Buf, true, true, ~0U)) {}
-
-  /// The unescaped message to display to the user.
-  const StringRef Message;
-};
 
 /// Returns the protocol requirement kind of the given declaration.
 /// Used in diagnostics.
@@ -1262,7 +1254,7 @@ Type getMemberTypeForComparison(const ValueDecl *member,
 /// Determine whether the given declaration is an override by comparing type
 /// information.
 bool isOverrideBasedOnType(const ValueDecl *decl, Type declTy,
-                           const ValueDecl *parentDecl, Type parentDeclTy);
+                           const ValueDecl *parentDecl);
 
 /// Determine whether the given declaration is an operator defined in a
 /// protocol. If \p type is not null, check specifically whether \p decl

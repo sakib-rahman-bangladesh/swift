@@ -1118,6 +1118,7 @@ extension ArraySlice: RangeReplaceableCollection {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 extension ArraySlice: CustomReflectable {
   /// A mirror that reflects the array.
   public var customMirror: Mirror {
@@ -1127,6 +1128,7 @@ extension ArraySlice: CustomReflectable {
       displayStyle: .collection)
   }
 }
+#endif
 
 extension ArraySlice: CustomStringConvertible, CustomDebugStringConvertible {
   /// A textual representation of the array and its elements.
@@ -1239,32 +1241,18 @@ extension ArraySlice {
     // Ensure unique storage
     _makeMutableAndUnique()
 
-    // Ensure that body can't invalidate the storage or its bounds by
-    // moving self into a temporary working array.
-    // NOTE: The stack promotion optimization that keys of the
-    // "array.withUnsafeMutableBufferPointer" semantics annotation relies on the
-    // array buffer not being able to escape in the closure. It can do this
-    // because we swap the array buffer in self with an empty buffer here. Any
-    // escape via the address of self in the closure will therefore escape the
-    // empty array.
-
-    var work = ArraySlice()
-    (work, self) = (self, work)
-
-    // Create an UnsafeBufferPointer over work that we can pass to body
-    let pointer = work._buffer.firstElementAddress
+    // Create an UnsafeBufferPointer that we can pass to body
+    let pointer = _buffer.firstElementAddress
     var inoutBufferPointer = UnsafeMutableBufferPointer(
       start: pointer, count: count)
 
-    // Put the working array back before returning.
     defer {
       _precondition(
         inoutBufferPointer.baseAddress == pointer &&
         inoutBufferPointer.count == count,
         "ArraySlice withUnsafeMutableBufferPointer: replacing the buffer is not allowed")
-
-      (work, self) = (self, work)
       _endMutation()
+      _fixLifetime(self)
     }
 
     // Invoke the body.

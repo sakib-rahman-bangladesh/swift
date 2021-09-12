@@ -618,19 +618,6 @@ SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 NearestTaskDeadline
 swift_task_getNearestDeadline(AsyncTask *task);
 
-/// Run the given async function and block the current thread until
-/// it returns.  This is a hack added for testing purposes; eventually
-/// top-level code will be an async context, and the need for this in
-/// tests should go away.  We *definitely* do not want this to be part
-/// of the standard feature set.
-///
-/// The argument is a `() async -> ()` function, whose ABI is currently
-/// quite complex.  Eventually this should use a different convention;
-/// that's rdar://72105841.
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_task_runAndBlockThread(const void *function,
-                                  HeapObject *functionContext);
-
 /// Switch the current task to a new executor if we aren't already
 /// running on a compatible executor.
 ///
@@ -716,18 +703,9 @@ SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
 void swift_defaultActor_deallocateResilient(HeapObject *actor);
 
 /// Initialize the runtime storage for a distributed remote actor.
-// TODO: this may end up being removed as we move to the "proxy creation" below
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-void swift_distributedActor_remote_initialize(DefaultActor *actor);
-
-/// Create a proxy object that will serve as remote distributed actor instance.
-SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)
-OpaqueValue* swift_distributedActor_remote_create(
-  /* +1 */OpaqueValue *identity,
-  /* +1 */OpaqueValue *transport
-  // metadata for identity
-  // metadata for transport
-);
+OpaqueValue*
+swift_distributedActor_remote_initialize(const Metadata *actorType);
 
 /// Destroy the runtime storage for a default actor.
 SWIFT_EXPORT_FROM(swift_Concurrency) SWIFT_CC(swift)

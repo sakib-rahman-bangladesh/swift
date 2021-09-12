@@ -21,6 +21,7 @@
 #include "GenType.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/Expr.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleLoader.h"
@@ -191,9 +192,11 @@ public:
   void emitArtificialFunction(IRBuilder &Builder, llvm::Function *Fn,
                               SILType SILTy);
 
-  void handleFragmentDIExpr(const SILDIExprOperand &CurDIExprOp,
+  /// Return false if we fail to create the right DW_OP_LLVM_fragment operand.
+  bool handleFragmentDIExpr(const SILDIExprOperand &CurDIExprOp,
                             SmallVectorImpl<uint64_t> &Operands);
-  void buildDebugInfoExpression(const SILDebugVariable &VarInfo,
+  /// Return false if we fail to create the desired !DIExpression.
+  bool buildDebugInfoExpression(const SILDebugVariable &VarInfo,
                                 SmallVectorImpl<uint64_t> &Operands);
 
   void emitVariableDeclaration(IRBuilder &Builder,
@@ -823,9 +826,29 @@ private:
       return MetadataTypeDeclCache.find(DbgTy.getDecl()->getName().str())
           ->getKey();
 
+    // This is a bit of a hack. We need a generic signature to use for mangling.
+    // If we started with an interface type, just use IGM.getCurGenericContext(),
+    // since callers that use interface types typically push a signature that way.
+    //
+    // Otherwise, if we have a contextual type, find an archetype and ask it for
+    // it's generic signature. The context generic signature from the IRGenModule
+    // is unlikely to be useful here.
+    GenericSignature Sig;
     Type Ty = DbgTy.getType();
-    if (Ty->hasArchetype())
+    if (Ty->hasArchetype()) {
+      Ty.findIf([&](Type t) -> bool {
+        if (auto *archetypeTy = t->getAs<PrimaryArchetypeType>()) {
+          Sig = archetypeTy->getGenericEnvironment()->getGenericSignature();
+          return true;
+        }
+
+        return false;
+      });
+
       Ty = Ty->mapTypeOutOfContext();
+    } else {
+      Sig = IGM.getCurGenericContext();
+    }
 
     // Strip off top level of type sugar (except for type aliases).
     // We don't want Optional<T> and T? to get different debug types.
@@ -850,7 +873,6 @@ private:
         IGM.getSILModule());
 
     Mangle::ASTMangler Mangler;
-    GenericSignature Sig = IGM.getCurGenericContext();
     std::string Result = Mangler.mangleTypeForDebugger(Ty, Sig);
 
     if (!Opts.DisableRoundTripDebugTypes) {
@@ -1627,7 +1649,8 @@ private:
     // SyntaxSugarType derivations.
     case TypeKind::Dictionary:
     case TypeKind::ArraySlice:
-    case TypeKind::Optional: {
+    case TypeKind::Optional:
+    case TypeKind::VariadicSequence: {
       auto *SyntaxSugarTy = cast<SyntaxSugarType>(BaseTy);
       auto *CanTy = SyntaxSugarTy->getSinglyDesugaredType();
       return getOrCreateDesugaredType(CanTy, DbgTy);
@@ -1667,8 +1690,7 @@ private:
   static bool canMangle(TypeBase *Ty) {
     // TODO: C++ types are not yet supported (SR-13223).
     if (Ty->getStructOrBoundGenericStruct() &&
-        Ty->getStructOrBoundGenericStruct()->getClangDecl() &&
-        isa<clang::CXXRecordDecl>(
+        isa_and_nonnull<clang::CXXRecordDecl>(
             Ty->getStructOrBoundGenericStruct()->getClangDecl()))
       return false;
 
@@ -2336,9 +2358,8 @@ void IRGenDebugInfoImpl::emitArtificialFunction(IRBuilder &Builder,
   setCurrentLoc(Builder, Scope, ALoc);
 }
 
-void IRGenDebugInfoImpl::handleFragmentDIExpr(
-    const SILDIExprOperand &CurDIExprOp,
-    SmallVectorImpl<uint64_t> &Operands) {
+bool IRGenDebugInfoImpl::handleFragmentDIExpr(
+    const SILDIExprOperand &CurDIExprOp, SmallVectorImpl<uint64_t> &Operands) {
   assert(CurDIExprOp.getOperator() == SILDIExprOperator::Fragment);
   // Expecting a VarDecl that points to a field in an struct
   auto DIExprArgs = CurDIExprOp.args();
@@ -2348,14 +2369,22 @@ void IRGenDebugInfoImpl::handleFragmentDIExpr(
                "DIExprOperator::Fragment");
   // Translate the based type
   DeclContext *ParentDecl = VD->getDeclContext();
+  assert(ParentDecl && "VarDecl has no parent context?");
   SILType ParentSILType =
       IGM.getLoweredType(ParentDecl->getDeclaredTypeInContext());
   // Retrieve the offset & size of the field
   llvm::Constant *Offset =
       emitPhysicalStructMemberFixedOffset(IGM, ParentSILType, VD);
-  llvm::Type *FieldTy =
-      getPhysicalStructFieldTypeInfo(IGM, ParentSILType, VD)->getStorageType();
-  assert(Offset && FieldTy && "Non-fixed type?");
+  auto *FieldTypeInfo = getPhysicalStructFieldTypeInfo(IGM, ParentSILType, VD);
+  // FIXME: This will only happen if IRGen hasn't processed ParentSILType
+  // (into its own representation) but we probably should ask IRGen to process
+  // it right now.
+  if (!FieldTypeInfo)
+    return false;
+  llvm::Type *FieldTy = FieldTypeInfo->getStorageType();
+  // Doesn't support non-fixed type right now
+  if (!Offset || !FieldTy)
+    return false;
 
   uint64_t SizeOfByte = CI.getTargetInfo().getCharWidth();
   uint64_t SizeInBits = IGM.DataLayout.getTypeSizeInBits(FieldTy);
@@ -2366,9 +2395,11 @@ void IRGenDebugInfoImpl::handleFragmentDIExpr(
   Operands.push_back(llvm::dwarf::DW_OP_LLVM_fragment);
   Operands.push_back(OffsetInBits);
   Operands.push_back(SizeInBits);
+
+  return true;
 }
 
-void IRGenDebugInfoImpl::buildDebugInfoExpression(
+bool IRGenDebugInfoImpl::buildDebugInfoExpression(
     const SILDebugVariable &VarInfo, SmallVectorImpl<uint64_t> &Operands) {
   assert(VarInfo.DIExpr && "SIL debug info expression not found");
 
@@ -2376,12 +2407,17 @@ void IRGenDebugInfoImpl::buildDebugInfoExpression(
   for (const SILDIExprOperand &ExprOperand : DIExpr.operands()) {
     switch (ExprOperand.getOperator()) {
     case SILDIExprOperator::Fragment:
-      handleFragmentDIExpr(ExprOperand, Operands);
+      if (!handleFragmentDIExpr(ExprOperand, Operands))
+        return false;
+      break;
+    case SILDIExprOperator::Dereference:
+      Operands.push_back(llvm::dwarf::DW_OP_deref);
       break;
     default:
-      llvm_unreachable("Unrecoginized operator");
+      llvm_unreachable("Unrecognized operator");
     }
   }
+  return true;
 }
 
 void IRGenDebugInfoImpl::emitVariableDeclaration(
@@ -2411,7 +2447,7 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
     while (isa<llvm::DILexicalBlock>(Scope))
       Scope = cast<llvm::DILexicalBlock>(Scope)->getScope();
   }
-  assert(Scope && isa<llvm::DIScope>(Scope) && "variable has no scope");
+  assert(isa_and_nonnull<llvm::DIScope>(Scope) && "variable has no scope");
   llvm::DIFile *Unit = getFile(Scope);
   llvm::DIType *DITy = getOrCreateType(DbgTy);
   assert(DITy && "could not determine debug type of variable");
@@ -2455,7 +2491,8 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
       [&VarInfo, this](llvm::DIExpression *DIExpr) -> llvm::DIExpression * {
     if (VarInfo.DIExpr) {
       llvm::SmallVector<uint64_t, 2> Operands;
-      buildDebugInfoExpression(VarInfo, Operands);
+      if (!buildDebugInfoExpression(VarInfo, Operands))
+        return nullptr;
       if (Operands.size())
         return llvm::DIExpression::append(DIExpr, Operands);
     }
@@ -2493,22 +2530,24 @@ void IRGenDebugInfoImpl::emitVariableDeclaration(
       Operands.push_back(SizeInBits);
     }
     llvm::DIExpression *DIExpr = DBuilder.createExpression(Operands);
-    emitDbgIntrinsic(
-        Builder, Piece, Var,
-        // DW_OP_LLVM_fragment must be the last part of an DIExpr
-        // so we can't append more if IsPiece is true.
-        Operands.empty() || IsPiece ? DIExpr : appendDIExpression(DIExpr),
-        DInstLine, DInstLoc.column, Scope, DS,
-        Indirection == CoroDirectValue || Indirection == CoroIndirectValue);
+    // DW_OP_LLVM_fragment must be the last part of an DIExpr
+    // so we can't append more if IsPiece is true.
+    if (!IsPiece)
+      DIExpr = appendDIExpression(DIExpr);
+    if (DIExpr)
+      emitDbgIntrinsic(
+          Builder, Piece, Var, DIExpr, DInstLine, DInstLoc.column, Scope, DS,
+          Indirection == CoroDirectValue || Indirection == CoroIndirectValue);
   }
 
   // Emit locationless intrinsic for variables that were optimized away.
-  if (Storage.empty())
-    emitDbgIntrinsic(Builder, llvm::ConstantInt::get(IGM.Int64Ty, 0), Var,
-                     appendDIExpression(DBuilder.createExpression()), DInstLine,
-                     DInstLoc.column, Scope, DS,
-                     Indirection == CoroDirectValue ||
-                         Indirection == CoroIndirectValue);
+  if (Storage.empty()) {
+    if (auto *DIExpr = appendDIExpression(DBuilder.createExpression()))
+      emitDbgIntrinsic(Builder, llvm::ConstantInt::get(IGM.Int64Ty, 0), Var,
+                       DIExpr, DInstLine, DInstLoc.column, Scope, DS,
+                       Indirection == CoroDirectValue ||
+                           Indirection == CoroIndirectValue);
+  }
 }
 
 void IRGenDebugInfoImpl::emitDbgIntrinsic(
@@ -2525,6 +2564,23 @@ void IRGenDebugInfoImpl::emitDbgIntrinsic(
   if (isa<llvm::AllocaInst>(Storage) &&
       !llvm::FindDbgDeclareUses(Storage).empty())
     return;
+
+  // Fragment DIExpression cannot cover the whole variable
+  // or going out-of-bound.
+  if (auto Fragment = Expr->getFragmentInfo())
+    if (auto VarSize = Var->getSizeInBits()) {
+      unsigned FragSize = Fragment->SizeInBits;
+      unsigned FragOffset = Fragment->OffsetInBits;
+      if (FragOffset + FragSize > *VarSize ||
+          FragSize == *VarSize) {
+        // Drop the fragment part
+        assert(Expr->isValid());
+        // Since this expression is valid, DW_OP_LLVM_fragment
+        // and its arguments must be the last 3 elements.
+        auto OrigElements = Expr->getElements();
+        Expr = DBuilder.createExpression(OrigElements.drop_back(3));
+      }
+    }
 
   // A dbg.declare is only meaningful if there is a single alloca for
   // the variable that is live throughout the function.
@@ -2554,7 +2610,19 @@ void IRGenDebugInfoImpl::emitDbgIntrinsic(
       DBuilder.insertDeclare(Storage, Var, Expr, DL, &EntryBlock);
   } else {
     // Insert a dbg.value at the current insertion point.
-    DBuilder.insertDbgValueIntrinsic(Storage, Var, Expr, DL, BB);
+    if (isa<llvm::Argument>(Storage) && !Var->getArg() &&
+        BB->getFirstNonPHIOrDbg())
+      // SelectionDAGISel only generates debug info for a dbg.value
+      // that is associated with a llvm::Argument if either its !DIVariable
+      // is marked as argument or there is no non-debug intrinsic instruction
+      // before it. So In the case of associating a llvm::Argument with a
+      // non-argument debug variable -- usually via a !DIExpression -- we
+      // need to make sure that dbg.value is before any non-phi / no-dbg
+      // instruction.
+      DBuilder.insertDbgValueIntrinsic(Storage, Var, Expr, DL,
+                                       BB->getFirstNonPHIOrDbg());
+    else
+      DBuilder.insertDbgValueIntrinsic(Storage, Var, Expr, DL, BB);
   }
 }
 
@@ -2570,8 +2638,7 @@ void IRGenDebugInfoImpl::emitGlobalVariableDeclaration(
     if (MetatypeType *metaTy = dyn_cast<MetatypeType>(ty))
       ty = metaTy->getInstanceType().getPointer();
     if (ty->getStructOrBoundGenericStruct() &&
-        ty->getStructOrBoundGenericStruct()->getClangDecl() &&
-        isa<clang::CXXRecordDecl>(
+        isa_and_nonnull<clang::CXXRecordDecl>(
             ty->getStructOrBoundGenericStruct()->getClangDecl()))
       return;
   }

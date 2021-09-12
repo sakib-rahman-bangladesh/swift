@@ -406,7 +406,14 @@ SILFunction *SILDeserializer::getFuncForReference(StringRef name,
   // SIL.
   SourceLoc sourceLoc;
   SILSerializationFunctionBuilder builder(SILMod);
-  return builder.createDeclaration(name, type, RegularLocation(sourceLoc));
+  fn = builder.createDeclaration(name, type,
+                                 RegularLocation(sourceLoc));
+  // The function is not really de-serialized, but it's important to call
+  // `didDeserialize` on every new function. Otherwise some Analysis might miss
+  // `notifyAddedOrModifiedFunction` notifications.
+  if (Callback)
+    Callback->didDeserialize(MF->getAssociatedModule(), fn);
+  return fn;
 }
 
 /// Helper function to find a SILFunction, given its name and type.
@@ -1066,6 +1073,11 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   ApplyOptions ApplyOpts;
   ArrayRef<uint64_t> ListOfValues;
   SILLocation Loc = RegularLocation(SLoc);
+  ValueOwnershipKind forwardingOwnership(OwnershipKind::Any);
+  auto decodeValueOwnership = [](unsigned field){
+    // Invalid/Any ownership is never encoded.
+    return ValueOwnershipKind(field+1);
+  };
 
   switch (RecordKind) {
   default:
@@ -1104,6 +1116,14 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
     SILOneTypeValuesLayout::readRecord(scratch, RawOpCode, TyID, TyCategory,
                                        ListOfValues);
     break;
+  case SIL_ONE_TYPE_OWNERSHIP_VALUES: {
+    unsigned ownershipField;
+    SILOneTypeOwnershipValuesLayout::readRecord(scratch, RawOpCode,
+                                                ownershipField, TyID,
+                                                TyCategory, ListOfValues);
+    forwardingOwnership = decodeValueOwnership(ownershipField);
+    break;
+  }
   case SIL_TWO_OPERANDS:
     SILTwoOperandsLayout::readRecord(scratch, RawOpCode, Attr,
                                      TyID, TyCategory, ValID,
@@ -1189,7 +1209,6 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   SILInstruction *ResultInst;
   switch (OpCode) {
   case SILInstructionKind::DebugValueInst:
-  case SILInstructionKind::DebugValueAddrInst:
     llvm_unreachable("not supported");
 
   case SILInstructionKind::AllocBoxInst:
@@ -1845,7 +1864,6 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   UNARY_INSTRUCTION(EndLifetime)
   UNARY_INSTRUCTION(CopyBlock)
   UNARY_INSTRUCTION(LoadBorrow)
-  UNARY_INSTRUCTION(BeginBorrow)
   REFCOUNTING_INSTRUCTION(StrongRetain)
   REFCOUNTING_INSTRUCTION(StrongRelease)
   UNARY_INSTRUCTION(IsUnique)
@@ -1854,6 +1872,17 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   UNARY_INSTRUCTION(ExtractExecutor)
 #undef UNARY_INSTRUCTION
 #undef REFCOUNTING_INSTRUCTION
+
+  case SILInstructionKind::BeginBorrowInst: {
+    assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand.");
+    unsigned defined = Attr;
+    ResultInst = Builder.createBeginBorrow(
+        Loc,
+        getLocalValue(ValID, getSILType(MF->getType(TyID),
+                                        (SILValueCategory)TyCategory, Fn)),
+        defined == 1);
+    break;
+  }
 
   case SILInstructionKind::IsEscapingClosureInst: {
     assert(RecordKind == SIL_ONE_OPERAND && "Layout should be OneOperand.");
@@ -1925,7 +1954,7 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
   }
   case SILInstructionKind::UncheckedOwnershipConversionInst: {
     auto Ty = MF->getType(TyID);
-    auto ResultKind = ValueOwnershipKind(Attr);
+    auto ResultKind = decodeValueOwnership(Attr);
     ResultInst = Builder.createUncheckedOwnershipConversion(
         Loc,
         getLocalValue(ValID, getSILType(Ty, (SILValueCategory)TyCategory, Fn)),
@@ -2236,10 +2265,13 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
       CaseBBs.push_back( {cast<EnumElementDecl>(MF->getDecl(ListOfValues[I])),
                             getBBForReference(Fn, ListOfValues[I+1])} );
     }
-    if (OpCode == SILInstructionKind::SwitchEnumInst)
-      ResultInst = Builder.createSwitchEnum(Loc, Cond, DefaultBB, CaseBBs);
-    else
+    if (OpCode == SILInstructionKind::SwitchEnumInst) {
+      ResultInst = Builder.createSwitchEnum(Loc, Cond, DefaultBB, CaseBBs,
+                                            None, ProfileCounter(),
+                                            forwardingOwnership);
+    } else {
       ResultInst = Builder.createSwitchEnumAddr(Loc, Cond, DefaultBB, CaseBBs);
+    }
     break;
   }
   case SILInstructionKind::SelectEnumInst:
@@ -2504,7 +2536,8 @@ bool SILDeserializer::readSILInstruction(SILFunction *Fn,
 
     ResultInst =
         Builder.createCheckedCastBranch(Loc, isExact, op, targetLoweredType,
-                                        targetFormalType, successBB, failureBB);
+                                        targetFormalType, successBB, failureBB,
+                                        forwardingOwnership);
     break;
   }
   case SILInstructionKind::CheckedCastValueBranchInst: {

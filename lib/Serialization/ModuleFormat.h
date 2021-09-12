@@ -56,7 +56,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR = 619; // builtin protocol conformances
+const uint16_t SWIFTMODULE_VERSION_MINOR = 626; // switch & checkcast ownership
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -797,6 +797,7 @@ namespace options_block {
     IS_IMPLICIT_DYNAMIC_ENABLED,
     IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED,
     MODULE_ABI_NAME,
+    IS_CONCURRENCY_CHECKED,
   };
 
   using SDKPathLayout = BCRecordLayout<
@@ -842,6 +843,10 @@ namespace options_block {
   using ModuleABINameLayout = BCRecordLayout<
     MODULE_ABI_NAME,
     BCBlob
+  >;
+
+  using IsConcurrencyCheckedLayout = BCRecordLayout<
+    IS_CONCURRENCY_CHECKED
   >;
 }
 
@@ -1145,6 +1150,7 @@ namespace decls_block {
 
   using ArraySliceTypeLayout = SyntaxSugarTypeLayout<ARRAY_SLICE_TYPE>;
   using OptionalTypeLayout = SyntaxSugarTypeLayout<OPTIONAL_TYPE>;
+  using VariadicSequenceTypeLayout = SyntaxSugarTypeLayout<VARIADIC_SEQUENCE_TYPE>;
 
   using DictionaryTypeLayout = BCRecordLayout<
     DICTIONARY_TYPE,
@@ -1251,7 +1257,6 @@ namespace decls_block {
     BCFixed<1>,             // implicit flag
     BCFixed<1>,             // class-bounded?
     BCFixed<1>,             // objc?
-    BCFixed<1>,             // existential-type-supported?
     AccessLevelField,       // access level
     BCVBR<4>,               // number of inherited types
     BCArray<TypeIDField>    // inherited types, followed by dependency types
@@ -1427,8 +1432,7 @@ namespace decls_block {
   using UnaryOperatorLayout = BCRecordLayout<
     Code, // ID field
     IdentifierIDField,  // name
-    DeclContextIDField, // context decl
-    BCArray<DeclIDField> // designated types
+    DeclContextIDField  // context decl
   >;
 
   using PrefixOperatorLayout = UnaryOperatorLayout<PREFIX_OPERATOR_DECL>;
@@ -1438,8 +1442,7 @@ namespace decls_block {
     INFIX_OPERATOR_DECL,
     IdentifierIDField, // name
     DeclContextIDField,// context decl
-    DeclIDField,       // precedence group
-    BCArray<DeclIDField> // designated types
+    DeclIDField        // precedence group
   >;
 
   using PrecedenceGroupLayout = BCRecordLayout<
@@ -1612,6 +1615,11 @@ namespace decls_block {
     BCVBR<8>                     // alignment
   >;
 
+  using AssociatedTypeLayout = BCRecordLayout<
+    ASSOCIATED_TYPE,
+    DeclIDField                  // associated type decl
+  >;
+
   /// Specifies the private discriminator string for a private declaration. This
   /// identifies the declaration's original source file in some opaque way.
   using PrivateDiscriminatorLayout = BCRecordLayout<
@@ -1675,7 +1683,8 @@ namespace decls_block {
     BUILTIN_PROTOCOL_CONFORMANCE,
     TypeIDField, // the conforming type
     DeclIDField, // the protocol
-    GenericSignatureIDField // the generic signature
+    GenericSignatureIDField, // the generic signature
+    BCFixed<2> // the builtin conformance kind
     // the (optional) conditional requirements follow
   >;
 
@@ -1881,10 +1890,11 @@ namespace decls_block {
     BC_AVAIL_TUPLE, // Introduced
     BC_AVAIL_TUPLE, // Deprecated
     BC_AVAIL_TUPLE, // Obsoleted
-    BCVBR<5>,   // platform
-    BCVBR<5>,   // number of bytes in message string
-    BCVBR<5>,   // number of bytes in rename string
-    BCBlob      // platform, followed by message
+    BCVBR<5>,    // platform
+    DeclIDField, // rename declaration (if any)
+    BCVBR<5>,    // number of bytes in message string
+    BCVBR<5>,    // number of bytes in rename string
+    BCBlob       // message, followed by rename
   >;
 
   using OriginallyDefinedInDeclAttrLayout = BCRecordLayout<
@@ -1940,13 +1950,6 @@ namespace decls_block {
     IdentifierIDField, // Original name.
     DeclIDField, // Original function declaration.
     BCArray<BCFixed<1>> // Transposed parameter indices' bitvector.
-  >;
-
-  using CompletionHandlerAsyncDeclAttrLayout = BCRecordLayout<
-    CompletionHandlerAsync_DECL_ATTR,
-    BCFixed<1>,                 // Implicit flag.
-    BCVBR<5>,                   // Completion handler index
-    DeclIDField                 // Mapped async function decl
   >;
 
 #define SIMPLE_DECL_ATTR(X, CLASS, ...)         \

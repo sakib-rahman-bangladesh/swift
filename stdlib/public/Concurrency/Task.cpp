@@ -24,16 +24,21 @@
 #include "swift/Runtime/HeapObject.h"
 #include "TaskGroupPrivate.h"
 #include "TaskPrivate.h"
-#include "AsyncCall.h"
 #include "Debug.h"
 #include "Error.h"
 
+#if !SWIFT_CONCURRENCY_COOPERATIVE_GLOBAL_EXECUTOR
 #include <dispatch/dispatch.h>
+#endif
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
 #endif
 
+#if defined(SWIFT_CONCURRENCY_BACK_DEPLOYMENT)
+asm("\n .globl _swift_async_extendedFramePointerFlags" \
+    "\n _swift_async_extendedFramePointerFlags = 0x0");
+#else
 #ifdef __APPLE__
 #if __POINTER_WIDTH__ == 64
 asm("\n .globl _swift_async_extendedFramePointerFlags" \
@@ -46,6 +51,7 @@ asm("\n .globl _swift_async_extendedFramePointerFlags" \
     "\n _swift_async_extendedFramePointerFlags = 0x0");
 #endif
 #endif // __APPLE__
+#endif // !defined(SWIFT_CONCURRENCY_BACK_DEPLOYMENT)
 
 using namespace swift;
 using FutureFragment = AsyncTask::FutureFragment;
@@ -84,20 +90,16 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
     switch (queueHead.getStatus()) {
     case Status::Error:
     case Status::Success:
-#if SWIFT_TASK_PRINTF_DEBUG
-      fprintf(stderr, "[%lu] task %p waiting on task %p, completed immediately\n",
-              _swift_get_thread_id(), waitingTask, this);
-#endif
+      SWIFT_TASK_DEBUG_LOG("task %p waiting on task %p, completed immediately",
+                           waitingTask, this);
       _swift_tsan_acquire(static_cast<Job *>(this));
       if (contextIntialized) waitingTask->flagAsRunning();
       // The task is done; we don't need to wait.
       return queueHead.getStatus();
 
     case Status::Executing:
-#if SWIFT_TASK_PRINTF_DEBUG
-      fprintf(stderr, "[%lu] task %p waiting on task %p, going to sleep\n",
-              _swift_get_thread_id(), waitingTask, this);
-#endif
+      SWIFT_TASK_DEBUG_LOG("task %p waiting on task %p, going to sleep",
+                           waitingTask, this);
       _swift_tsan_release(static_cast<Job *>(waitingTask));
       // Task is not complete. We'll need to add ourselves to the queue.
       break;
@@ -147,7 +149,7 @@ void NullaryContinuationJob::process(Job *_job) {
 void AsyncTask::completeFuture(AsyncContext *context) {
   using Status = FutureFragment::Status;
   using WaitQueueItem = FutureFragment::WaitQueueItem;
-
+  SWIFT_TASK_DEBUG_LOG("complete future = %p", this);
   assert(isFuture());
   auto fragment = futureFragment();
 
@@ -183,21 +185,16 @@ void AsyncTask::completeFuture(AsyncContext *context) {
   // Schedule every waiting task on the executor.
   auto waitingTask = queueHead.getTask();
 
-#if SWIFT_TASK_PRINTF_DEBUG
   if (!waitingTask)
-    fprintf(stderr, "[%lu] task %p had no waiting tasks\n",
-            _swift_get_thread_id(), this);
-#endif
+    SWIFT_TASK_DEBUG_LOG("task %p had no waiting tasks", this);
 
   while (waitingTask) {
     // Find the next waiting task before we invalidate it by resuming
     // the task.
     auto nextWaitingTask = waitingTask->getNextWaitingTask();
 
-#if SWIFT_TASK_PRINTF_DEBUG
-    fprintf(stderr, "[%lu] waking task %p from future of task %p\n",
-            _swift_get_thread_id(), waitingTask, this);
-#endif
+    SWIFT_TASK_DEBUG_LOG("waking task %p from future of task %p", waitingTask,
+                         this);
 
     // Fill in the return context.
     auto waitingContext =
@@ -238,7 +235,6 @@ AsyncTask::~AsyncTask() {
 SWIFT_CC(swift)
 static void destroyTask(SWIFT_CONTEXT HeapObject *obj) {
   auto task = static_cast<AsyncTask*>(obj);
-
   task->~AsyncTask();
 
   // The task execution itself should always hold a reference to it, so
@@ -247,19 +243,21 @@ static void destroyTask(SWIFT_CONTEXT HeapObject *obj) {
   // the task-local allocator.  There's actually nothing else to clean up
   // here.
 
-#if SWIFT_TASK_PRINTF_DEBUG
-  fprintf(stderr, "[%lu] destroy task %p\n", _swift_get_thread_id(), task);
-#endif
+  SWIFT_TASK_DEBUG_LOG("destroy task %p", task);
   free(task);
 }
 
 static ExecutorRef executorForEnqueuedJob(Job *job) {
+#if SWIFT_CONCURRENCY_COOPERATIVE_GLOBAL_EXECUTOR
+  return ExecutorRef::generic();
+#else
   void *jobQueue = job->SchedulerPrivate[Job::DispatchQueueIndex];
   if (jobQueue == DISPATCH_QUEUE_GLOBAL_EXECUTOR)
     return ExecutorRef::generic();
   else
     return ExecutorRef::forOrdinary(reinterpret_cast<HeapObject*>(jobQueue),
                     _swift_task_getDispatchQueueSerialExecutorWitnessTable());
+#endif
 }
 
 static void jobInvoke(void *obj, void *unused, uint32_t flags) {
@@ -322,9 +320,7 @@ static void completeTaskImpl(AsyncTask *task,
 
   task->Private.complete(task);
 
-#if SWIFT_TASK_PRINTF_DEBUG
-  fprintf(stderr, "[%lu] task %p completed\n", _swift_get_thread_id(), task);
-#endif
+  SWIFT_TASK_DEBUG_LOG("task %p completed", task);
 
   // Complete the future.
   // Warning: This deallocates the task in case it's an async let task.
@@ -496,14 +492,17 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
 
     if (currentTask)
       jobFlags.setPriority(currentTask->getPriority());
-    else
-      // FIXME: Ideally, this should be setting priority based on
-      // swift_task_getCurrentThreadPriority(). However, that creates
-      // priority differences which lead to different kinds of hangs
-      // Temporarily use Unspecified to work around that.
-      // See also: PR #37939.
-      jobFlags.setPriority(JobPriority::Unspecified);
+    else if (taskCreateFlags.inheritContext())
+      jobFlags.setPriority(swift_task_getCurrentThreadPriority());
   }
+
+  // Adjust user-interactive priorities down to user-initiated.
+  if (jobFlags.getPriority() == JobPriority::UserInteractive)
+    jobFlags.setPriority(JobPriority::UserInitiated);
+
+  // If there is still no job priority, use the default priority.
+  if (jobFlags.getPriority() == JobPriority::Unspecified)
+    jobFlags.setPriority(JobPriority::Default);
 
   // Figure out the size of the header.
   size_t headerSize = sizeof(AsyncTask);
@@ -559,10 +558,8 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
   } else {
     allocation = malloc(amountToAllocate);
   }
-#if SWIFT_TASK_PRINTF_DEBUG
-  fprintf(stderr, "[%lu] allocate task %p, parent = %p, slab %u\n",
-          _swift_get_thread_id(), allocation, parent, initialSlabSize);
-#endif
+  SWIFT_TASK_DEBUG_LOG("allocate task %p, parent = %p, slab %u", allocation,
+                       parent, initialSlabSize);
 
   AsyncContext *initialContext =
     reinterpret_cast<AsyncContext*>(
@@ -599,15 +596,18 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
   // Initialize the task so that resuming it will run the given
   // function on the initial context.
   AsyncTask *task = nullptr;
+  bool captureCurrentVoucher = taskCreateFlags.copyTaskLocals() || jobFlags.task_isChildTask();
   if (asyncLet) {
     // Initialize the refcount bits to "immortal", so that
     // ARC operations don't have any effect on the task.
     task = new(allocation) AsyncTask(&taskHeapMetadata,
                              InlineRefCounts::Immortal, jobFlags,
-                             function, initialContext);
+                             function, initialContext,
+                             captureCurrentVoucher);
   } else {
     task = new(allocation) AsyncTask(&taskHeapMetadata, jobFlags,
-                                    function, initialContext);
+                                    function, initialContext,
+                                    captureCurrentVoucher);
   }
 
   // Initialize the child fragment if applicable.
@@ -637,10 +637,7 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
     futureAsyncContextPrefix->indirectResult = futureFragment->getStoragePtr();
   }
 
-#if SWIFT_TASK_PRINTF_DEBUG
-  fprintf(stderr, "[%lu] creating task %p with parent %p\n",
-          _swift_get_thread_id(), task, parent);
-#endif
+  SWIFT_TASK_DEBUG_LOG("creating task %p with parent %p", task, parent);
 
   // Initialize the task-local allocator.
   initialContext->ResumeParent = reinterpret_cast<TaskContinuationFunction *>(
@@ -852,126 +849,6 @@ void swift_task_future_wait_throwingImpl(
     return resumeFunction(callerContext, error);
   }
   }
-}
-
-namespace {
-
-#if SWIFT_CONCURRENCY_COOPERATIVE_GLOBAL_EXECUTOR
-
-class RunAndBlockSemaphore {
-  bool Finished = false;
-public:
-  void wait() {
-    donateThreadToGlobalExecutorUntil([](void *context) {
-      return *reinterpret_cast<bool*>(context);
-    }, &Finished);
-
-    assert(Finished && "ran out of tasks before we were signalled");
-  }
-
-  void signal() {
-    Finished = true;
-  }
-};
-
-#else
-
-class RunAndBlockSemaphore {
-  ConditionVariable Queue;
-  ConditionVariable::Mutex Lock;
-  bool Finished = false;
-public:
-  /// Wait for a signal.
-  void wait() {
-    Lock.withLockOrWait(Queue, [&] {
-      return Finished;
-    });
-  }
-
-  void signal() {
-    Lock.withLockThenNotifyAll(Queue, [&]{
-      Finished = true;
-    });
-  }
-};
-
-#endif
-
-using RunAndBlockSignature =
-  AsyncSignature<void(HeapObject*), /*throws*/ false>;
-struct RunAndBlockContext: AsyncContext {
-  const void *Function;
-  HeapObject *FunctionContext;
-  RunAndBlockSemaphore *Semaphore;
-};
-using RunAndBlockCalleeContext =
-  AsyncCalleeContext<RunAndBlockContext, RunAndBlockSignature>;
-
-} // end anonymous namespace
-
-/// Second half of the runAndBlock async function.
-SWIFT_CC(swiftasync)
-static void runAndBlock_finish(SWIFT_ASYNC_CONTEXT AsyncContext *_context) {
-  auto calleeContext = static_cast<RunAndBlockCalleeContext*>(_context);
-
-  auto context = popAsyncContext(calleeContext);
-
-  context->Semaphore->signal();
-
-  return context->ResumeParent(context);
-}
-
-/// First half of the runAndBlock async function.
-SWIFT_CC(swiftasync)
-static void runAndBlock_start(SWIFT_ASYNC_CONTEXT AsyncContext *_context,
-                              SWIFT_CONTEXT HeapObject *closureContext) {
-  auto callerContext = static_cast<RunAndBlockContext*>(_context);
-
-  RunAndBlockSignature::FunctionType *function;
-  size_t calleeContextSize;
-  auto functionContext = callerContext->FunctionContext;
-  assert(closureContext == functionContext);
-  std::tie(function, calleeContextSize)
-    = getAsyncClosureEntryPointAndContextSize<
-      RunAndBlockSignature,
-      SpecialPointerAuthDiscriminators::AsyncRunAndBlockFunction
-    >(const_cast<void*>(callerContext->Function), functionContext);
-
-  auto calleeContext =
-    pushAsyncContext<RunAndBlockSignature>(callerContext,
-                                           calleeContextSize,
-                                           &runAndBlock_finish,
-                                           functionContext);
-  return reinterpret_cast<AsyncVoidClosureEntryPoint *>(function)(
-      calleeContext, functionContext);
-}
-
-// TODO: Remove this hack.
-void swift::swift_task_runAndBlockThread(const void *function,
-                                         HeapObject *functionContext) {
-  RunAndBlockSemaphore semaphore;
-
-  // Set up a task that runs the runAndBlock async function above.
-  auto flags = TaskCreateFlags();
-  flags.setPriority(JobPriority::Default);
-  auto pair = swift_task_create_common(
-      flags.getOpaqueValue(),
-      /*options=*/nullptr,
-      /*futureResultType=*/nullptr,
-      reinterpret_cast<ThinNullaryAsyncSignature::FunctionType *>(
-          &runAndBlock_start),
-      nullptr,
-      sizeof(RunAndBlockContext));
-  auto context = static_cast<RunAndBlockContext*>(pair.InitialContext);
-  context->Function = function;
-  context->FunctionContext = functionContext;
-  context->Semaphore = &semaphore;
-
-  // Enqueue the task.
-  swift_task_enqueueGlobal(pair.Task);
-
-  // Wait until the task completes.
-  semaphore.wait();
 }
 
 size_t swift::swift_task_getJobFlags(AsyncTask *task) {

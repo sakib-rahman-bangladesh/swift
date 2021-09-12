@@ -27,6 +27,7 @@
 #include "swift/Runtime/HeapObject.h"
 #include "swift/Runtime/Mutex.h"
 #include "swift/Runtime/Once.h"
+#include "swift/Runtime/Portability.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/StringExtras.h"
 #include <algorithm>
@@ -1861,7 +1862,7 @@ swift::swift_getTupleTypeMetadata(MetadataRequest request,
   size_t labelsAllocSize = roundUpToAlignment(labelsLen + 1, sizeof(void*));
   char *newLabels =
     (char *) MetadataAllocator(TupleCacheTag).Allocate(labelsAllocSize, alignof(char));
-  strcpy(newLabels, labels);
+  _swift_strlcpy(newLabels, labels, labelsAllocSize);
   key.Labels = newLabels;
 
   // Update the metadata cache.
@@ -3490,13 +3491,17 @@ swift::swift_getExistentialMetatypeMetadata(const Metadata *instanceMetadata) {
 ExistentialMetatypeCacheEntry::ExistentialMetatypeCacheEntry(
                                             const Metadata *instanceMetadata) {
   ExistentialTypeFlags flags;
-  if (instanceMetadata->getKind() == MetadataKind::Existential) {
+  switch (instanceMetadata->getKind()) {
+  case MetadataKind::Existential:
     flags = static_cast<const ExistentialTypeMetadata*>(instanceMetadata)
       ->Flags;
-  } else {
-    assert(instanceMetadata->getKind() == MetadataKind::ExistentialMetatype);
+    break;
+  case MetadataKind::ExistentialMetatype:
     flags = static_cast<const ExistentialMetatypeMetadata*>(instanceMetadata)
       ->Flags;
+    break;
+  default:
+    assert(false && "expected existential metadata");
   }
 
   Data.setKind(MetadataKind::ExistentialMetatype);
@@ -6118,17 +6123,6 @@ const HeapObject *swift_getKeyPathImpl(const void *pattern,
 #define OVERRIDE_KEYPATH COMPATIBILITY_OVERRIDE
 #define OVERRIDE_WITNESSTABLE COMPATIBILITY_OVERRIDE
 #include COMPATIBILITY_OVERRIDE_INCLUDE_PATH
-
-#if defined(_WIN32) && defined(_M_ARM64)
-namespace std {
-template <>
-inline void _Atomic_storage<::PoolRange, 16>::_Unlock() const noexcept {
-  __dmb(0x8);
-  __iso_volatile_store32(&reinterpret_cast<volatile int &>(_Spinlock), 0);
-  __dmb(0x8);
-}
-}
-#endif
 
 // Autolink with libc++, for cases where libswiftCore is linked statically.
 #if defined(__MACH__)

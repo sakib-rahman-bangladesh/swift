@@ -256,8 +256,11 @@ public:
   bool hasModuleSourceInfoOutputPath() const;
   bool hasModuleInterfaceOutputPath() const;
   bool hasPrivateModuleInterfaceOutputPath() const;
+  bool hasABIDescriptorOutputPath() const;
   bool hasModuleSummaryOutputPath() const;
   bool hasTBDPath() const;
+  bool hasYAMLOptRecordPath() const;
+  bool hasBitstreamOptRecordPath() const;
 
   bool hasDependencyTrackerPath() const;
 };

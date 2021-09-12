@@ -10,11 +10,13 @@
 #
 #===----------------------------------------------------------------------===#
 
-set(LLVM_OPTIONAL_SOURCES
-  ${swift_concurrency_objc_sources})
+if(NOT swift_concurrency_extra_sources)
+  set(swift_concurrency_extra_sources)
+endif()
 
-set(swift_concurrency_link_libraries
-  swiftCore)
+if(NOT swift_concurrency_install_component)
+  set(swift_concurrency_install_component stdlib)
+endif()
 
 if(SWIFT_CONCURRENCY_USES_DISPATCH)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
@@ -77,7 +79,7 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   AsyncThrowingStream.swift
   AsyncStream.cpp
   Deque.swift
-  ${swift_concurrency_objc_sources}
+  ${swift_concurrency_extra_sources}
 
   SWIFT_MODULE_DEPENDS_LINUX Glibc
   SWIFT_MODULE_DEPENDS_FREEBSD Glibc
@@ -95,7 +97,8 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
     -parse-stdlib
     -Xfrontend -enable-experimental-concurrency
     -Xfrontend -define-availability
-    -Xfrontend \"SwiftStdlib 5.5:macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0\"
+    -Xfrontend "SwiftStdlib 5.5:macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0"
   LINK_FLAGS "${SWIFT_RUNTIME_CONCURRENCY_SWIFT_LINK_FLAGS}"
-  INSTALL_IN_COMPONENT stdlib
+  ${swift_concurrency_options}
+  INSTALL_IN_COMPONENT ${swift_concurrency_install_component}
 )

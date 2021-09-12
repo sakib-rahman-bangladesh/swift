@@ -606,6 +606,21 @@ static void extendDepthMap(
         llvm::DenseMap<Expr *, std::pair<unsigned, Expr *>> &depthMap)
         : DepthMap(depthMap) {}
 
+    // For argument lists, bump the depth of the arguments, as they are
+    // effectively nested within the argument list. It's debatable whether we
+    // should actually do this, as it doesn't reflect the true expression depth,
+    // but it's needed to preserve compatibility with the behavior from when
+    // TupleExpr and ParenExpr were used to represent argument lists.
+    std::pair<bool, ArgumentList *>
+    walkToArgumentListPre(ArgumentList *ArgList) override {
+      ++Depth;
+      return {true, ArgList};
+    }
+    ArgumentList *walkToArgumentListPost(ArgumentList *ArgList) override {
+      --Depth;
+      return ArgList;
+    }
+
     std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
       DepthMap[E] = {Depth, Parent.getAsExpr()};
       ++Depth;
@@ -842,6 +857,63 @@ Type ConstraintSystem::openType(Type type, OpenedTypeMap &replacements) {
 
       return type;
     });
+}
+
+Type ConstraintSystem::openOpaqueType(OpaqueTypeArchetypeType *opaque,
+                                      ConstraintLocatorBuilder locator) {
+  auto opaqueLocator = locator.withPathElement(
+      LocatorPathElt::OpenedOpaqueArchetype(opaque->getDecl()));
+
+  // Open the generic signature of the opaque decl, and bind the "outer" generic
+  // params to our context. The remaining axes of freedom on the type variable
+  // corresponding to the underlying type should be the constraints on the
+  // underlying return type.
+  OpenedTypeMap replacements;
+  openGeneric(DC, opaque->getBoundSignature(), opaqueLocator, replacements);
+
+  auto underlyingTyVar = openType(opaque->getInterfaceType(), replacements);
+  assert(underlyingTyVar);
+
+  for (auto param : DC->getGenericSignatureOfContext().getGenericParams()) {
+    addConstraint(ConstraintKind::Bind, openType(param, replacements),
+                  DC->mapTypeIntoContext(param), opaqueLocator);
+  }
+
+  return underlyingTyVar;
+}
+
+Type ConstraintSystem::openOpaqueType(Type type, ContextualTypePurpose context,
+                                      ConstraintLocatorBuilder locator) {
+  // Early return if `type` is `NULL` or if there are no opaque archetypes (in
+  // which case there is certainly nothing for us to do).
+  if (!type || !type->hasOpaqueArchetype())
+    return type;
+
+  auto inReturnContext = [](ContextualTypePurpose context) {
+    return context == CTP_ReturnStmt || context == CTP_ReturnSingleExpr;
+  };
+
+  if (!(context == CTP_Initialization || inReturnContext(context)))
+    return type;
+
+  auto shouldOpen = [&](OpaqueTypeArchetypeType *opaqueType) {
+    if (!inReturnContext(context))
+      return true;
+
+    if (auto *func = dyn_cast<AbstractFunctionDecl>(DC))
+      return opaqueType->getDecl()->isOpaqueReturnTypeOfFunction(func);
+
+    return true;
+  };
+
+  return type.transform([&](Type type) -> Type {
+    auto *opaqueType = type->getAs<OpaqueTypeArchetypeType>();
+
+    if (opaqueType && shouldOpen(opaqueType))
+      return openOpaqueType(opaqueType, locator);
+
+    return type;
+  });
 }
 
 FunctionType *ConstraintSystem::openFunctionType(
@@ -3235,7 +3307,9 @@ static void diagnoseOperatorAmbiguity(ConstraintSystem &cs,
           .highlight(rhs->getSourceRange());
     }
   } else {
-    auto argType = solution.simplifyType(solution.getType(applyExpr->getArg()));
+    auto *arg = applyExpr->getArgs()->getUnlabeledUnaryExpr();
+    assert(arg && "Expected a unary arg");
+    auto argType = solution.simplifyType(solution.getType(arg));
     DE.diagnose(anchor->getLoc(), diag::cannot_apply_unop_to_arg,
                 operatorName.str(), argType->getRValueType());
   }
@@ -3626,10 +3700,12 @@ static bool diagnoseAmbiguity(
       // e.g. `arr.sort(by: <)` it's better to produce generic error
       // and a note per candidate.
       if (auto *parentExpr = cs.getParentExpr(anchor)) {
-        if (isa<ApplyExpr>(parentExpr)) {
-          diagnoseOperatorAmbiguity(cs, name.getBaseIdentifier(), solutions,
-                                    commonCalleeLocator);
-          return true;
+        if (auto *apply = dyn_cast<ApplyExpr>(parentExpr)) {
+          if (apply->getFn() == anchor) {
+            diagnoseOperatorAmbiguity(cs, name.getBaseIdentifier(), solutions,
+                                      commonCalleeLocator);
+            return true;
+          }
         }
       }
 
@@ -3637,10 +3713,11 @@ static bool diagnoseAmbiguity(
                   /*isApplication=*/false, decl->getDescriptiveKind(),
                   name.isSpecial(), name.getBaseName());
     } else {
-      bool isApplication =
-          llvm::any_of(cs.ArgumentInfos, [&](const auto &argInfo) {
-            return argInfo.first->getAnchor() == commonAnchor;
+      bool isApplication = llvm::any_of(solutions, [&](const auto &S) {
+          return llvm::any_of(S.argumentLists, [&](const auto &pair) {
+            return pair.first->getAnchor() == commonAnchor;
           });
+      });
 
       DE.diagnose(getLoc(commonAnchor),
                   diag::no_overloads_match_exactly_in_call, isApplication,
@@ -3680,12 +3757,14 @@ static bool diagnoseAmbiguity(
         assert(fn);
 
         if (fn->getNumParams() == 1) {
-          auto argExpr =
-              simplifyLocatorToAnchor(solution.Fixes.front()->getLocator());
-          assert(argExpr);
+          auto *argList =
+              solution.getArgumentList(solution.Fixes.front()->getLocator());
+          assert(argList);
 
           const auto &param = fn->getParams()[0];
-          auto argType = solution.simplifyType(cs.getType(argExpr));
+          auto argType = argList->composeTupleOrParenType(
+              cs.getASTContext(),
+              [&](Expr *E) { return solution.getResolvedType(E); });
 
           DE.diagnose(noteLoc, diag::candidate_has_invalid_argument_at_position,
                       solution.simplifyType(param.getPlainType()),
@@ -3773,30 +3852,19 @@ static bool diagnoseContextualFunctionCallGenericAmbiguity(
     return false;
   }
 
-  auto typeParamResultInvolvesTypeVar = [&cs, &applyFnType, &argMatching](
-                                            unsigned argIdx,
-                                            TypeVariableType *typeVar) {
-    auto argParamMatch = argMatching->second.parameterBindings[argIdx];
+  auto *args = AE->getArgs();
+  llvm::SmallVector<ClosureExpr *, 2> closureArguments;
+  for (auto i : indices(*args)) {
+    auto *closure = getAsExpr<ClosureExpr>(args->getExpr(i));
+    if (!closure)
+      continue;
+
+    auto argParamMatch = argMatching->second.parameterBindings[i];
     auto param = applyFnType->getParams()[argParamMatch.front()];
     auto paramFnType = param.getPlainType()->castTo<FunctionType>();
-    return cs.typeVarOccursInType(typeVar, paramFnType->getResult());
-  };
 
-  llvm::SmallVector<ClosureExpr *, 2> closureArguments;
-  // A single closure argument.
-  if (auto *closure =
-          getAsExpr<ClosureExpr>(AE->getArg()->getSemanticsProvidingExpr())) {
-    if (typeParamResultInvolvesTypeVar(/*paramIdx=*/0, resultTypeVar))
+    if (cs.typeVarOccursInType(resultTypeVar, paramFnType->getResult()))
       closureArguments.push_back(closure);
-  } else if (auto *argTuple = getAsExpr<TupleExpr>(AE->getArg())) {
-    for (auto i : indices(argTuple->getElements())) {
-      auto arg = argTuple->getElements()[i];
-      auto *closure = getAsExpr<ClosureExpr>(arg);
-      if (closure &&
-          typeParamResultInvolvesTypeVar(/*paramIdx=*/i, resultTypeVar)) {
-        closureArguments.push_back(closure);
-      }
-    }
   }
 
   // If no closure result's involves the generic parameter, just bail because we
@@ -3922,8 +3990,14 @@ bool ConstraintSystem::diagnoseAmbiguityWithFixes(
 
   llvm::SmallSetVector<FixInContext, 4> fixes;
   for (auto &solution : solutions) {
-    for (auto *fix : solution.Fixes)
+    for (auto *fix : solution.Fixes) {
+      // Ignore warnings in favor of actual error fixes,
+      // because they are not the source of ambiguity/failures.
+      if (fix->isWarning())
+        continue;
+
       fixes.insert({&solution, fix});
+    }
   }
 
   llvm::MapVector<ConstraintLocator *, SmallVector<FixInContext, 4>>
@@ -4215,34 +4289,29 @@ void constraints::simplifyLocator(ASTNode &anchor,
   while (!path.empty()) {
     switch (path[0].getKind()) {
     case ConstraintLocator::ApplyArgument: {
+      auto *anchorExpr = castToExpr(anchor);
+      // If the next element is an ApplyArgToParam, we can simplify by looking
+      // into the index expression.
+      if (path.size() < 2)
+        break;
+
+      auto elt = path[1].getAs<LocatorPathElt::ApplyArgToParam>();
+      if (!elt)
+        break;
+
       // Extract application argument.
-      if (auto applyExpr = getAsExpr<ApplyExpr>(anchor)) {
-        anchor = applyExpr->getArg();
-        path = path.slice(1);
-        continue;
-      }
-
-      if (auto subscriptExpr = getAsExpr<SubscriptExpr>(anchor)) {
-        anchor = subscriptExpr->getIndex();
-        path = path.slice(1);
-
-        // TODO: It would be better if the index expression was always wrapped
-        // in a ParenExpr (if there is no label).
-        if (!(isExpr<TupleExpr>(anchor) || isExpr<ParenExpr>(anchor)) &&
-            !path.empty() && path[0].is<LocatorPathElt::ApplyArgToParam>()) {
-          path = path.slice(1);
+      if (auto *args = anchorExpr->getArgs()) {
+        if (elt->getArgIdx() < args->size()) {
+          anchor = args->getExpr(elt->getArgIdx());
+          path = path.slice(2);
+          continue;
         }
-        continue;
       }
-
-      if (auto objectLiteralExpr = getAsExpr<ObjectLiteralExpr>(anchor)) {
-        anchor = objectLiteralExpr->getArg();
-        path = path.slice(1);
-        continue;
-      }
-
       break;
     }
+
+    case ConstraintLocator::ApplyArgToParam:
+      llvm_unreachable("Cannot appear without ApplyArgument");
 
     case ConstraintLocator::DynamicCallable: {
       path = path.slice(1);
@@ -4261,6 +4330,12 @@ void constraints::simplifyLocator(ASTNode &anchor,
       // The subscript itself is the function.
       if (auto subscriptExpr = getAsExpr<SubscriptExpr>(anchor)) {
         anchor = subscriptExpr;
+        path = path.slice(1);
+        continue;
+      }
+
+      // If the anchor is an unapplied decl ref, there's nothing to extract.
+      if (isExpr<DeclRefExpr>(anchor) || isExpr<OverloadedDeclRefExpr>(anchor)) {
         path = path.slice(1);
         continue;
       }
@@ -4305,29 +4380,6 @@ void constraints::simplifyLocator(ASTNode &anchor,
       break;
     }
 
-    case ConstraintLocator::ApplyArgToParam: {
-      auto elt = path[0].castTo<LocatorPathElt::ApplyArgToParam>();
-      // Extract tuple element.
-      if (auto tupleExpr = getAsExpr<TupleExpr>(anchor)) {
-        unsigned index = elt.getArgIdx();
-        if (index < tupleExpr->getNumElements()) {
-          anchor = tupleExpr->getElement(index);
-          path = path.slice(1);
-          continue;
-        }
-      }
-
-      // Extract subexpression in parentheses.
-      if (auto parenExpr = getAsExpr<ParenExpr>(anchor)) {
-        // This simplication request could be for a synthesized argument.
-        if (elt.getArgIdx() == 0) {
-          anchor = parenExpr->getSubExpr();
-          path = path.slice(1);
-          continue;
-        }
-      }
-      break;
-    }
     case ConstraintLocator::ConstructorMember:
       if (auto typeExpr = getAsExpr<TypeExpr>(anchor)) {
         // This is really an implicit 'init' MemberRef, so point at the base,
@@ -4377,17 +4429,24 @@ void constraints::simplifyLocator(ASTNode &anchor,
 
       // If the next element is an ApplyArgument, we can simplify by looking
       // into the index expression.
-      if (path.size() < 2 ||
+      if (path.size() < 3 ||
           path[1].getKind() != ConstraintLocator::ApplyArgument)
         break;
 
+      auto applyArgElt = path[2].getAs<LocatorPathElt::ApplyArgToParam>();
+      if (!applyArgElt)
+        break;
+
+      auto argIdx = applyArgElt->getArgIdx();
       if (auto *kpe = getAsExpr<KeyPathExpr>(anchor)) {
         auto component = kpe->getComponents()[elt.getIndex()];
-        auto indexExpr = component.getIndexExpr();
-        assert(indexExpr && "Trying to apply a component without an index?");
-        anchor = indexExpr;
-        path = path.slice(2);
-        continue;
+        auto *args = component.getSubscriptArgs();
+        assert(args && "Trying to apply a component without args?");
+        if (argIdx < args->size()) {
+          anchor = args->getExpr(argIdx);
+          path = path.slice(3);
+          continue;
+        }
       }
       break;
     }
@@ -4464,25 +4523,14 @@ Expr *constraints::getArgumentExpr(ASTNode node, unsigned index) {
   if (!expr)
     return nullptr;
 
-  Expr *argExpr = nullptr;
-  if (auto *AE = dyn_cast<ApplyExpr>(expr))
-    argExpr = AE->getArg();
-  else if (auto *SE = dyn_cast<SubscriptExpr>(expr))
-    argExpr = SE->getIndex();
-  else
+  auto *argList = expr->getArgs();
+  if (!argList)
     return nullptr;
 
-  if (auto *PE = dyn_cast<ParenExpr>(argExpr)) {
-    assert(index == 0);
-    return PE->getSubExpr();
-  }
+  if (index >= argList->size())
+    return nullptr;
 
-  if (auto *tuple = dyn_cast<TupleExpr>(argExpr)) {
-    return (tuple->getNumElements() > index) ? tuple->getElement(index)
-                                             : nullptr;
-  }
-
-  return nullptr;
+  return argList->getExpr(index);
 }
 
 bool constraints::isAutoClosureArgument(Expr *argExpr) {
@@ -4615,17 +4663,37 @@ ConstraintSystem::getArgumentInfoLocator(ConstraintLocator *locator) {
   return getCalleeLocator(locator);
 }
 
-Optional<ConstraintSystem::ArgumentInfo>
-ConstraintSystem::getArgumentInfo(ConstraintLocator *locator) {
+ArgumentList *ConstraintSystem::getArgumentList(ConstraintLocator *locator) {
   if (!locator)
-    return None;
+    return nullptr;
 
   if (auto *infoLocator = getArgumentInfoLocator(locator)) {
-    auto known = ArgumentInfos.find(infoLocator);
-    if (known != ArgumentInfos.end())
+    auto known = ArgumentLists.find(infoLocator);
+    if (known != ArgumentLists.end())
       return known->second;
   }
-  return None;
+  return nullptr;
+}
+
+void ConstraintSystem::associateArgumentList(ConstraintLocator *locator,
+                                             ArgumentList *args) {
+  assert(locator && locator->getAnchor());
+  auto *argInfoLoc = getArgumentInfoLocator(locator);
+  auto inserted = ArgumentLists.insert({argInfoLoc, args}).second;
+  assert(inserted && "Multiple argument lists at locator?");
+  (void)inserted;
+}
+
+ArgumentList *Solution::getArgumentList(ConstraintLocator *locator) const {
+  if (!locator)
+    return nullptr;
+
+  if (auto *infoLocator = constraintSystem->getArgumentInfoLocator(locator)) {
+    auto known = argumentLists.find(infoLocator);
+    if (known != argumentLists.end())
+      return known->second;
+  }
+  return nullptr;
 }
 
 /// Given an apply expr, returns true if it is expected to have a direct callee
@@ -4685,24 +4753,12 @@ Type Solution::resolveInterfaceType(Type type) const {
 
 Optional<FunctionArgApplyInfo>
 Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
-  auto &cs = getConstraintSystem();
-
   // It's only valid to use `&` in argument positions, but we need
   // to figure out exactly where it was used.
   if (auto *argExpr = getAsExpr<InOutExpr>(locator->getAnchor())) {
-    auto argInfo = cs.isArgumentExpr(argExpr);
-    assert(argInfo && "Incorrect use of `inout` expression");
-
-    Expr *call;
-    unsigned argIdx;
-
-    std::tie(call, argIdx) = *argInfo;
-
-    ParameterTypeFlags flags;
-    locator = cs.getConstraintLocator(
-        call, {ConstraintLocator::ApplyArgument,
-               LocatorPathElt::ApplyArgToParam(argIdx, argIdx,
-                                               flags.withInOut(true))});
+    auto *argLoc = getConstraintSystem().getArgumentLocator(argExpr);
+    assert(argLoc && "Incorrect use of `inout` expression");
+    locator = argLoc;
   }
 
   auto anchor = locator->getAnchor();
@@ -4731,6 +4787,10 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   // If we were unable to simplify down to the argument expression, we don't
   // know what this is.
   if (!argExpr)
+    return None;
+
+  auto *argList = getArgumentList(argLocator);
+  if (!argList)
     return None;
 
   Optional<OverloadChoice> choice;
@@ -4798,7 +4858,7 @@ Solution::getFunctionArgApplyInfo(ConstraintLocator *locator) const {
   auto argIdx = applyArgElt->getArgIdx();
   auto paramIdx = applyArgElt->getParamIdx();
 
-  return FunctionArgApplyInfo(cs.getParentExpr(argExpr), argExpr, argIdx,
+  return FunctionArgApplyInfo(argList, argExpr, argIdx,
                               simplifyType(getType(argExpr)), paramIdx,
                               fnInterfaceType, fnType, callee);
 }
@@ -4870,59 +4930,44 @@ bool constraints::isStandardComparisonOperator(ASTNode node) {
   return false;
 }
 
-Optional<std::pair<Expr *, unsigned>>
-ConstraintSystem::isArgumentExpr(Expr *expr) {
-  auto *argList = getParentExpr(expr);
-  if (!argList) {
-    return None;
-  }
-
-  if (isa<ParenExpr>(argList)) {
-    for (;;) {
-      auto *parent = getParentExpr(argList);
-      if (!parent)
-        return None;
-
-      if (isa<TupleExpr>(parent)) {
-        argList = parent;
-        break;
-      }
-
-      // Drop all of the semantically insignificant parens
-      // that might be wrapping an argument e.g. `test(((42)))`
-      if (isa<ParenExpr>(parent)) {
-        argList = parent;
-        continue;
-      }
-
-      break;
-    }
-  }
-
-  if (!(isa<ParenExpr>(argList) || isa<TupleExpr>(argList)))
-    return None;
-
-  auto *application = getParentExpr(argList);
+ConstraintLocator *ConstraintSystem::getArgumentLocator(Expr *expr) {
+  auto *application = getParentExpr(expr);
   if (!application)
-    return None;
+    return nullptr;
 
-  if (!(isa<ApplyExpr>(application) || isa<SubscriptExpr>(application) ||
-        isa<ObjectLiteralExpr>(application)))
-    return None;
-
-  unsigned argIdx = 0;
-  if (auto *tuple = dyn_cast<TupleExpr>(argList)) {
-    auto arguments = tuple->getElements();
-
-    for (auto idx : indices(arguments)) {
-      if (arguments[idx]->getSemanticsProvidingExpr() == expr) {
-        argIdx = idx;
-        break;
-      }
-    }
+  // Drop all of the semantically insignificant exprs that might be wrapping an
+  // argument e.g. `test(((42)))`
+  while (application->getSemanticsProvidingExpr() == expr) {
+    application = getParentExpr(application);
+    if (!application)
+      return nullptr;
   }
 
-  return std::make_pair(application, argIdx);
+  ArgumentList *argList = application->getArgs();
+  if (!argList && !isa<KeyPathExpr>(application))
+    return nullptr;
+
+  ConstraintLocator *loc = nullptr;
+  if (auto *KP = dyn_cast<KeyPathExpr>(application)) {
+    auto idx = KP->findComponentWithSubscriptArg(expr);
+    if (!idx)
+      return nullptr;
+    loc = getConstraintLocator(KP, {LocatorPathElt::KeyPathComponent(*idx)});
+    argList = KP->getComponents()[*idx].getSubscriptArgs();
+  } else {
+    loc = getConstraintLocator(application);
+  }
+  assert(argList);
+
+  auto argIdx = argList->findArgumentExpr(expr);
+  if (!argIdx)
+    return nullptr;
+
+  ParameterTypeFlags flags;
+  flags = flags.withInOut(argList->get(*argIdx).isInOut());
+  return getConstraintLocator(
+      loc, {LocatorPathElt::ApplyArgument(),
+            LocatorPathElt::ApplyArgToParam(*argIdx, *argIdx, flags)});
 }
 
 bool constraints::isOperatorArgument(ConstraintLocator *locator,
@@ -5030,7 +5075,7 @@ ConstraintSystem::isConversionEphemeral(ConversionRestrictionKind conversion,
         // For an instance member, the base must be an @lvalue struct type.
         if (auto *lvt = simplifyType(getType(base))->getAs<LValueType>()) {
           auto *nominal = lvt->getObjectType()->getAnyNominal();
-          if (nominal && isa<StructDecl>(nominal)) {
+          if (isa_and_nonnull<StructDecl>(nominal)) {
             subExpr = base;
             continue;
           }
@@ -5171,9 +5216,9 @@ Expr *ConstraintSystem::buildTypeErasedExpr(Expr *expr, DeclContext *dc,
   auto typeEraser = attr->getResolvedType(PD);
   assert(typeEraser && "Failed to resolve eraser type!");
   auto &ctx = dc->getASTContext();
-  return CallExpr::createImplicit(ctx,
-                                  TypeExpr::createImplicit(typeEraser, ctx),
-                                  {expr}, {ctx.Id_erasing});
+  auto *argList = ArgumentList::forImplicitSingle(ctx, ctx.Id_erasing, expr);
+  return CallExpr::createImplicit(
+      ctx, TypeExpr::createImplicit(typeEraser, ctx), argList);
 }
 
 /// If an UnresolvedDotExpr, SubscriptMember, etc has been resolved by the
@@ -5230,7 +5275,14 @@ SolutionApplicationTarget::SolutionApplicationTarget(
 void SolutionApplicationTarget::maybeApplyPropertyWrapper() {
   assert(kind == Kind::expression);
   assert(expression.contextualPurpose == CTP_Initialization);
-  auto singleVar = expression.pattern->getSingleVar();
+
+  VarDecl *singleVar;
+  if (auto *pattern = expression.pattern) {
+    singleVar = pattern->getSingleVar();
+  } else {
+    singleVar = expression.propertyWrapper.wrappedVar;
+  }
+
   if (!singleVar)
     return;
 
@@ -5267,11 +5319,11 @@ void SolutionApplicationTarget::maybeApplyPropertyWrapper() {
 
     // Retrieve the outermost wrapper argument. If there isn't one, we're
     // performing default initialization.
-    auto outermostArg = outermostWrapperAttr->getArg();
-    if (!outermostArg) {
+    auto outermostArgs = outermostWrapperAttr->getArgs();
+    if (!outermostArgs) {
       SourceLoc fakeParenLoc = outermostWrapperAttr->getRange().End;
-      outermostArg = TupleExpr::createEmpty(
-          ctx, fakeParenLoc, fakeParenLoc, /*Implicit=*/true);
+      outermostArgs = ArgumentList::createImplicit(ctx, fakeParenLoc, {},
+                                                   fakeParenLoc);
       isImplicit = true;
     }
 
@@ -5281,12 +5333,8 @@ void SolutionApplicationTarget::maybeApplyPropertyWrapper() {
     }
     auto typeExpr =
         TypeExpr::createImplicitHack(typeLoc, outermostWrapperType, ctx);
-    backingInitializer = CallExpr::create(
-        ctx, typeExpr, outermostArg,
-        outermostWrapperAttr->getArgumentLabels(),
-        outermostWrapperAttr->getArgumentLabelLocs(),
-        /*hasTrailingClosure=*/false,
-        /*implicit=*/isImplicit);
+    backingInitializer = CallExpr::create(ctx, typeExpr, outermostArgs,
+                                          /*implicit*/ isImplicit);
   }
   wrapperAttrs[0]->setSemanticInit(backingInitializer);
 
@@ -5356,12 +5404,30 @@ SolutionApplicationTarget SolutionApplicationTarget::forForEachStmt(
 }
 
 SolutionApplicationTarget
-SolutionApplicationTarget::forUninitializedWrappedVar(VarDecl *wrappedVar) {
-  return SolutionApplicationTarget(wrappedVar);
+SolutionApplicationTarget::forPropertyWrapperInitializer(
+    VarDecl *wrappedVar, DeclContext *dc, Expr *initializer) {
+  SolutionApplicationTarget target(
+      initializer, dc, CTP_Initialization, wrappedVar->getType(),
+      /*isDiscarded=*/false);
+  target.expression.propertyWrapper.wrappedVar = wrappedVar;
+  if (auto *patternBinding = wrappedVar->getParentPatternBinding()) {
+    auto index = patternBinding->getPatternEntryIndexForVarDecl(wrappedVar);
+    target.expression.initialization.patternBinding = patternBinding;
+    target.expression.initialization.patternBindingIndex = index;
+    target.expression.pattern = patternBinding->getPattern(index);
+  }
+  target.maybeApplyPropertyWrapper();
+  return target;
 }
 
 ContextualPattern
 SolutionApplicationTarget::getContextualPattern() const {
+  if (kind == Kind::uninitializedVar) {
+    assert(patternBinding);
+    return ContextualPattern::forPatternBindingDecl(patternBinding,
+                                                    uninitializedVar.index);
+  }
+
   assert(kind == Kind::expression);
   assert(expression.contextualPurpose == CTP_Initialization ||
          expression.contextualPurpose == CTP_ForEachStmt);
@@ -5379,23 +5445,11 @@ bool SolutionApplicationTarget::infersOpaqueReturnType() const {
   assert(kind == Kind::expression);
   switch (expression.contextualPurpose) {
   case CTP_Initialization:
-    if (Type convertType = expression.convertType.getType()) {
-      return convertType->is<OpaqueTypeArchetypeType>();
-    }
-    return false;
-
   case CTP_ReturnStmt:
   case CTP_ReturnSingleExpr:
-    if (Type convertType = expression.convertType.getType()) {
-      if (auto opaqueType = convertType->getAs<OpaqueTypeArchetypeType>()) {
-        auto dc = getDeclContext();
-        if (auto func = dyn_cast<AbstractFunctionDecl>(dc)) {
-          return opaqueType->getDecl()->isOpaqueReturnTypeOfFunction(func);
-        }
-      }
-    }
+    if (Type convertType = expression.convertType.getType())
+      return convertType->hasOpaqueArchetype();
     return false;
-
   default:
     return false;
   }
@@ -5446,6 +5500,14 @@ void ConstraintSystem::diagnoseFailureFor(SolutionApplicationTarget target) {
   SWIFT_DEFER { setPhase(ConstraintSystemPhase::Finalization); };
 
   auto &DE = getASTContext().Diags;
+
+  // If constraint system is in invalid state always produce
+  // a fallback diagnostic that asks to file a bug.
+  if (inInvalidState()) {
+    DE.diagnose(target.getLoc(), diag::failed_to_produce_diagnostic);
+    return;
+  }
+
   if (auto expr = target.getAsExpr()) {
     if (auto *assignment = dyn_cast<AssignExpr>(expr)) {
       if (isa<DiscardAssignmentExpr>(assignment->getDest()))
@@ -5481,6 +5543,8 @@ void ConstraintSystem::diagnoseFailureFor(SolutionApplicationTarget target) {
       nominal->diagnose(diag::property_wrapper_declared_here,
                         nominal->getName());
     }
+  } else if (auto *var = target.getAsUninitializedVar()) {
+    DE.diagnose(target.getLoc(), diag::failed_to_produce_diagnostic);
   } else {
     // Emit a poor fallback message.
     DE.diagnose(target.getAsFunction()->getLoc(),
@@ -5801,7 +5865,6 @@ bool TypeVarBindingProducer::requiresOptionalAdjustment(
     if (auto *nominalBindingDecl = type->getAnyNominal()) {
       SmallVector<ProtocolConformance *, 2> conformances;
       conformsToExprByNilLiteral = nominalBindingDecl->lookupConformance(
-          CS.DC->getParentModule(),
           CS.getASTContext().getProtocol(
               KnownProtocolKind::ExpressibleByNilLiteral),
           conformances);

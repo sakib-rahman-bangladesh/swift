@@ -120,7 +120,6 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.SerializeDependencyScannerCache |= Args.hasArg(OPT_serialize_dependency_scan_cache);
   Opts.ReuseDependencyScannerCache |= Args.hasArg(OPT_reuse_dependency_scan_cache);
   Opts.EmitDependencyScannerCacheRemarks |= Args.hasArg(OPT_dependency_scan_cache_remarks);
-  Opts.TestDependencyScannerCacheSerialization |= Args.hasArg(OPT_debug_test_dependency_scan_cache_serialization);
   if (const Arg *A = Args.getLastArg(OPT_dependency_scan_cache_path)) {
     Opts.SerializedDependencyScannerCachePath = A->getValue();
   }
@@ -609,6 +608,11 @@ bool ArgsToFrontendOptionsConverter::checkUnusedSupplementaryOutputPaths()
   if (!FrontendOptions::canActionEmitModuleDoc(Opts.RequestedAction) &&
       Opts.InputsAndOutputs.hasModuleDocOutputPath()) {
     Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_module_doc);
+    return true;
+  }
+  if (!FrontendOptions::canActionEmitABIDescriptor(Opts.RequestedAction) &&
+      Opts.InputsAndOutputs.hasABIDescriptorOutputPath()) {
+    Diags.diagnose(SourceLoc(), diag::error_mode_cannot_emit_abi_descriptor);
     return true;
   }
   // If we cannot emit module doc, we cannot emit source information file either.

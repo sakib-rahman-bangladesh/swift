@@ -16,6 +16,7 @@
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/ProtocolAssociations.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Platform.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/ABI/MetadataValues.h"
@@ -36,7 +37,7 @@ const char *getManglingForWitness(swift::Demangle::ValueWitnessKind kind) {
 
 std::string IRGenMangler::mangleValueWitness(Type type, ValueWitness witness) {
   beginMangling();
-  appendType(type);
+  appendType(type, nullptr);
 
   const char *Code = nullptr;
   switch (witness) {
@@ -98,7 +99,8 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
       // manglings already, and the runtime ought to have a lookup table for
       // them. Symbolic referencing would be wasteful.
       if (type->getModuleContext()->hasStandardSubstitutions()
-          && Mangle::getStandardTypeSubst(type->getName().str())) {
+          && Mangle::getStandardTypeSubst(
+               type->getName().str(), AllowConcurrencyStandardSubstitutions)) {
         return false;
       }
       
@@ -146,9 +148,19 @@ SymbolicMangling
 IRGenMangler::mangleTypeForReflection(IRGenModule &IGM,
                                       CanGenericSignature Sig,
                                       CanType Ty) {
+  // If our target predates Swift 5.5, we cannot apply the standard
+  // substitutions for types defined in the Concurrency module.
+  ASTContext &ctx = Ty->getASTContext();
+  llvm::SaveAndRestore<bool> savedConcurrencyStandardSubstitutions(
+      AllowConcurrencyStandardSubstitutions);
+  if (auto runtimeCompatVersion = getSwiftRuntimeCompatibilityVersionForTarget(
+          ctx.LangOpts.Target)) {
+    if (*runtimeCompatVersion < llvm::VersionTuple(5, 5))
+      AllowConcurrencyStandardSubstitutions = false;
+  }
+
   return withSymbolicReferences(IGM, [&]{
-    bindGenericParameters(Sig);
-    appendType(Ty);
+    appendType(Ty, Sig);
   });
 }
 
@@ -191,7 +203,7 @@ std::string IRGenMangler::mangleTypeForLLVMTypeName(CanType Ty) {
     appendProtocolName(P->getDecl(), /*allowStandardSubstitution=*/false);
     appendOperator("P");
   } else {
-    appendType(Ty);
+    appendType(Ty, nullptr);
   }
   return finalize();
 }
@@ -224,7 +236,7 @@ mangleProtocolForLLVMTypeName(ProtocolCompositionType *type) {
           ->getDeclaredType();
       }
 
-      appendType(CanType(superclass));
+      appendType(CanType(superclass), nullptr);
       appendOperator("Xc");
     } else if (layout.getLayoutConstraint()) {
       appendOperator("Xl");
@@ -288,10 +300,6 @@ std::string IRGenMangler::mangleSymbolNameForAssociatedConformanceWitness(
     Buffer << "default associated conformance";
   }
 
-  // appendProtocolConformance() sets CurGenericSignature; clear it out
-  // before calling appendAssociatedTypePath().
-  CurGenericSignature = nullptr;
-
   bool isFirstAssociatedTypeIdentifier = true;
   appendAssociatedTypePath(associatedType, isFirstAssociatedTypeIdentifier);
   appendProtocolName(proto);
@@ -309,7 +317,7 @@ std::string IRGenMangler::mangleSymbolNameForMangledMetadataAccessorString(
     appendGenericSignature(genericSig);
 
   if (type)
-    appendType(type);
+    appendType(type, genericSig);
   return finalize();
 }
 

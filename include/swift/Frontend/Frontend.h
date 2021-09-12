@@ -354,9 +354,6 @@ public:
   /// imported.
   bool shouldImportSwiftConcurrency() const;
 
-  /// Whether the Distributed support library should be implicitly imported.
-  bool shouldImportSwiftDistributed() const;
-
   /// Performs input setup common to these tools:
   /// sil-opt, sil-func-extractor, sil-llvm-gen, and sil-nm.
   /// Return value includes the buffer so caller can keep it alive.
@@ -390,8 +387,6 @@ public:
   /// fail an assert if not in that mode.
   std::string getModuleInterfaceOutputPathForWholeModule() const;
   std::string getPrivateModuleInterfaceOutputPathForWholeModule() const;
-
-  std::string getLdAddCFileOutputPathForWholeModule() const;
 
 public:
   /// Given the current configuration of this frontend invocation, a set of

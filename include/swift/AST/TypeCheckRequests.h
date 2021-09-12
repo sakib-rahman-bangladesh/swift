@@ -287,32 +287,6 @@ public:
   void cacheResult(bool value) const;
 };
 
-/// Determine whether we are allowed to refer to an existential type conforming
-/// to this protocol.
-class ExistentialTypeSupportedRequest :
-    public SimpleRequest<ExistentialTypeSupportedRequest,
-                         bool(ProtocolDecl *),
-                         RequestFlags::SeparatelyCached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, ProtocolDecl *decl) const;
-
-public:
-  // Cycle handling.
-  void diagnoseCycle(DiagnosticEngine &diags) const;
-  void noteCycleStep(DiagnosticEngine &diags) const;
-
-  // Separate caching.
-  bool isCached() const { return true; }
-  Optional<bool> getCachedResult() const;
-  void cacheResult(bool value) const;
-};
-
 class PolymorphicEffectRequirementsRequest :
     public SimpleRequest<PolymorphicEffectRequirementsRequest,
                          PolymorphicEffectRequirementList(EffectKind, ProtocolDecl *),
@@ -933,18 +907,18 @@ public:
     bool isCached() const { return true; }
 };
 
-/// Determine whether the given func is distributed.
-class IsDistributedFuncRequest :
-    public SimpleRequest<IsDistributedFuncRequest,
-        bool(FuncDecl *),
-        RequestFlags::Cached> {
+/// Obtain the 'remote' counterpart of a 'distributed func'.
+class GetDistributedRemoteFuncRequest :
+    public SimpleRequest<GetDistributedRemoteFuncRequest,
+                         AbstractFunctionDecl *(AbstractFunctionDecl *),
+                         RequestFlags::Cached> {
 public:
-    using SimpleRequest::SimpleRequest;
+  using SimpleRequest::SimpleRequest;
 
 private:
-    friend SimpleRequest;
+  friend SimpleRequest;
 
-    bool evaluate(Evaluator &evaluator, FuncDecl *func) const;
+  AbstractFunctionDecl *evaluate(Evaluator &evaluator, AbstractFunctionDecl *func) const;
 
 public:
     // Caching
@@ -1517,6 +1491,8 @@ public:
   bool isCached() const { return true; }
   Optional<GenericSignature> getCachedResult() const;
   void cacheResult(GenericSignature value) const;
+
+  void diagnoseCycle(DiagnosticEngine &diags) const;
 };
 
 /// Compute the underlying interface type of a typealias.
@@ -1955,24 +1931,6 @@ public:
   bool isCached() const { return true; }
 };
 
-/// Checks whether this type has a distributed actor "local" initializer.
-class HasDistributedActorLocalInitRequest
-    : public SimpleRequest<HasDistributedActorLocalInitRequest, bool(NominalTypeDecl *),
-                           RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, NominalTypeDecl *decl) const;
-
-public:
-  // Caching.
-  bool isCached() const { return true; }
-};
-
 /// Synthesizes a default initializer for a given type.
 class SynthesizeDefaultInitRequest
     : public SimpleRequest<SynthesizeDefaultInitRequest,
@@ -2065,6 +2023,7 @@ enum class ImplicitMemberAction : uint8_t {
   ResolveDecodable,
   ResolveDistributedActor,
   ResolveDistributedActorIdentity,
+  ResolveDistributedActorTransport,
 };
 
 class ResolveImplicitMemberRequest
@@ -2245,6 +2204,24 @@ public:
   void diagnoseCycle(DiagnosticEngine &diags) const;
   void noteCycleStep(DiagnosticEngine &diags) const;
 
+  // Cached.
+  bool isCached() const { return true; }
+};
+
+/// Checks if the _Distributed module is available.
+class DistributedModuleIsAvailableRequest
+    : public SimpleRequest<DistributedModuleIsAvailableRequest, bool(Decl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  bool evaluate(Evaluator &evaluator, Decl *decl) const;
+
+public:
   // Cached.
   bool isCached() const { return true; }
 };
@@ -2981,23 +2958,6 @@ private:
   // Evaluation.
   llvm::ArrayRef<Requirement> evaluate(Evaluator &evaluator,
                                        NormalProtocolConformance *decl) const;
-
-public:
-  bool isCached() const { return true; }
-};
-
-class AsyncAlternativeRequest
-    : public SimpleRequest<AsyncAlternativeRequest,
-                           AbstractFunctionDecl *(AbstractFunctionDecl *),
-                           RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  AbstractFunctionDecl *evaluate(
-      Evaluator &evaluator, AbstractFunctionDecl *attachedFunctionDecl) const;
 
 public:
   bool isCached() const { return true; }

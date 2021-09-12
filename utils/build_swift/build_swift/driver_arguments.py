@@ -596,6 +596,13 @@ def create_argument_parser():
     option(['-b', '--llbuild'], toggle_true('build_llbuild'),
            help='build llbuild')
 
+    option(['--back-deploy-concurrency'], toggle_true('build_backdeployconcurrency'),
+           help='build back-deployment support for concurrency')
+
+    option(['--install-back-deploy-concurrency'],
+           toggle_true('install_backdeployconcurrency'),
+           help='install back-deployment support libraries for concurrency')
+
     option(['--libcxx'], toggle_true('build_libcxx'),
            help='build libcxx')
 
@@ -690,6 +697,9 @@ def create_argument_parser():
 
     option(['-c', '--clean'], store_true,
            help='do a clean build')
+
+    option(['--clean-install-destdir'], store_true,
+           help='Clean the install destroot before building.')
 
     option('--export-compile-commands', toggle_true,
            help='generate compilation databases in addition to building')
@@ -1059,6 +1069,12 @@ def create_argument_parser():
            toggle_false('test_android_host'),
            help='skip testing Android device targets on the host machine (the '
                 'phone itself)')
+    option('--skip-clean-libdispatch', toggle_false('clean_libdispatch'),
+           help='skip cleaning up libdispatch')
+    option('--skip-clean-foundation', toggle_false('clean_foundation'),
+           help='skip cleaning up foundation')
+    option('--skip-clean-xctest', toggle_false('clean_xctest'),
+           help='skip cleaning up xctest')
     option('--skip-clean-llbuild', toggle_false('clean_llbuild'),
            help='skip cleaning up llbuild')
     option('--clean-early-swift-driver', toggle_true('clean_early_swift_driver'),

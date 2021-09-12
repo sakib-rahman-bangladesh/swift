@@ -812,6 +812,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(options_block, RESILIENCE_STRATEGY);
   BLOCK_RECORD(options_block, IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED);
   BLOCK_RECORD(options_block, MODULE_ABI_NAME);
+  BLOCK_RECORD(options_block, IS_CONCURRENCY_CHECKED);
 
   BLOCK(INPUT_BLOCK);
   BLOCK_RECORD(input_block, IMPORTED_MODULE);
@@ -869,6 +870,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(sil_block, SIL_ONE_OPERAND);
   BLOCK_RECORD(sil_block, SIL_ONE_TYPE_ONE_OPERAND);
   BLOCK_RECORD(sil_block, SIL_ONE_TYPE_VALUES);
+  BLOCK_RECORD(sil_block, SIL_ONE_TYPE_OWNERSHIP_VALUES);
   BLOCK_RECORD(sil_block, SIL_TWO_OPERANDS);
   BLOCK_RECORD(sil_block, SIL_TAIL_ADDR);
   BLOCK_RECORD(sil_block, SIL_INST_APPLY);
@@ -1024,6 +1026,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
       if (M->getABIName() != M->getName()) {
         options_block::ModuleABINameLayout ABIName(Out);
         ABIName.emit(ScratchRecord, M->getABIName().str());
+      }
+
+      if (M->isConcurrencyChecked()) {
+        options_block::IsConcurrencyCheckedLayout IsConcurrencyChecked(Out);
+        IsConcurrencyChecked.emit(ScratchRecord);
       }
 
       if (options.SerializeOptionsForDebugging) {
@@ -1346,6 +1353,19 @@ void Serializer::writeGenericRequirements(ArrayRef<Requirement> requirements,
   }
 }
 
+void Serializer::writeAssociatedTypes(ArrayRef<AssociatedTypeDecl *> assocTypes,
+                                      const std::array<unsigned, 256> &abbrCodes) {
+  using namespace decls_block;
+
+  auto assocTypeAbbrCode = abbrCodes[AssociatedTypeLayout::Code];
+
+  for (auto *assocType : assocTypes) {
+    AssociatedTypeLayout::emitRecord(
+        Out, ScratchRecord, assocTypeAbbrCode,
+        addDeclRef(assocType));
+  }
+}
+
 void Serializer::writeASTBlockEntity(GenericSignature sig) {
   using namespace decls_block;
 
@@ -1470,9 +1490,6 @@ void Serializer::writeASTBlockEntity(
       ++numValueWitnesses;
       data.push_back(addDeclRef(req));
       data.push_back(addDeclRef(witness.getDecl()));
-      assert(witness.getDecl() || req->getAttrs().hasAttribute<OptionalAttr>()
-             || req->getAttrs().isUnavailable(req->getASTContext())
-             || allowCompilerErrors());
 
       // If there is no witness, we're done.
       if (!witness.getDecl()) return;
@@ -1612,7 +1629,8 @@ Serializer::writeConformance(ProtocolConformanceRef conformanceRef,
     auto protocolID = addDeclRef(builtin->getProtocol());
     auto genericSigID = addGenericSignatureRef(builtin->getGenericSignature());
     BuiltinProtocolConformanceLayout::emitRecord(
-        Out, ScratchRecord, abbrCode, typeID, protocolID, genericSigID);
+        Out, ScratchRecord, abbrCode, typeID, protocolID, genericSigID,
+        static_cast<unsigned>(builtin->getBuiltinConformanceKind()));
     writeGenericRequirements(builtin->getConditionalRequirements(), abbrCodes);
     break;
   }
@@ -2070,8 +2088,10 @@ void Serializer::writePatternBindingInitializer(PatternBindingDecl *binding,
   StringRef initStr;
   SmallString<128> scratch;
   auto varDecl = binding->getAnchoringVarDecl(bindingIndex);
+  assert((varDecl || allowCompilerErrors()) &&
+         "Serializing PDB without anchoring VarDecl");
   if (binding->hasInitStringRepresentation(bindingIndex) &&
-      varDecl->isInitExposedToClients()) {
+      varDecl && varDecl->isInitExposedToClients()) {
     initStr = binding->getInitStringRepresentation(bindingIndex, scratch);
   }
 
@@ -2466,6 +2486,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       ENCODE_VER_TUPLE(Deprecated, theAttr->Deprecated)
       ENCODE_VER_TUPLE(Obsoleted, theAttr->Obsoleted)
 
+      auto renameDeclID = S.addDeclRef(theAttr->RenameDecl);
       llvm::SmallString<32> blob;
       blob.append(theAttr->Message);
       blob.append(theAttr->Rename);
@@ -2480,6 +2501,7 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
           LIST_VER_TUPLE_PIECES(Deprecated),
           LIST_VER_TUPLE_PIECES(Obsoleted),
           static_cast<unsigned>(theAttr->Platform),
+          renameDeclID,
           theAttr->Message.size(),
           theAttr->Rename.size(),
           blob);
@@ -2656,21 +2678,6 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       TransposeDeclAttrLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode, attr->isImplicit(), origNameId,
           origDeclID, paramIndicesVector);
-      return;
-    }
-
-    case DAK_CompletionHandlerAsync: {
-      auto *attr = cast<CompletionHandlerAsyncAttr>(DA);
-      auto abbrCode =
-          S.DeclTypeAbbrCodes[CompletionHandlerAsyncDeclAttrLayout::Code];
-
-      assert(attr->AsyncFunctionDecl &&
-             "Serializing unresolved completion handler async function decl");
-      auto asyncFuncDeclID = S.addDeclRef(attr->AsyncFunctionDecl);
-
-      CompletionHandlerAsyncDeclAttrLayout::emitRecord(
-          S.Out, S.ScratchRecord, abbrCode, attr->isImplicit(),
-          attr->CompletionHandlerIndex, asyncFuncDeclID);
       return;
     }
     }
@@ -3237,29 +3244,21 @@ public:
     auto contextID = S.addDeclContextRef(op->getDeclContext());
     auto nameID = S.addDeclBaseNameRef(op->getName());
     auto groupID = S.addDeclRef(op->getPrecedenceGroup());
-    SmallVector<DeclID, 1> designatedNominalTypeDeclIDs;
-    for (auto *decl : op->getDesignatedNominalTypes())
-      designatedNominalTypeDeclIDs.push_back(S.addDeclRef(decl));
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[InfixOperatorLayout::Code];
     InfixOperatorLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode, nameID,
-                                    contextID.getOpaqueValue(), groupID,
-                                    designatedNominalTypeDeclIDs);
+                                    contextID.getOpaqueValue(), groupID);
 
   }
 
   template <typename Layout>
   void visitUnaryOperatorDecl(const OperatorDecl *op) {
     auto contextID = S.addDeclContextRef(op->getDeclContext());
-    SmallVector<DeclID, 1> designatedNominalTypeDeclIDs;
-    for (auto *decl : op->getDesignatedNominalTypes())
-      designatedNominalTypeDeclIDs.push_back(S.addDeclRef(decl));
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[Layout::Code];
     Layout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
                        S.addDeclBaseNameRef(op->getName()),
-                       contextID.getOpaqueValue(),
-                       designatedNominalTypeDeclIDs);
+                       contextID.getOpaqueValue());
   }
 
   void visitPrefixOperatorDecl(const PrefixOperatorDecl *op) {
@@ -3516,7 +3515,9 @@ public:
     for (auto element : proto->getInherited()) {
       auto elementType = element.getType();
       assert(!elementType || !elementType->hasArchetype());
-      if (elementType && elementType->is<ProtocolType>())
+      if (elementType &&
+          (elementType->is<ProtocolType>() ||
+           elementType->is<ProtocolCompositionType>()))
         dependencyTypes.insert(elementType);
     }
 
@@ -3542,13 +3543,14 @@ public:
                                const_cast<ProtocolDecl *>(proto)
                                  ->requiresClass(),
                                proto->isObjC(),
-                               proto->existentialTypeSupported(),
                                rawAccessLevel, numInherited,
                                inheritedAndDependencyTypes);
 
     writeGenericParams(proto->getGenericParams());
     S.writeGenericRequirements(
       proto->getRequirementSignature(), S.DeclTypeAbbrCodes);
+    S.writeAssociatedTypes(
+      proto->getAssociatedTypeMembers(), S.DeclTypeAbbrCodes);
     writeMembers(id, proto->getAllMembers(), true);
     writeDefaultWitnessTable(proto);
   }
@@ -3962,9 +3964,6 @@ public:
     using namespace decls_block;
     verifyAttrSerializable(dtor);
 
-    if (S.allowCompilerErrors() && dtor->isInvalid())
-      return;
-
     auto contextID = S.addDeclContextRef(dtor->getDeclContext());
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[DestructorLayout::Code];
@@ -4006,11 +4005,33 @@ public:
   }
 };
 
+/// When allowing modules with errors there may be cases where there's little
+/// point in serializing a declaration and doing so would create a maintenance
+/// burden on the deserialization side. Returns \c true if the given declaration
+/// should be skipped and \c false otherwise.
+static bool canSkipWhenInvalid(const Decl *D) {
+  // There's no point writing out the deinit when its context is not a class
+  // as nothing would be able to reference it
+  if (auto *deinit = dyn_cast<DestructorDecl>(D)) {
+    if (!isa<ClassDecl>(D->getDeclContext()))
+      return true;
+  }
+  return false;
+}
+
 void Serializer::writeASTBlockEntity(const Decl *D) {
   using namespace decls_block;
 
   PrettyStackTraceDecl trace("serializing", D);
   assert(DeclsToSerialize.hasRef(D));
+
+  if (D->isInvalid()) {
+    assert(allowCompilerErrors() &&
+           "cannot create a module with an invalid decl");
+
+    if (canSkipWhenInvalid(D))
+      return;
+  }
 
   BitOffset initialOffset = Out.GetCurrentBitNo();
   SWIFT_DEFER {
@@ -4021,8 +4042,6 @@ void Serializer::writeASTBlockEntity(const Decl *D) {
     }
   };
 
-  assert((allowCompilerErrors() || !D->isInvalid()) &&
-         "cannot create a module with an invalid decl");
   if (isDeclXRef(D)) {
     writeCrossReference(D);
     return;
@@ -4549,6 +4568,11 @@ public:
                                      S.addTypeRef(dictTy->getValueType()));
   }
 
+  void visitVariadicSequenceType(const VariadicSequenceType *seqTy) {
+    using namespace decls_block;
+    serializeSimpleWrapper<VariadicSequenceTypeLayout>(seqTy->getBaseType());
+  }
+
   void visitOptionalType(const OptionalType *optionalTy) {
     using namespace decls_block;
     serializeSimpleWrapper<OptionalTypeLayout>(optionalTy->getBaseType());
@@ -4752,6 +4776,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<SILFunctionTypeLayout>();
   registerDeclTypeAbbr<ArraySliceTypeLayout>();
   registerDeclTypeAbbr<DictionaryTypeLayout>();
+  registerDeclTypeAbbr<VariadicSequenceTypeLayout>();
   registerDeclTypeAbbr<ReferenceStorageTypeLayout>();
   registerDeclTypeAbbr<UnboundGenericTypeLayout>();
   registerDeclTypeAbbr<OptionalTypeLayout>();
@@ -4774,6 +4799,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<OpaqueTypeLayout>();
   registerDeclTypeAbbr<PatternBindingLayout>();
   registerDeclTypeAbbr<ProtocolLayout>();
+  registerDeclTypeAbbr<AssociatedTypeLayout>();
   registerDeclTypeAbbr<DefaultWitnessTableLayout>();
   registerDeclTypeAbbr<PrefixOperatorLayout>();
   registerDeclTypeAbbr<PostfixOperatorLayout>();

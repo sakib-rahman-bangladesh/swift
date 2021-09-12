@@ -107,8 +107,17 @@ static StringRef getTagForParameter(PrintStructureKind context) {
     return "syntaxtype.number";
   case PrintStructureKind::StringLiteral:
     return "syntaxtype.string";
+  case PrintStructureKind::DefaultArgumentClause:
+  case PrintStructureKind::DeclGenericParameterClause:
+  case PrintStructureKind::DeclGenericRequirementClause:
+  case PrintStructureKind::EffectsSpecifiers:
+  case PrintStructureKind::DeclResultTypeClause:
+  case PrintStructureKind::FunctionParameterList:
+  case PrintStructureKind::FunctionParameterType:
+    // These kinds are ignored by 'isIgnoredPrintStructureKind()'
+    llvm_unreachable("ignored structure kind");
   }
-  llvm_unreachable("unexpected parameter kind");
+  llvm_unreachable("unexpected structure kind");
 }
 
 static StringRef getDeclNameTagForDecl(const Decl *D) {
@@ -233,7 +242,24 @@ private:
       closeTag(tag);
   }
 
+  bool isIgnoredPrintStructureKind(PrintStructureKind kind) {
+    switch (kind) {
+    case PrintStructureKind::DefaultArgumentClause:
+    case PrintStructureKind::DeclGenericParameterClause:
+    case PrintStructureKind::DeclGenericRequirementClause:
+    case PrintStructureKind::EffectsSpecifiers:
+    case PrintStructureKind::DeclResultTypeClause:
+    case PrintStructureKind::FunctionParameterList:
+    case PrintStructureKind::FunctionParameterType:
+      return true;
+    default:
+      return false;
+    }
+  }
+
   void printStructurePre(PrintStructureKind kind, const Decl *D) override {
+    if (isIgnoredPrintStructureKind(kind))
+      return;
     if (kind == PrintStructureKind::TupleElement ||
         kind == PrintStructureKind::TupleType)
       fixupTuple(kind);
@@ -251,6 +277,8 @@ private:
     }
   }
   void printStructurePost(PrintStructureKind kind, const Decl *D) override {
+    if (isIgnoredPrintStructureKind(kind))
+      return;
     if (kind == PrintStructureKind::TupleElement ||
         kind == PrintStructureKind::TupleType) {
       auto prev = contextStack.pop_back_val();
@@ -352,6 +380,7 @@ private:
         return ExternalParamNameTag;
       return "tuple.element.argument_label";
     case PrintNameContext::Keyword:
+    case PrintNameContext::IntroducerKeyword:
       return SyntaxKeywordTag;
     case PrintNameContext::GenericParameter:
       return GenericParamNameTag;
@@ -1058,6 +1087,8 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
       // differentiate them.
       PrintOptions PO;
       PO.SkipAttributes = true;
+      PO.PrintStaticKeyword = false;
+      PO.PrintSelfAccessKindKeyword = false;
       PO.SkipIntroducerKeywords = true;
       PO.ArgAndParamPrinting =
           PrintOptions::ArgAndParamPrintingMode::ArgumentOnly;
@@ -1448,24 +1479,24 @@ static void resolveCursor(
         Range.Line = Pair.first;
         Range.Column = Pair.second;
         Range.Length = Length;
-        bool RangeStartMayNeedRename = false;
+        bool CollectRangeStartRefactorings = false;
         collectAvailableRefactorings(&AstUnit->getPrimarySourceFile(), Range,
-                                     RangeStartMayNeedRename, Kinds, {});
+                                     CollectRangeStartRefactorings, Kinds, {});
         for (RefactoringKind Kind : Kinds) {
           Actions.emplace_back(SwiftLangSupport::getUIDForRefactoringKind(Kind),
                                getDescriptiveRefactoringKindName(Kind),
                                /*UnavailableReason*/ StringRef());
         }
-        if (!RangeStartMayNeedRename) {
-          // If Length is given, then the cursor-info request should only about
-          // collecting available refactorings for the range.
+        if (!CollectRangeStartRefactorings) {
+          // If Length is given then this request is only for refactorings,
+          // return straight away unless we need cursor based refactorings as
+          // well.
           CursorInfoData Data;
           Data.AvailableActions = llvm::makeArrayRef(Actions);
           Receiver(RequestResult<CursorInfoData>::fromResult(Data));
           return;
         }
-        // If the range start may need rename, we fall back to a regular cursor
-        // info request to get the available rename kinds.
+        // Fall through to collect cursor based refactorings
       }
 
       auto *File = &AstUnit->getPrimarySourceFile();
@@ -1474,12 +1505,6 @@ static void resolveCursor(
                           CursorInfoRequest{CursorInfoOwner(File, Loc)},
                           ResolvedCursorInfo());
 
-      if (CursorInfo.isInvalid()) {
-        CursorInfoData Info;
-        Info.InternalDiagnostic = "Unable to resolve cursor info.";
-        Receiver(RequestResult<CursorInfoData>::fromResult(Info));
-        return;
-      }
       CompilerInvocation CompInvok;
       ASTInvok->applyTo(CompInvok);
 
@@ -1526,9 +1551,15 @@ static void resolveCursor(
         Receiver(RequestResult<CursorInfoData>::fromResult(Info));
         return;
       }
-      case CursorInfoKind::Invalid: {
-        llvm_unreachable("bad sema token kind");
-      }
+      case CursorInfoKind::Invalid:
+        CursorInfoData Data;
+        if (Actionables) {
+          Data.AvailableActions = llvm::makeArrayRef(Actions);
+        } else {
+          Data.InternalDiagnostic = "Unable to resolve cursor info.";
+        }
+        Receiver(RequestResult<CursorInfoData>::fromResult(Data));
+        return;
       }
     }
 

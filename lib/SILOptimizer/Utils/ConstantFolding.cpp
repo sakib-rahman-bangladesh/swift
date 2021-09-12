@@ -205,17 +205,17 @@ constantFoldBinaryWithOverflow(BuiltinInst *BI, llvm::Intrinsic::ID ID,
     const ApplyExpr *CE = Loc.getAsASTNode<ApplyExpr>();
     SourceRange LHSRange, RHSRange;
     if (CE) {
-      const auto *Args = dyn_cast_or_null<TupleExpr>(CE->getArg());
-      if (Args && Args->getNumElements() == 2) {
+      const auto *Args = CE->getArgs();
+      if (Args->size() == 2) {
         // Look through inout types in order to handle += well.
-        CanType LHSTy = Args->getElement(0)->getType()->getInOutObjectType()->
+        CanType LHSTy = Args->getExpr(0)->getType()->getInOutObjectType()->
                          getCanonicalType();
-        CanType RHSTy = Args->getElement(1)->getType()->getCanonicalType();
+        CanType RHSTy = Args->getExpr(1)->getType()->getCanonicalType();
         if (LHSTy == RHSTy)
-          OpType = Args->getElement(1)->getType();
+          OpType = Args->getExpr(1)->getType();
 
-        LHSRange = Args->getElement(0)->getSourceRange();
-        RHSRange = Args->getElement(1)->getSourceRange();
+        LHSRange = Args->getExpr(0)->getSourceRange();
+        RHSRange = Args->getExpr(1)->getSourceRange();
       }
     }
 
@@ -779,13 +779,8 @@ constantFoldAndCheckIntegerConversions(BuiltinInst *BI,
     // Eventually we might be able to use SILLocation (when it contains info
     // about inlined call chains).
     if (CE) {
-      if (const TupleType *RTy = CE->getArg()->getType()->getAs<TupleType>()) {
-        if (RTy->getNumElements() == 1) {
-          UserSrcTy = RTy->getElementType(0);
-          UserDstTy = CE->getType();
-        }
-      } else {
-        UserSrcTy = CE->getArg()->getType();
+      if (auto *unaryArg = CE->getArgs()->getUnaryExpr()) {
+        UserSrcTy = unaryArg->getType();
         UserDstTy = CE->getType();
       }
     } else if (auto *ILE = Loc.getAsASTNode<IntegerLiteralExpr>()) {
@@ -875,28 +870,7 @@ constantFoldAndCheckIntegerConversions(BuiltinInst *BI,
 template<unsigned N>
 static bool tryExtractLiteralText(FloatLiteralInst *flitInst,
                                   SmallString<N> &fpStr) {
-
-  Expr *expr = flitInst->getLoc().getAsASTNode<Expr>();
-  if (!expr)
-    return false;
-
-  // 'expr' may not be a FloatLiteralExpr since 'flitInst' could have been
-  // created by the ConstantFolder by folding floating-point constructor calls.
-  // So we iterate through the sequence of folded constructors if any, and
-  // try to extract the FloatLiteralExpr.
-  while (auto *callExpr = dyn_cast<CallExpr>(expr)) {
-    if (callExpr->getNumArguments() != 1 ||
-         !dyn_cast<ConstructorRefCallExpr>(callExpr->getFn()))
-      break;
-
-    auto *tupleExpr = dyn_cast<TupleExpr>(callExpr->getArg());
-    if (!tupleExpr)
-      break;
-
-    expr = tupleExpr->getElement(0);
-  }
-
-  auto *flitExpr = dyn_cast<FloatLiteralExpr>(expr);
+  auto *flitExpr = flitInst->getLoc().getAsASTNode<FloatLiteralExpr>();
   if (!flitExpr)
     return false;
 
@@ -1074,27 +1048,8 @@ bool isLossyUnderflow(APFloat srcVal, BuiltinFloatType *srcType,
 /// This function determines whether the float literal in the given
 /// SIL instruction is specified using hex-float notation in the Swift source.
 bool isHexLiteralInSource(FloatLiteralInst *flitInst) {
-  Expr *expr = flitInst->getLoc().getAsASTNode<Expr>();
-  if (!expr)
-    return false;
-
-  // Iterate through a sequence of folded implicit constructors if any, and
-  // try to extract the FloatLiteralExpr.
-  while (auto *callExpr = dyn_cast<CallExpr>(expr)) {
-    if (!callExpr->isImplicit() || callExpr->getNumArguments() != 1 ||
-        !dyn_cast<ConstructorRefCallExpr>(callExpr->getFn()))
-      break;
-
-    auto *tupleExpr = dyn_cast<TupleExpr>(callExpr->getArg());
-    if (!tupleExpr)
-      break;
-
-    expr = tupleExpr->getElement(0);
-  }
-  auto *flitExpr = dyn_cast<FloatLiteralExpr>(expr);
-  if (!flitExpr)
-    return false;
-  return flitExpr->getDigitsText().startswith("0x");
+  auto *flitExpr = flitInst->getLoc().getAsASTNode<FloatLiteralExpr>();
+  return flitExpr && flitExpr->getDigitsText().startswith("0x");
 }
 
 bool maybeExplicitFPCons(BuiltinInst *BI, const BuiltinInfo &Builtin) {

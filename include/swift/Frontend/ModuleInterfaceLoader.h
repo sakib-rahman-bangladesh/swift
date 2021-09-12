@@ -139,7 +139,8 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
                   std::unique_ptr<llvm::MemoryBuffer> *moduleBuffer,
                   std::unique_ptr<llvm::MemoryBuffer> *moduleDocBuffer,
                   std::unique_ptr<llvm::MemoryBuffer> *moduleSourceInfoBuffer,
-                  bool &isFramework, bool &isSystemModule) override;
+                  bool skipBuildingInterface, bool &isFramework,
+                  bool &isSystemModule) override;
 
   std::error_code findModuleFilesInDirectory(
                   ImportPath::Element ModuleID,
@@ -148,7 +149,7 @@ class ExplicitSwiftModuleLoader: public SerializedModuleLoaderBase {
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
                   std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-                  bool IsFramework) override;
+                  bool skipBuildingInterface, bool IsFramework) override;
 
   bool canImportModule(ImportPath::Element mID, llvm::VersionTuple version,
                        bool underlyingVersion) override;
@@ -161,7 +162,6 @@ public:
   static std::unique_ptr<ExplicitSwiftModuleLoader>
   create(ASTContext &ctx,
          DependencyTracker *tracker, ModuleLoadingMode loadMode,
-         ArrayRef<std::string> ExplicitModulePaths,
          StringRef ExplicitSwiftModuleMap,
          bool IgnoreSwiftSourceInfoFile);
 
@@ -180,10 +180,11 @@ struct ExplicitModuleInfo {
   std::string moduleDocPath;
   // Path of the .swiftsourceinfo file.
   std::string moduleSourceInfoPath;
-  // Opened buffer for the .swiftmodule file.
-  std::unique_ptr<llvm::MemoryBuffer> moduleBuffer;
   // A flag that indicates whether this module is a framework
   bool isFramework;
+  // A flag that indicates whether this module is a system module
+  // Set the default to be false.
+  bool isSystem = false;
 };
 
 /// Parser of explicit module maps passed into the compiler.
@@ -242,7 +243,18 @@ private:
     SmallString<32> Buffer;
     return Saver.save(cast<llvm::yaml::ScalarNode>(N)->getValue(Buffer));
   }
-  
+
+  static bool parseBoolValue(StringRef val) {
+    auto valStr = val.str();
+    valStr.erase(std::remove(valStr.begin(), valStr.end(), '\n'), valStr.end());
+    if (valStr.compare("true") == 0)
+      return true;
+    else if (valStr.compare("false") == 0)
+      return false;
+    else
+      llvm_unreachable("Unexpected JSON value for isFramework");
+  }
+
   bool parseSingleModuleEntry(llvm::yaml::Node &node,
                               llvm::StringMap<ExplicitModuleInfo> &moduleMap) {
     using namespace llvm::yaml;
@@ -263,14 +275,9 @@ private:
       } else if (key == "sourceInfoPath") {
         result.moduleSourceInfoPath = val.str();
       } else if (key == "isFramework") {
-        auto valStr = val.str();
-        valStr.erase(std::remove(valStr.begin(), valStr.end(), '\n'), valStr.end());
-        if (valStr.compare("true") == 0)
-          result.isFramework = true;
-        else if (valStr.compare("false") == 0)
-          result.isFramework = false;
-        else
-          llvm_unreachable("Unexpected JSON value for isFramework");
+        result.isFramework = parseBoolValue(val);
+      } else if (key == "isSystem") {
+        result.isSystem = parseBoolValue(val);
       } else {
         // Being forgiving for future fields.
         continue;
@@ -394,7 +401,7 @@ class ModuleInterfaceLoader : public SerializedModuleLoaderBase {
      std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
      std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
      std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
-     bool IsFramework) override;
+     bool skipBuildingInterface, bool IsFramework) override;
 
   bool isCached(StringRef DepPath) override;
 public:
@@ -424,7 +431,8 @@ public:
       const ClangImporterOptions &ClangOpts, StringRef CacheDir,
       StringRef PrebuiltCacheDir, StringRef BackupInterfaceDir,
       StringRef ModuleName, StringRef InPath,
-      StringRef OutPath, bool SerializeDependencyHashes,
+      StringRef OutPath, StringRef ABIOutputPath,
+      bool SerializeDependencyHashes,
       bool TrackSystemDependencies, ModuleInterfaceLoaderOptions Opts,
       RequireOSSAModules_t RequireOSSAModules);
 };

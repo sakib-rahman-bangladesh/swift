@@ -400,14 +400,14 @@ static void checkForEmptyOptionSet(const VarDecl *VD) {
     return;
   
   // Make sure it is calling the rawValue constructor
-  if (ctor->getNumArguments() != 1)
+  auto *args = ctor->getArgs();
+  if (!args->isUnary())
     return;
-  if (ctor->getArgumentLabels().front() != VD->getASTContext().Id_rawValue)
+  if (args->getLabel(0) != VD->getASTContext().Id_rawValue)
     return;
   
   // Make sure the rawValue parameter is a '0' integer literal
-  auto *args = cast<TupleExpr>(ctor->getArg());
-  auto intArg = dyn_cast<IntegerLiteralExpr>(args->getElement(0));
+  auto intArg = dyn_cast<IntegerLiteralExpr>(args->getExpr(0));
   if (!intArg)
     return;
   if (intArg->getValue() != 0)
@@ -1410,28 +1410,6 @@ static void maybeDiagnoseClassWithoutInitializers(ClassDecl *classDecl) {
   diagnoseClassWithoutInitializers(classDecl);
 }
 
-void TypeChecker::checkResultType(Type resultType,
-                                  DeclContext *owner) {
-//  // Only distributed functions have special requirements on return types.
-//  if (!owner->isDistributed())
-//    return;
-//
-//  auto conformanceDC = owner->getConformanceContext();
-//
-//  // Result type of distributed functions must be Codable.
-//  auto target =
-//      conformanceDC->mapTypeIntoContext(it->second->getValueInterfaceType());
-//  if (TypeChecker::conformsToProtocol(target, derived.Protocol, conformanceDC)
-//      .isInvalid()) {
-//    TypeLoc typeLoc = {
-//        it->second->getTypeReprOrParentPatternTypeRepr(),
-//        it->second->getType(),
-//    };
-//    it->second->diagnose(diag::codable_non_conforming_property_here,
-//                         derived.getProtocolType(), typeLoc);
-//    propertiesAreValid = false;
-}
-
 void TypeChecker::diagnoseDuplicateBoundVars(Pattern *pattern) {
   SmallVector<VarDecl *, 2> boundVars;
   pattern->collectVariables(boundVars);
@@ -1659,8 +1637,6 @@ public:
 
     DeclVisitor<DeclChecker>::visit(decl);
 
-    TypeChecker::checkUnsupportedProtocolType(decl);
-
     if (auto VD = dyn_cast<ValueDecl>(decl)) {
       auto &Context = getASTContext();
       TypeChecker::checkForForbiddenPrefix(Context, VD->getBaseName());
@@ -1746,20 +1722,8 @@ public:
   void visitOperatorDecl(OperatorDecl *OD) {
     TypeChecker::checkDeclAttributes(OD);
     checkRedeclaration(OD);
-    auto &Ctx = OD->getASTContext();
-    if (auto *IOD = dyn_cast<InfixOperatorDecl>(OD)) {
+    if (auto *IOD = dyn_cast<InfixOperatorDecl>(OD))
       (void)IOD->getPrecedenceGroup();
-    } else {
-      auto nominalTypes = OD->getDesignatedNominalTypes();
-      const auto wantsDesignatedTypes =
-          Ctx.TypeCheckerOpts.EnableOperatorDesignatedTypes;
-      if (nominalTypes.empty() && wantsDesignatedTypes) {
-        auto identifiers = OD->getIdentifiers();
-        if (checkDesignatedTypes(OD, identifiers))
-          OD->setInvalid();
-      }
-      return;
-    }
     checkAccessControl(OD);
   }
 
@@ -2418,6 +2382,10 @@ public:
                      /*distributed=*/CD->isDistributedActor());
     }
 
+    if (CD->isDistributedActor()) {
+      TypeChecker::checkDistributedActor(CD);
+    }
+
     // Force lowering of stored properties.
     (void) CD->getStoredProperties();
 
@@ -2702,7 +2670,6 @@ public:
       checkAccessControl(FD);
 
       TypeChecker::checkParameterList(FD->getParameters(), FD);
-      TypeChecker::checkResultType(FD->getResultInterfaceType(), FD);
     }
 
     TypeChecker::checkDeclAttributes(FD);
@@ -2785,7 +2752,7 @@ public:
     if (FD->getDeclContext()->isTypeContext()) {
       if (FD->isOperator() && !isMemberOperator(FD, nullptr)) {
         auto selfNominal = FD->getDeclContext()->getSelfNominalTypeDecl();
-        auto isProtocol = selfNominal && isa<ProtocolDecl>(selfNominal);
+        auto isProtocol = isa_and_nonnull<ProtocolDecl>(selfNominal);
         // We did not find 'Self'. Complain.
         FD->diagnose(diag::operator_in_unrelated_type,
                      FD->getDeclContext()->getDeclaredInterfaceType(), isProtocol,
@@ -2948,6 +2915,9 @@ public:
     checkAccessControl(ED);
 
     checkExplicitAvailability(ED);
+
+    if (nominal->isDistributedActor())
+      TypeChecker::checkDistributedActor(dyn_cast<ClassDecl>(nominal));
   }
 
   void visitTopLevelCodeDecl(TopLevelCodeDecl *TLCD) {

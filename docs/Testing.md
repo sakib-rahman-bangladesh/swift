@@ -350,6 +350,9 @@ code for the target that is not the build machine:
 * ``%target-cc-options``: the clang flags to setup the target with the right
   architecture and platform version.
 
+* ``%target-sanitizer-opt``: if sanitizers are enabled for the build, the
+  corresponding ``-fsanitize=`` option.
+
 * ``%target-triple``: a triple composed of the ``%target-cpu``, the vendor,
   the ``%target-os``, and the operating system version number. Possible values
   include ``i386-apple-ios7.0`` or ``armv7k-apple-watchos2.0``.
@@ -380,6 +383,16 @@ code for the target that is not the build machine:
 * ``%target-static-stdlib-path``: the path to the static standard library.
 
   Add ``REQUIRES: static_stdlib`` to the test.
+
+* ``%target-rtti-opt``: the ``-frtti`` or ``-fno-rtti`` option required to
+  link with the Swift libraries on the target platform.
+
+* ``%target-cxx-lib``: the argument to add to the command line when using
+  ``swiftc`` and linking in a C++ object file.  Typically ``-lc++`` or
+  ``-lstdc++`` depending on platform.
+
+* ``%target-msvc-runtime-opt``: for Windows, the MSVC runtime option, e.g.
+  ``-MD``, to use when building C/C++ code to link with Swift.
 
 Always use ``%target-*`` substitutions unless you have a good reason.  For
 example, an exception would be a test that checks how the compiler handles

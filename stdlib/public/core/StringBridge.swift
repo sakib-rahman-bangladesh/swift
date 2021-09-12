@@ -409,9 +409,8 @@ private func _getCocoaStringPointer(
   if let ascii = stableCocoaASCIIPointer(cfImmutableValue) {
     return .ascii(ascii)
   }
-  if let utf16Ptr = _stdlib_binary_CFStringGetCharactersPtr(cfImmutableValue) {
-    return .utf16(utf16Ptr)
-  }
+  // We could ask for UTF16 here via _stdlib_binary_CFStringGetCharactersPtr,
+  // but we currently have no use for it
   return .none
 }
 
@@ -659,7 +658,7 @@ internal func _SwiftCreateBridgedString_DoNotCall(
 // This allows us to subclass an Objective-C class and use the fast Swift
 // memory allocator.
 @objc @_swift_native_objc_runtime_base(__SwiftNativeNSStringBase)
-class __SwiftNativeNSString {
+@_spi(Foundation) public class __SwiftNativeNSString {
   @objc internal init() {}
   deinit {}
 }

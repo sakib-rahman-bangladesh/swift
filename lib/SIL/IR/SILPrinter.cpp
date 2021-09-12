@@ -523,6 +523,69 @@ namespace {
   
 class SILPrinter;
 
+// 1. Accumulate opcode-specific comments in this stream.
+// 2. Start emitting comments: lineComments.start()
+// 3. Emit each comment section: lineComments.delim()
+// 4. End emitting comments: LineComments::end()
+class LineComments : public raw_ostream {
+  llvm::formatted_raw_ostream &os;
+  // Opcode-specific comments to be printed at the end of the current line.
+  std::string opcodeCommentString;
+  llvm::raw_string_ostream opcodeCommentStream;
+  bool emitting = false;
+  bool printedSlashes = false;
+
+public:
+  LineComments(llvm::formatted_raw_ostream &os)
+      : os(os), opcodeCommentStream(opcodeCommentString) {
+    SetUnbuffered(); // pass through to the underlying stream
+  }
+
+  // Call to start emitting line comments into the underlying stream.
+  void start() {
+    emitting = true;
+    printedSlashes = false;
+
+    if (opcodeCommentString.empty())
+      return;
+
+    delim();
+    os << opcodeCommentString;
+    opcodeCommentString.clear();
+  }
+  // Call for each section of line
+  void delim() {
+    assert(emitting);
+    if (printedSlashes) {
+      os << "; ";
+    } else {
+      os.PadToColumn(50);
+      os << "// ";
+      printedSlashes = true;
+    }
+  }
+  void end() {
+    assert(emitting);
+    emitting = false;
+    printedSlashes = false;
+    os << "\n";
+  }
+
+protected:
+  void write_impl(const char *ptr, size_t size) override {
+    if (emitting)
+      os.write(ptr, size);
+    else
+      opcodeCommentStream.write(ptr, size);
+  }
+  uint64_t current_pos() const override {
+    if (emitting)
+      return os.tell() - os.GetNumBytesInBuffer();
+
+    return opcodeCommentString.size();
+  }
+};
+
 /// SILPrinter class - This holds the internal implementation details of
 /// printing SIL structures.
 class SILPrinter : public SILInstructionVisitor<SILPrinter> {
@@ -531,6 +594,7 @@ class SILPrinter : public SILInstructionVisitor<SILPrinter> {
     llvm::formatted_raw_ostream OS;
     PrintOptions ASTOptions;
   } PrintState;
+  LineComments lineComments;
   unsigned LastBufferID;
 
   // Printers for the underlying stream.
@@ -581,7 +645,7 @@ public:
       llvm::DenseMap<CanType, Identifier> *AlternativeTypeNames = nullptr)
       : Ctx(PrintCtx), PrintState{{PrintCtx.OS()},
                                   PrintOptions::printSIL(&PrintCtx)},
-        LastBufferID(0) {
+        lineComments(PrintState.OS), LastBufferID(0) {
     PrintState.ASTOptions.AlternativeTypeNames = AlternativeTypeNames;
     PrintState.ASTOptions.PrintForSIL = true;
   }
@@ -755,33 +819,33 @@ public:
   //===--------------------------------------------------------------------===//
   // SILInstruction Printing Logic
 
-  bool printTypeDependentOperands(const SILInstruction *I) {
+  void printTypeDependentOperands(const SILInstruction *I) {
     ArrayRef<Operand> TypeDepOps = I->getTypeDependentOperands();
     if (TypeDepOps.empty())
-      return false;
+      return;
 
-    PrintState.OS.PadToColumn(50);
-    *this << "// type-defs: ";
+    lineComments.delim();
+    *this << "type-defs: ";
     interleave(TypeDepOps,
                [&](const Operand &op) { *this << Ctx.getID(op.get()); },
                [&] { *this << ", "; });
-    return true;
   }
 
   /// Print out the users of the SILValue \p V. Return true if we printed out
   /// either an id or a use list. Return false otherwise.
-  bool printUsersOfValue(SILValue value, bool printedSlashes) {
-    return printUserList({value}, value, printedSlashes);
+  void printUsersOfValue(SILValue value) {
+    lineComments.start();
+    printUserList({value}, value);
+    lineComments.end();
   }
 
-  bool printUsersOfInstruction(const SILInstruction *inst, bool printedSlashes) {
+  void printUsersOfInstruction(const SILInstruction *inst) {
     llvm::SmallVector<SILValue, 8> values;
     llvm::copy(inst->getResults(), std::back_inserter(values));
-    return printUserList(values, inst, printedSlashes);
+    printUserList(values, inst);
   }
 
-  bool printUserList(ArrayRef<SILValue> values, SILNodePointer node,
-                     bool printedSlashes) {
+  void printUserList(ArrayRef<SILValue> values, SILNodePointer node) {
     // If the set of values is empty, we need to print the ID of
     // the instruction.  Otherwise, if none of the values has a use,
     // we don't need to do anything.
@@ -791,18 +855,13 @@ public:
         if (!value->use_empty()) hasUse = true;
       }
       if (!hasUse)
-        return printedSlashes;
+        return;
     }
+    lineComments.delim();
 
-    if (printedSlashes) {
-      *this << "; ";
-    } else {
-      PrintState.OS.PadToColumn(50);
-      *this << "// ";
-    }
     if (values.empty()) {
       *this << "id: " << Ctx.getID(node);
-      return true;
+      return;
     }
 
     llvm::SmallVector<ID, 32> UserIDs;
@@ -825,7 +884,6 @@ public:
     llvm::interleave(
         UserIDs.begin(), UserIDs.end(), [&](ID id) { *this << id; },
         [&] { *this << ", "; });
-    return true;
   }
 
   void printConformances(ArrayRef<ProtocolConformanceRef> conformances) {
@@ -833,9 +891,9 @@ public:
     if (!Ctx.printVerbose()) {
       return;
     }
-    *this << " // ";
-    for (ProtocolConformanceRef conformance : conformances)
-      conformance.dump(PrintState.OS, /*indent*/ 0, /*details*/ false);
+    for (ProtocolConformanceRef conformance : conformances) {
+      conformance.dump(lineComments, /*indent*/ 0, /*details*/ false);
+    }
   }
 
   void printDebugLocRef(SILLocation Loc, const SourceManager &SM,
@@ -881,15 +939,9 @@ public:
     }
   }
 
-  void printSILLocation(SILLocation L, SILModule &M, const SILDebugScope *DS,
-                        bool printedSlashes) {
+  void printSILLocation(SILLocation L, SILModule &M, const SILDebugScope *DS) {
+    lineComments.delim();
     if (!L.isNull()) {
-      if (!printedSlashes) {
-        PrintState.OS.PadToColumn(50);
-        *this << "//";
-      }
-      *this << " ";
-
       // To minimize output, only print the line and column number for
       // everything but the first instruction.
       L.getSourceLoc().printLineAndColumn(PrintState.OS,
@@ -924,12 +976,7 @@ public:
         *this << ":auto_gen";
       if (L.isInPrologue())
         *this << ":in_prologue";
-    }
-    if (L.isNull()) {
-      if (!printedSlashes) {
-        PrintState.OS.PadToColumn(50);
-        *this << "//";
-      }
+    } else {
       if (L.isAutoGenerated())
         *this << " auto_gen";
       else
@@ -1009,25 +1056,25 @@ public:
     visit(const_cast<SILInstruction*>(I));
 
     // Maybe print debugging information.
-    bool printedSlashes = false;
     if (Ctx.printDebugInfo() && !I->isDeleted()
         && !I->isStaticInitializerInst()) {
       auto &SM = I->getModule().getASTContext().SourceMgr;
       printDebugLocRef(I->getLoc(), SM);
       printDebugScopeRef(I->getDebugScope(), SM);
     }
-    printedSlashes = printTypeDependentOperands(I);
+
+    lineComments.start();
+
+    printTypeDependentOperands(I);
 
     // Print users, or id for valueless instructions.
-    printedSlashes = printUsersOfInstruction(I, printedSlashes);
+    printUsersOfInstruction(I);
 
     // Print SIL location.
     if (Ctx.printVerbose()) {
-      printSILLocation(I->getLoc(), I->getModule(), I->getDebugScope(),
-                       printedSlashes);
+      printSILLocation(I->getLoc(), I->getModule(), I->getDebugScope());
     }
-    
-    *this << '\n';
+    lineComments.end();
   }
 
   void print(const SILNode *node) {
@@ -1068,9 +1115,7 @@ public:
           << Ctx.getID(arg->getParent()) << " : " << arg->getType();
 
     // Print users.
-    (void) printUsersOfValue(arg, false);
-
-    *this << '\n';
+    printUsersOfValue(arg);
   }
 
   void printSILUndef(const SILUndef *undef) {
@@ -1105,9 +1150,7 @@ public:
     visit(static_cast<SILInstruction *>(nonConstParent));
 
     // Print users.
-    (void)printUsersOfValue(result, false);
-
-    *this << '\n';
+    printUsersOfValue(result);
   }
 
   void printInContext(const SILNode *node) {
@@ -1179,29 +1222,37 @@ public:
 
   void printDebugVar(Optional<SILDebugVariable> Var,
                      const SourceManager *SM = nullptr) {
-    if (!Var || Var->Name.empty())
+    if (!Var)
       return;
-    if (Var->Constant)
-      *this << ", let";
-    else
-      *this << ", var";
 
-    if ((Var->Loc || Var->Scope) && SM) {
-      *this << ", (name \"" << Var->Name << '"';
-      if (Var->Loc)
-        printDebugLocRef(*Var->Loc, *SM);
-      if (Var->Scope)
-        printDebugScopeRef(Var->Scope, *SM);
-      *this << ")";
-    } else
-      *this << ", name \"" << Var->Name << '"';
+    if (!Var->Name.empty()) {
+      if (Var->Constant)
+        *this << ", let";
+      else
+        *this << ", var";
 
-    if (Var->ArgNo)
-      *this << ", argno " << Var->ArgNo;
-    if (Var->Type) {
-      *this << ", type ";
-      Var->Type->print(PrintState.OS, PrintState.ASTOptions);
+      if ((Var->Loc || Var->Scope) && SM) {
+        *this << ", (name \"" << Var->Name << '"';
+        if (Var->Loc)
+          printDebugLocRef(*Var->Loc, *SM);
+        if (Var->Scope)
+          printDebugScopeRef(Var->Scope, *SM);
+        *this << ")";
+      } else
+        *this << ", name \"" << Var->Name << '"';
+
+      if (Var->ArgNo)
+        *this << ", argno " << Var->ArgNo;
+      if (Var->Implicit)
+        *this << ", implicit";
+      if (Var->Type) {
+        *this << ", type ";
+        Var->Type->print(PrintState.OS, PrintState.ASTOptions);
+      }
     }
+    // Although it's rare in real-world use cases, but during testing,
+    // sometimes we want to print out di-expression, even the debug
+    // variable name is empty.
     if (Var->DIExpr)
       printDebugInfoExpression(Var->DIExpr);
   }
@@ -1210,7 +1261,8 @@ public:
     if (AVI->hasDynamicLifetime())
       *this << "[dynamic_lifetime] ";
     *this << AVI->getElementType();
-    printDebugVar(AVI->getVarInfo());
+    printDebugVar(AVI->getVarInfo(),
+                  &AVI->getModule().getASTContext().SourceMgr);
   }
 
   void printAllocRefInstBase(AllocRefInstBase *ARI) {
@@ -1245,7 +1297,8 @@ public:
     if (ABI->hasDynamicLifetime())
       *this << "[dynamic_lifetime] ";
     *this << ABI->getType();
-    printDebugVar(ABI->getVarInfo());
+    printDebugVar(ABI->getVarInfo(),
+                  &ABI->getModule().getASTContext().SourceMgr);
   }
 
   void printSubstitutions(SubstitutionMap Subs,
@@ -1453,6 +1506,9 @@ public:
   }
 
   void visitBeginBorrowInst(BeginBorrowInst *LBI) {
+    if (LBI->isDefined()) {
+      *this << "[defined] ";
+    }
     *this << getIDAndType(LBI->getOperand());
   }
 
@@ -1573,12 +1629,6 @@ public:
                   &DVI->getModule().getASTContext().SourceMgr);
   }
 
-  void visitDebugValueAddrInst(DebugValueAddrInst *DVAI) {
-    *this << getIDAndType(DVAI->getOperand());
-    printDebugVar(DVAI->getVarInfo(),
-                  &DVAI->getModule().getASTContext().SourceMgr);
-  }
-
 #define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
   void visitLoad##Name##Inst(Load##Name##Inst *LI) { \
     if (LI->isTake()) \
@@ -1623,6 +1673,7 @@ public:
       *this << " !true_count(" << CI->getTrueBBCount().getValue() << ")";
     if (CI->getFalseBBCount())
       *this << " !false_count(" << CI->getFalseBBCount().getValue() << ")";
+    printForwardingOwnershipKind(CI, CI->getOperand());
   }
 
   void visitCheckedCastValueBranchInst(CheckedCastValueBranchInst *CI) {
@@ -2231,34 +2282,41 @@ public:
       *this << ", default " << Ctx.getID(SII->getDefaultBB());
   }
 
-  void printSwitchEnumInst(SwitchEnumTermInst SOI) {
-    *this << getIDAndType(SOI.getOperand());
-    for (unsigned i = 0, e = SOI.getNumCases(); i < e; ++i) {
+  void printSwitchEnumInst(SwitchEnumTermInst switchEnum) {
+    *this << getIDAndType(switchEnum.getOperand());
+    for (unsigned i = 0, e = switchEnum.getNumCases(); i < e; ++i) {
       EnumElementDecl *elt;
       SILBasicBlock *dest;
-      std::tie(elt, dest) = SOI.getCase(i);
+      std::tie(elt, dest) = switchEnum.getCase(i);
       *this << ", case " << SILDeclRef(elt, SILDeclRef::Kind::EnumElement)
             << ": " << Ctx.getID(dest);
-      if (SOI.getCaseCount(i)) {
-        *this << " !case_count(" << SOI.getCaseCount(i).getValue() << ")";
+      if (switchEnum.getCaseCount(i)) {
+        *this << " !case_count(" << switchEnum.getCaseCount(i).getValue()
+              << ")";
       }
     }
-    if (SOI.hasDefault()) {
-      *this << ", default " << Ctx.getID(SOI.getDefaultBB());
-      if (SOI.getDefaultCount()) {
-        *this << " !default_count(" << SOI.getDefaultCount().getValue() << ")";
+    if (switchEnum.hasDefault()) {
+      *this << ", default " << Ctx.getID(switchEnum.getDefaultBB());
+      if (switchEnum.getDefaultCount()) {
+        *this << " !default_count(" << switchEnum.getDefaultCount().getValue()
+              << ")";
+      }
+      if (NullablePtr<EnumElementDecl> uniqueCase =
+              switchEnum.getUniqueCaseForDefault()) {
+        lineComments << SILDeclRef(uniqueCase.get(),
+                                   SILDeclRef::Kind::EnumElement);
       }
     }
   }
 
-  void visitSwitchEnumInst(SwitchEnumInst *SOI) {
-    printSwitchEnumInst(SOI);
-    printForwardingOwnershipKind(SOI, SOI->getOperand());
+  void visitSwitchEnumInst(SwitchEnumInst *switchEnum) {
+    printSwitchEnumInst(switchEnum);
+    printForwardingOwnershipKind(switchEnum, switchEnum->getOperand());
   }
-  void visitSwitchEnumAddrInst(SwitchEnumAddrInst *SOI) {
-    printSwitchEnumInst(SOI);
+  void visitSwitchEnumAddrInst(SwitchEnumAddrInst *switchEnum) {
+    printSwitchEnumInst(switchEnum);
   }
-  
+
   void printSelectEnumInst(SelectEnumInstBase *SEI) {
     *this << getIDAndType(SEI->getEnumOperand());
 

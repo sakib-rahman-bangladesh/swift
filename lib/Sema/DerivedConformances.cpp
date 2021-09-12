@@ -312,6 +312,14 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
     if (name.isSimpleName(ctx.Id_unownedExecutor))
       return getRequirement(KnownProtocolKind::Actor);
 
+    // DistributedActor.id
+    if(name.isSimpleName(ctx.Id_id))
+      return getRequirement(KnownProtocolKind::DistributedActor);
+
+    // DistributedActor.actorTransport
+    if(name.isSimpleName(ctx.Id_actorTransport))
+      return getRequirement(KnownProtocolKind::DistributedActor);
+
     return nullptr;
   }
 
@@ -349,6 +357,17 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
       auto argumentNames = name.getArgumentNames();
       if (argumentNames.size() == 1 && argumentNames[0] == ctx.Id_into)
         return getRequirement(KnownProtocolKind::Hashable);
+    }
+
+    // static DistributedActor.resolve(_:using:)
+    if (name.isCompoundName() && name.getBaseName() == ctx.Id_resolve &&
+        func->isStatic()) {
+      auto argumentNames = name.getArgumentNames();
+      if (argumentNames.size() == 2 &&
+          argumentNames[0] == Identifier() &&
+          argumentNames[1] == ctx.Id_using) {
+        return getRequirement(KnownProtocolKind::DistributedActor);
+      }
     }
 
     return nullptr;
@@ -431,8 +450,8 @@ DerivedConformance::createBuiltinCall(ASTContext &ctx,
   Expr *ref = new (ctx) DeclRefExpr(declRef, DeclNameLoc(),
                                     /*Implicit=*/true,
                                     AccessSemantics::Ordinary, fnType);
-  CallExpr *call =
-    CallExpr::createImplicit(ctx, ref, args, /*labels*/ {});
+  auto *argList = ArgumentList::forImplicitUnlabeled(ctx, args);
+  auto *call = CallExpr::createImplicit(ctx, ref, argList);
   call->setType(resultType);
   call->setThrows(false);
 

@@ -675,7 +675,7 @@ _searchTypeMetadataRecords(TypeMetadataPrivateState &T,
 
 // FIXME: When the _Concurrency library gets merged into the Standard Library,
 // we will be able to reference those symbols directly as well.
-#define STANDARD_TYPE_2(KIND, MANGLING, TYPENAME)
+#define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)
 
 #if !SWIFT_OBJC_INTEROP
 # define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
@@ -709,7 +709,7 @@ _findContextDescriptor(Demangle::NodePointer node,
     }
   // FIXME: When the _Concurrency library gets merged into the Standard Library,
   // we will be able to reference those symbols directly as well.
-#define STANDARD_TYPE_2(KIND, MANGLING, TYPENAME)
+#define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)
 #if !SWIFT_OBJC_INTEROP
 # define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
 #endif
@@ -1446,6 +1446,12 @@ public:
   TypeLookupErrorOr<BuiltType> createExistentialMetatypeType(
       BuiltType instance,
       llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = None) const {
+    if (instance->getKind() != MetadataKind::Existential
+        && instance->getKind() != MetadataKind::ExistentialMetatype) {
+      return TYPE_LOOKUP_ERROR_FMT("Tried to build an existential metatype from "
+                                   "a type that was neither an existential nor "
+                                   "an existential metatype");
+    }
     return swift_getExistentialMetatypeMetadata(instance);
   }
 

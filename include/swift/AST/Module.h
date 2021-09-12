@@ -163,7 +163,8 @@ class OverlayFile;
 /// output binary and logical module (such as a single library or executable).
 ///
 /// \sa FileUnit
-class ModuleDecl : public DeclContext, public TypeDecl {
+class ModuleDecl
+    : public DeclContext, public TypeDecl, public ASTAllocated<ModuleDecl> {
   friend class DirectOperatorLookupRequest;
   friend class DirectPrecedenceGroupLookupRequest;
 
@@ -513,6 +514,16 @@ public:
     return Bits.ModuleDecl.IsMainModule;
   }
 
+  /// Whether this module has been compiled with comprehensive checking for
+  /// concurrency, e.g., Sendable checking.
+  bool isConcurrencyChecked() const {
+    return Bits.ModuleDecl.IsConcurrencyChecked;
+  }
+
+  void setIsConcurrencyChecked(bool value = true) {
+    Bits.ModuleDecl.IsConcurrencyChecked = value;
+  }
+
   /// For the main module, retrieves the list of primary source files being
   /// compiled, that is, the files we're generating code for.
   ArrayRef<SourceFile *> getPrimarySourceFiles() const;
@@ -578,10 +589,15 @@ public:
   ///
   /// \param protocol The protocol to which we are computing conformance.
   ///
+  /// \param allowMissing When \c true, the resulting conformance reference
+  /// might include "missing" conformances, which are synthesized for some
+  /// protocols as an error recovery mechanism.
+  ///
   /// \returns The result of the conformance search, which will be
   /// None if the type does not conform to the protocol or contain a
   /// ProtocolConformanceRef if it does conform.
-  ProtocolConformanceRef lookupConformance(Type type, ProtocolDecl *protocol);
+  ProtocolConformanceRef lookupConformance(Type type, ProtocolDecl *protocol,
+                                           bool allowMissing = false);
 
   /// Look for the conformance of the given existential type to the given
   /// protocol.
@@ -661,9 +677,10 @@ public:
   /// This assumes that \p module was imported.
   bool isImportedImplementationOnly(const ModuleDecl *module) const;
 
-  /// Returns true if a function, which is using \p nominal, can be serialized
-  /// by cross-module-optimization.
-  bool canBeUsedForCrossModuleOptimization(NominalTypeDecl *nominal) const;
+  /// Returns true if decl context or its content can be serialized by
+  /// cross-module-optimization.
+  /// The \p ctxt can e.g. be a NominalType or the context of a function.
+  bool canBeUsedForCrossModuleOptimization(DeclContext *ctxt) const;
 
   /// Finds all top-level decls of this module.
   ///
@@ -807,16 +824,8 @@ public:
     return D->getKind() == DeclKind::Module;
   }
 
-private:
-  // Make placement new and vanilla new/delete illegal for Modules.
-  void *operator new(size_t Bytes) throw() = delete;
-  void operator delete(void *Data) throw() = delete;
-  void *operator new(size_t Bytes, void *Mem) throw() = delete;
-public:
-  // Only allow allocation of Modules using the allocator in ASTContext
-  // or by doing a placement new.
-  void *operator new(size_t Bytes, const ASTContext &C,
-                     unsigned Alignment = alignof(ModuleDecl));
+  using ASTAllocated<ModuleDecl>::operator new;
+  using ASTAllocated<ModuleDecl>::operator delete;
 };
 
 /// Wraps either a swift module or a clang one.

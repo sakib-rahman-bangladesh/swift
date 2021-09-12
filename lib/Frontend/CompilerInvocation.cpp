@@ -370,6 +370,13 @@ static void SaveModuleInterfaceArgs(ModuleInterfaceOptions &Opts,
     interleave(RenderedArgs,
                [&](const char *Argument) { PrintArg(OS, Argument, StringRef()); },
                [&] { OS << " "; });
+
+    // Backward-compatibility hack: disable availability checking in the
+    // _Concurrency module, so that older (Swift 5.5) compilers that did not
+    // support back deployment of concurrency do not complain about 'async'
+    // with older availability.
+    if (FOpts.ModuleName == "_Concurrency")
+      OS << " -disable-availability-checking";
   }
   {
     llvm::raw_string_ostream OS(Opts.IgnorableFlags);
@@ -422,8 +429,11 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   Opts.EnableExperimentalConcurrency |=
     Args.hasArg(OPT_enable_experimental_concurrency);
 
-  Opts.EnableExperimentalOpaqueReturnTypes |=
-      Args.hasArg(OPT_enable_experimental_opaque_return_types);
+  Opts.EnableExperimentalNamedOpaqueTypes |=
+      Args.hasArg(OPT_enable_experimental_named_opaque_types);
+
+  Opts.EnableExperimentalStructuralOpaqueTypes |=
+      Args.hasArg(OPT_enable_experimental_structural_opaque_types);
 
   Opts.EnableExperimentalDistributed |=
     Args.hasArg(OPT_enable_experimental_distributed);
@@ -464,6 +474,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
 
   Opts.WarnOnPotentiallyUnavailableEnumCase |=
       Args.hasArg(OPT_warn_on_potentially_unavailable_enum_case);
+  Opts.WarnOnEditorPlaceholder |= Args.hasArg(OPT_warn_on_editor_placeholder);
+
   if (auto A = Args.getLastArg(OPT_enable_access_control,
                                OPT_disable_access_control)) {
     Opts.EnableAccessControl
@@ -654,11 +666,8 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
   }
 
   Opts.EnableConcisePoundFile =
-      Args.hasArg(OPT_enable_experimental_concise_pound_file);
-  Opts.EnableFuzzyForwardScanTrailingClosureMatching =
-      Args.hasFlag(OPT_enable_fuzzy_forward_scan_trailing_closure_matching,
-                   OPT_disable_fuzzy_forward_scan_trailing_closure_matching,
-                   true);
+      Args.hasArg(OPT_enable_experimental_concise_pound_file) ||
+      Opts.EffectiveLanguageVersion.isVersionAtLeast(6);
 
   Opts.EnableCrossImportOverlays =
       Args.hasFlag(OPT_enable_cross_import_overlays,
@@ -827,8 +836,13 @@ static bool ParseLangArgs(LangOptions &Opts, ArgList &Args,
                      A->getAsString(Args), A->getValue());
   }
 
-  Opts.DebugRequirementMachine = Args.hasArg(
-      OPT_debug_requirement_machine);
+  Opts.DumpRequirementMachine = Args.hasArg(
+      OPT_dump_requirement_machine);
+  Opts.AnalyzeRequirementMachine = Args.hasArg(
+      OPT_analyze_requirement_machine);
+
+  if (const Arg *A = Args.getLastArg(OPT_debug_requirement_machine))
+    Opts.DebugRequirementMachine = A->getValue();
 
   if (const Arg *A = Args.getLastArg(OPT_requirement_machine_step_limit)) {
     unsigned limit;
@@ -1098,9 +1112,6 @@ static bool ParseSearchPathArgs(SearchPathOptions &Opts,
   Opts.DisableModulesValidateSystemDependencies |=
       Args.hasArg(OPT_disable_modules_validate_system_headers);
 
-  for (auto A: Args.filtered(OPT_swift_module_file)) {
-    Opts.ExplicitSwiftModules.push_back(resolveSearchPath(A->getValue()));
-  }
   if (const Arg *A = Args.getLastArg(OPT_explict_swift_module_map))
     Opts.ExplicitSwiftModuleMap = A->getValue();
   for (auto A: Args.filtered(OPT_candidate_module_file)) {
@@ -1877,6 +1888,12 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
       Diags.diagnose(SourceLoc(), diag::remark_max_determinism_overriding,
                      "-num-threads");
     }
+  }
+
+  if (SWIFT_ENABLE_GLOBAL_ISEL_ARM64 &&
+      Triple.getArch() == llvm::Triple::aarch64 &&
+      Triple.getArchName() != "arm64e") {
+    Opts.EnableGlobalISel = true;
   }
 
   return false;

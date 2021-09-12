@@ -70,8 +70,8 @@ NullablePtr<SILInstruction> createDecrementBefore(SILValue ptr,
 Optional<SILBasicBlock::iterator> getInsertAfterPoint(SILValue val);
 
 /// True if this instruction's only uses are debug_value (in -O mode),
-/// destroy_value, or end-of-scope instruction such as end_borrow.
-bool hasOnlyEndOfScopeOrDestroyUses(SILInstruction *inst);
+/// destroy_value, end_lifetime or end-of-scope instruction such as end_borrow.
+bool hasOnlyEndOfScopeOrEndOfLifetimeUses(SILInstruction *inst);
 
 /// Return the number of @inout arguments passed to the given apply site.
 unsigned getNumInOutArguments(FullApplySite applySite);
@@ -675,15 +675,10 @@ SILBasicBlock::iterator replaceSingleUse(Operand *use, SILValue newValue,
 SILValue
 makeCopiedValueAvailable(SILValue value, SILBasicBlock *inBlock);
 
-/// Given a newly created @owned value \p value without any uses, this utility
+/// Given an existing @owned value \p value, this utility
 /// inserts control equivalent copy and destroy at leaking blocks to adjust
 /// ownership and make \p value available for use at \p inBlock.
-///
-/// inBlock must be the only point at which \p value will be consumed. If this
-/// consuming point is within a loop, this will create and return a copy of \p
-/// value inside \p inBlock.
-SILValue
-makeNewValueAvailable(SILValue value, SILBasicBlock *inBlock);
+SILValue makeValueAvailable(SILValue value, SILBasicBlock *inBlock);
 
 /// Given an ssa value \p value, create destroy_values at leaking blocks
 ///

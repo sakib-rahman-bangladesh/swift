@@ -2161,11 +2161,10 @@ static void addAssocTypeDeductionString(llvm::SmallString<128> &str,
 static Type getTypeForDisplay(ModuleDecl *module, ValueDecl *decl) {
   // For a constructor, we only care about the parameter types.
   if (auto ctor = dyn_cast<ConstructorDecl>(decl)) {
-    return AnyFunctionType::composeInput(module->getASTContext(),
+    return AnyFunctionType::composeTuple(module->getASTContext(),
                                          ctor->getMethodInterfaceType()
                                              ->castTo<FunctionType>()
-                                             ->getParams(),
-                                         /*canonicalVararg=*/false);
+                                             ->getParams());
   }
 
   Type type = decl->getInterfaceType();
@@ -2869,7 +2868,7 @@ bool ConformanceChecker::checkActorIsolation(
   }
 
   case ActorIsolationRestriction::CrossActorSelf:
-    return diagnoseNonConcurrentTypesInReference(
+    return diagnoseNonSendableTypesInReference(
         witness, DC->getParentModule(), witness->getLoc(),
         ConcurrentReferenceKind::CrossActor);
 
@@ -2940,7 +2939,7 @@ bool ConformanceChecker::checkActorIsolation(
     if (requirement->hasClangNode())
       return false;
 
-    return diagnoseNonConcurrentTypesInReference(
+    return diagnoseNonSendableTypesInReference(
       witness, DC->getParentModule(), witness->getLoc(),
       ConcurrentReferenceKind::CrossActor);
   }
@@ -2975,7 +2974,7 @@ bool ConformanceChecker::checkActorIsolation(
       return false;
 
     if (isCrossActor) {
-      return diagnoseNonConcurrentTypesInReference(
+      return diagnoseNonSendableTypesInReference(
         witness, DC->getParentModule(), witness->getLoc(),
         ConcurrentReferenceKind::CrossActor);
     }
@@ -3248,7 +3247,8 @@ void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
     // Find the conformance for this overridden protocol.
     auto overriddenConformance =
       DC->getParentModule()->lookupConformance(Adoptee,
-                                               overridden->getProtocol());
+                                               overridden->getProtocol(),
+                                               /*allowMissing=*/true);
     if (overriddenConformance.isInvalid() ||
         !overriddenConformance.isConcrete())
       continue;
@@ -3962,22 +3962,25 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
   // Determine whether we can derive a witness for this requirement.
   bool canDerive = false;
 
-  // Can a witness for this requirement be derived for this nominal type?
-  if (auto derivable = DerivedConformance::getDerivableRequirement(
-                         nominal,
-                         requirement)) {
-    if (derivable == requirement) {
-      // If it's the same requirement, we can derive it here.
-      canDerive = true;
-    } else {
-      // Otherwise, go satisfy the derivable requirement, which can introduce
-      // a member that could in turn satisfy *this* requirement.
-      auto derivableProto = cast<ProtocolDecl>(derivable->getDeclContext());
-      auto conformance =
-          TypeChecker::conformsToProtocol(Adoptee, derivableProto,
-                                          DC->getParentModule());
-      if (conformance.isConcrete()) {
-        (void)conformance.getConcrete()->getWitnessDecl(derivable);
+  auto *SF = DC->getParentSourceFile();
+  if (!(SF == nullptr || SF->Kind == SourceFileKind::Interface)) {
+    // Can a witness for this requirement be derived for this nominal type?
+    if (auto derivable = DerivedConformance::getDerivableRequirement(
+                           nominal,
+                           requirement)) {
+      if (derivable == requirement) {
+        // If it's the same requirement, we can derive it here.
+        canDerive = true;
+      } else {
+        // Otherwise, go satisfy the derivable requirement, which can introduce
+        // a member that could in turn satisfy *this* requirement.
+        auto derivableProto = cast<ProtocolDecl>(derivable->getDeclContext());
+        auto conformance =
+            TypeChecker::conformsToProtocol(Adoptee, derivableProto,
+                                            DC->getParentModule());
+        if (conformance.isConcrete()) {
+          (void)conformance.getConcrete()->getWitnessDecl(derivable);
+        }
       }
     }
   }
@@ -4096,14 +4099,11 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
                        witness->getName(), isSetter, requiredAccess,
                        protoAccessScope.accessLevelForDiagnostics(),
                        proto->getName());
-        if (auto *decl = dyn_cast<AbstractFunctionDecl>(witness)) {
-          auto isMemberwiseInitializer =
-              decl->getBodyKind() ==
-              AbstractFunctionDecl::BodyKind::MemberwiseInitializer;
-          if (isMemberwiseInitializer) {
+
+        if (auto *decl = dyn_cast<AbstractFunctionDecl>(witness))
+          if (decl->isMemberwiseInitializer())
             return;
-          }
-        }
+
         diagnoseWitnessFixAccessLevel(diags, witness, requiredAccess,
                                       isSetter);
       });
@@ -4198,11 +4198,12 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
                                     NormalProtocolConformance *conformance) {
           auto &diags = witness->getASTContext().Diags;
           SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, witness);
-          diags.diagnose(diagLoc,
-                         diag::witness_unavailable,
-                         witness->getDescriptiveKind(),
-                         witness->getName(),
-                         conformance->getProtocol()->getName());
+          auto *attr = AvailableAttr::isUnavailable(witness);
+          EncodedDiagnosticMessage EncodedMessage(attr->Message);
+          diags.diagnose(diagLoc, diag::witness_unavailable,
+                         witness->getDescriptiveKind(), witness->getName(),
+                         conformance->getProtocol()->getName(),
+                         EncodedMessage.Message);
           emitDeclaredHereIfNeeded(diags, diagLoc, witness);
           diags.diagnose(requirement, diag::kind_declname_declared_here,
                          DescriptiveDeclKind::Requirement,
@@ -4288,6 +4289,10 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
 ResolveWitnessResult ConformanceChecker::resolveWitnessViaDerivation(
                        ValueDecl *requirement) {
   assert(!isa<AssociatedTypeDecl>(requirement) && "Use resolveTypeWitnessVia*");
+
+  auto *SF = DC->getParentSourceFile();
+  if (SF != nullptr && SF->Kind == SourceFileKind::Interface)
+    return ResolveWitnessResult::Missing;
 
   // Find the declaration that derives the protocol conformance.
   NominalTypeDecl *derivingTypeDecl = nullptr;
@@ -5179,7 +5184,7 @@ TypeChecker::containsProtocol(Type T, ProtocolDecl *Proto, ModuleDecl *M,
 ProtocolConformanceRef
 TypeChecker::conformsToProtocol(Type T, ProtocolDecl *Proto, ModuleDecl *M) {
   // Look up conformance in the module.
-  auto lookupResult = M->lookupConformance(T, Proto);
+  auto lookupResult = M->lookupConformance(T, Proto, /*alllowMissing=*/true);
   if (lookupResult.isInvalid()) {
     return ProtocolConformanceRef::forInvalid();
   }
@@ -5928,6 +5933,9 @@ void TypeChecker::checkConformancesInContext(IterableDeclContext *idc) {
     SendableCheck check = SendableCheck::Explicit;
     if (errorConformance || codingKeyConformance)
       check = SendableCheck::ImpliedByStandardProtocol;
+    else if (SendableConformance->getSourceKind() ==
+                 ConformanceEntryKind::Synthesized)
+      check = SendableCheck::Implicit;
     checkSendableConformance(SendableConformance, check);
   }
 
@@ -6220,8 +6228,7 @@ swift::findWitnessedObjCRequirements(const ValueDecl *witness,
       // Dig out the conformance.
       if (!conformance.hasValue()) {
         SmallVector<ProtocolConformance *, 2> conformances;
-        nominal->lookupConformance(dc->getParentModule(), proto,
-                                   conformances);
+        nominal->lookupConformance(proto, conformances);
         if (conformances.size() == 1)
           conformance = conformances.front();
         else

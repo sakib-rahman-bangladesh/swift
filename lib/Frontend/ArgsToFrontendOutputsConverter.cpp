@@ -337,15 +337,18 @@ SupplementaryOutputPathsComputer::getSupplementaryOutputPathsFromArguments()
       options::OPT_emit_private_module_interface_path);
   auto moduleSourceInfoOutput = getSupplementaryFilenamesFromArguments(
       options::OPT_emit_module_source_info_path);
-  auto ldAddCFileOutput  = getSupplementaryFilenamesFromArguments(
-      options::OPT_emit_ldadd_cfile_path);
   auto moduleSummaryOutput = getSupplementaryFilenamesFromArguments(
       options::OPT_emit_module_summary_path);
+  auto abiDescriptorOutput = getSupplementaryFilenamesFromArguments(
+      options::OPT_emit_abi_descriptor_path);
+  auto optRecordOutput = getSupplementaryFilenamesFromArguments(
+      options::OPT_save_optimization_record_path);
   if (!objCHeaderOutput || !moduleOutput || !moduleDocOutput ||
       !dependenciesFile || !referenceDependenciesFile ||
       !serializedDiagnostics || !fixItsOutput || !loadedModuleTrace || !TBD ||
       !moduleInterfaceOutput || !privateModuleInterfaceOutput ||
-      !moduleSourceInfoOutput || !ldAddCFileOutput || !moduleSummaryOutput) {
+      !moduleSourceInfoOutput || !moduleSummaryOutput || !abiDescriptorOutput ||
+      !optRecordOutput) {
     return None;
   }
   std::vector<SupplementaryOutputPaths> result;
@@ -366,8 +369,10 @@ SupplementaryOutputPathsComputer::getSupplementaryOutputPathsFromArguments()
     sop.ModuleInterfaceOutputPath = (*moduleInterfaceOutput)[i];
     sop.PrivateModuleInterfaceOutputPath = (*privateModuleInterfaceOutput)[i];
     sop.ModuleSourceInfoOutputPath = (*moduleSourceInfoOutput)[i];
-    sop.LdAddCFilePath = (*ldAddCFileOutput)[i];
     sop.ModuleSummaryOutputPath = (*moduleSummaryOutput)[i];
+    sop.ABIDescriptorOutputPath = (*abiDescriptorOutput)[i];
+    sop.YAMLOptRecordPath = (*optRecordOutput)[i];
+    sop.BitstreamOptRecordPath = (*optRecordOutput)[i];
     result.push_back(sop);
   }
   return result;
@@ -466,6 +471,8 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
   auto PrivateModuleInterfaceOutputPath =
       pathsFromArguments.PrivateModuleInterfaceOutputPath;
 
+  // There is no non-path form of -emit-abi-descriptor-path
+  auto ABIDescriptorOutputPath = pathsFromArguments.ABIDescriptorOutputPath;
   ID emitModuleOption;
   std::string moduleExtension;
   std::string mainOutputIfUsableForModule;
@@ -475,6 +482,15 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
   auto moduleOutputPath = determineSupplementaryOutputFilename(
       emitModuleOption, pathsFromArguments.ModuleOutputPath,
       file_types::TY_SwiftModuleFile, mainOutputIfUsableForModule,
+      defaultSupplementaryOutputPathExcludingExtension);
+
+  auto YAMLOptRecordPath = determineSupplementaryOutputFilename(
+      OPT_save_optimization_record_path, pathsFromArguments.YAMLOptRecordPath,
+      file_types::TY_YAMLOptRecord, "",
+      defaultSupplementaryOutputPathExcludingExtension);
+  auto bitstreamOptRecordPath = determineSupplementaryOutputFilename(
+      OPT_save_optimization_record_path, pathsFromArguments.BitstreamOptRecordPath,
+      file_types::TY_BitstreamOptRecord, "",
       defaultSupplementaryOutputPathExcludingExtension);
 
   SupplementaryOutputPaths sop;
@@ -490,8 +506,10 @@ SupplementaryOutputPathsComputer::computeOutputPathsForOneInput(
   sop.ModuleInterfaceOutputPath = ModuleInterfaceOutputPath;
   sop.PrivateModuleInterfaceOutputPath = PrivateModuleInterfaceOutputPath;
   sop.ModuleSourceInfoOutputPath = moduleSourceInfoOutputPath;
-  sop.LdAddCFilePath = pathsFromArguments.LdAddCFilePath;
   sop.ModuleSummaryOutputPath = moduleSummaryOutputPath;
+  sop.ABIDescriptorOutputPath = ABIDescriptorOutputPath;
+  sop.YAMLOptRecordPath = YAMLOptRecordPath;
+  sop.BitstreamOptRecordPath = bitstreamOptRecordPath;
   return sop;
 }
 
@@ -574,6 +592,8 @@ createFromTypeToPathMap(const TypeToPathMap *map) {
       {file_types::TY_SwiftModuleSummaryFile, paths.ModuleSummaryOutputPath},
       {file_types::TY_PrivateSwiftModuleInterfaceFile,
        paths.PrivateModuleInterfaceOutputPath},
+      {file_types::TY_YAMLOptRecord, paths.YAMLOptRecordPath},
+      {file_types::TY_BitstreamOptRecord, paths.BitstreamOptRecordPath},
   };
   for (const std::pair<file_types::ID, std::string &> &typeAndString :
        typesAndStrings) {
@@ -596,8 +616,7 @@ SupplementaryOutputPathsComputer::readSupplementaryOutputFileMap() const {
         options::OPT_emit_module_interface_path,
         options::OPT_emit_private_module_interface_path,
         options::OPT_emit_module_source_info_path,
-        options::OPT_emit_tbd_path,
-        options::OPT_emit_ldadd_cfile_path)) {
+        options::OPT_emit_tbd_path)) {
     Diags.diagnose(SourceLoc(),
                    diag::error_cannot_have_supplementary_outputs,
                    A->getSpelling(), "-supplementary-output-file-map");

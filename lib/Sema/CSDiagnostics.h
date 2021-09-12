@@ -210,7 +210,7 @@ protected:
   /// within an argument application, returns the argument list for that
   /// application. If the locator is not for an argument application, or
   /// the argument list cannot be found, returns \c nullptr.
-  Expr *getArgumentListExprFor(ConstraintLocator *locator) const;
+  ArgumentList *getArgumentListFor(ConstraintLocator *locator) const;
 
   /// \returns A new type with all of the type variables associated with
   /// generic parameters substituted back into being generic parameter type.
@@ -633,9 +633,9 @@ public:
   /// Diagnose failed conversion in a `CoerceExpr`.
   bool diagnoseCoercionToUnrelatedType() const;
 
-  /// If we're trying to convert something of type "() -> T" to T,
-  /// then we probably meant to call the value.
-  bool diagnoseMissingFunctionCall() const;
+  /// Diagnose cases where a pattern tried to match associated values but
+  /// the enum case had none.
+  bool diagnoseExtraneousAssociatedValues() const;
 
   /// Produce a specialized diagnostic if this is an invalid conversion to Bool.
   bool diagnoseConversionToBool() const;
@@ -682,10 +682,6 @@ private:
   Type resolve(Type rawType) const {
     return resolveType(rawType)->getWithoutSpecifierType();
   }
-
-  /// Try to add a fix-it to convert a stored property into a computed
-  /// property
-  void tryComputedPropertyFixIts() const;
 
   bool isIntegerType(Type type) const {
     return conformsToKnownProtocol(
@@ -903,7 +899,7 @@ private:
                                                   asPG);
   }
 
-  bool exprNeedsParensAfterAddingAs(const Expr *expr, const Expr *rootExpr) {
+  bool exprNeedsParensAfterAddingAs(const Expr *expr) {
     auto *DC = getDC();
     auto asPG = TypeChecker::lookupPrecedenceGroup(
         DC, DC->getASTContext().Id_CastingPrecedence, SourceLoc()).getSingle();
@@ -911,7 +907,8 @@ private:
       return true;
 
     return exprNeedsParensOutsideFollowingOperator(
-        DC, const_cast<Expr *>(expr), const_cast<Expr *>(rootExpr), asPG);
+        DC, const_cast<Expr *>(expr), asPG,
+        [&](auto *E) { return findParentExpr(E); });
   }
 };
 
@@ -1045,6 +1042,10 @@ public:
 };
 
 class MissingCallFailure final : public FailureDiagnostic {
+  /// Try to add a fix-it to convert a stored property into a computed
+  /// property
+  void tryComputedPropertyFixIts() const;
+
 public:
   MissingCallFailure(const Solution &solution, ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
@@ -1388,6 +1389,8 @@ public:
     assert(!SynthesizedArgs.empty() && "No missing arguments?!");
   }
 
+  SourceLoc getLoc() const override;
+
   ASTNode getAnchor() const override;
 
   bool diagnoseAsError() override;
@@ -1411,10 +1414,8 @@ private:
   bool isPropertyWrapperInitialization() const;
 
   /// Gather information associated with expression that represents
-  /// a call - function, arguments, # of arguments and the position of
-  /// the first trailing closure.
-  std::tuple<Expr *, Expr *, unsigned, Optional<unsigned>>
-      getCallInfo(ASTNode anchor) const;
+  /// a call - function and argument list.
+  Optional<std::pair<Expr *, ArgumentList *>> getCallInfo(ASTNode anchor) const;
 
   /// Transform given argument into format suitable for a fix-it
   /// text e.g. `[<label>:]? <#<type#>`
@@ -1449,6 +1450,8 @@ public:
       : FailureDiagnostic(solution, locator),
         ContextualType(resolveType(contextualType)->castTo<FunctionType>()),
         ExtraArgs(extraArgs.begin(), extraArgs.end()) {}
+
+  SourceLoc getLoc() const override;
 
   bool diagnoseAsError() override;
   bool diagnoseAsNote() override;
@@ -1861,6 +1864,13 @@ public:
 
   bool diagnoseAsError() override;
   bool diagnoseAsNote() override;
+
+private:
+  /// Tailored diagnostics for an unsupported variable declaration.
+  bool diagnosePatternBinding(PatternBindingDecl *PB) const;
+
+  /// Tailored diagnostics for lazy/wrapped/computed variable declarations.
+  bool diagnoseStorage(VarDecl *var) const;
 };
 
 /// Diagnose situation when a single "tuple" parameter is given N arguments e.g.
@@ -1943,6 +1953,15 @@ public:
   /// function parameter, but keypath value don't match the function parameter
   /// result value.
   bool diagnoseKeyPathAsFunctionResultMismatch() const;
+
+  /// Situations like this:
+  ///
+  /// func foo(_: Int, _: String) {}
+  /// foo("")
+  ///
+  /// Are currently impossible to fix correctly,
+  /// so we have to attend to that in diagnostics.
+  bool diagnoseMisplacedMissingArgument() const;
 
 protected:
   /// \returns The position of the argument being diagnosed, starting at 1.
@@ -2028,15 +2047,6 @@ protected:
   ParameterTypeFlags getParameterFlagsAtIndex(unsigned idx) const {
     return Info.getParameterFlagsAtIndex(idx);
   }
-
-  /// Situations like this:
-  ///
-  /// func foo(_: Int, _: String) {}
-  /// foo("")
-  ///
-  /// Are currently impossible to fix correctly,
-  /// so we have to attend to that in diagnostics.
-  bool diagnoseMisplacedMissingArgument() const;
 };
 
 /// Replace a coercion ('as') with a runtime checked cast ('as!' or 'as?').
@@ -2398,6 +2408,21 @@ public:
   bool diagnoseAsError() override;
 };
 
+/// Diagnose situations where there is no context to determine the type of a
+/// placeholder, e.g.,
+///
+/// \code
+/// let _ = _.foo
+/// \endcode
+class CouldNotInferPlaceholderType final : public FailureDiagnostic {
+public:
+  CouldNotInferPlaceholderType(const Solution &solution,
+                               ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
 /// Diagnostic situations where AST node references an invalid declaration.
 ///
 /// \code
@@ -2559,6 +2584,25 @@ class InvalidMemberRefOnProtocolMetatype final : public FailureDiagnostic {
 public:
   InvalidMemberRefOnProtocolMetatype(const Solution &solution,
                                      ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose situations where `weak` attribute is used with a non-optional type
+/// in declaration e.g. `weak var x: <Type>`:
+///
+/// \code
+/// class X {
+/// }
+///
+/// weak var x: X = ...
+/// \endcode
+///
+/// `weak` declaration is required to use an optional type e.g. `X?`.
+class InvalidWeakAttributeUse final : public FailureDiagnostic {
+public:
+  InvalidWeakAttributeUse(const Solution &solution, ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
 
   bool diagnoseAsError() override;

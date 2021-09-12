@@ -23,6 +23,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/SourceManager.h"
 #include "swift/Basic/STLExtras.h"
 #include "RequirementMachine/RequirementMachine.h"
 #include <functional>
@@ -349,22 +350,36 @@ GenericSignatureImpl::getLocalRequirements(Type depType) const {
     auto rqmResult = computeViaRQM();
     auto gsbResult = computeViaGSB();
 
-    auto typesEqual = [&](Type lhs, Type rhs) {
+    auto typesEqual = [&](Type lhs, Type rhs, bool canonical) {
       if (!lhs || !rhs)
         return !lhs == !rhs;
-      return lhs->isEqual(rhs);
+      if (lhs->isEqual(rhs))
+        return true;
+
+      if (canonical)
+        return false;
+
+      if (getCanonicalTypeInContext(lhs) ==
+          getCanonicalTypeInContext(rhs))
+        return true;
+
+      return false;
     };
 
     auto compare = [&]() {
       // If the types are concrete, we don't care about the rest.
       if (gsbResult.concreteType || rqmResult.concreteType) {
-        if (!typesEqual(gsbResult.concreteType, rqmResult.concreteType))
+        if (!typesEqual(gsbResult.concreteType,
+                        rqmResult.concreteType,
+                        false))
           return false;
 
         return true;
       }
 
-      if (!typesEqual(gsbResult.anchor, rqmResult.anchor))
+      if (!typesEqual(gsbResult.anchor,
+                      rqmResult.anchor,
+                      true))
         return false;
 
       if (gsbResult.layout != rqmResult.layout)
@@ -376,6 +391,11 @@ GenericSignatureImpl::getLocalRequirements(Type depType) const {
       ProtocolType::canonicalizeProtocols(rhsProtos);
 
       if (lhsProtos != rhsProtos)
+        return false;
+
+      if (!typesEqual(gsbResult.superclass,
+                      rqmResult.superclass,
+                      false))
         return false;
 
       return true;
@@ -439,7 +459,7 @@ GenericSignatureImpl::lookupConformance(CanType type,
   if (type->isTypeParameter())
     return ProtocolConformanceRef(proto);
 
-  return M->lookupConformance(type, proto);
+  return M->lookupConformance(type, proto, /*allowMissing=*/true);
 }
 
 bool GenericSignatureImpl::requiresClass(Type type) const {
@@ -770,7 +790,11 @@ Type GenericSignatureImpl::getConcreteType(Type type) const {
     auto check = [&]() {
       if (!gsbResult || !rqmResult)
         return !gsbResult == !rqmResult;
-      return gsbResult->isEqual(rqmResult);
+      if (gsbResult->isEqual(rqmResult))
+        return true;
+
+      return (getCanonicalTypeInContext(gsbResult)
+              == getCanonicalTypeInContext(rqmResult));
     };
 
     if (!check()) {
@@ -873,15 +897,19 @@ bool GenericSignatureImpl::areSameTypeParameterInContext(Type type1,
     auto gsbResult = computeViaGSB();
 
     if (gsbResult != rqmResult) {
-      llvm::errs() << "RequirementMachine::areSameTypeParameterInContext() is broken\n";
-      llvm::errs() << "Generic signature: " << GenericSignature(this) << "\n";
-      llvm::errs() << "First dependent type: "; type1.dump(llvm::errs());
-      llvm::errs() << "Second dependent type: "; type2.dump(llvm::errs());
-      llvm::errs() << "\n";
-      llvm::errs() << "GenericSignatureBuilder says: " << gsbResult << "\n";
-      llvm::errs() << "RequirementMachine says: " << rqmResult << "\n";
-      getRequirementMachine()->dump(llvm::errs());
-      abort();
+      auto firstConcreteType = getConcreteType(type1);
+      auto secondConcreteType = getConcreteType(type2);
+      if (!firstConcreteType->isEqual(secondConcreteType)) {
+        llvm::errs() << "RequirementMachine::areSameTypeParameterInContext() is broken\n";
+        llvm::errs() << "Generic signature: " << GenericSignature(this) << "\n";
+        llvm::errs() << "First dependent type: "; type1.dump(llvm::errs());
+        llvm::errs() << "Second dependent type: "; type2.dump(llvm::errs());
+        llvm::errs() << "\n";
+        llvm::errs() << "GenericSignatureBuilder says: " << gsbResult << "\n";
+        llvm::errs() << "RequirementMachine says: " << rqmResult << "\n";
+        getRequirementMachine()->dump(llvm::errs());
+        abort();
+      }
     }
 
     return rqmResult;
@@ -914,7 +942,7 @@ bool GenericSignatureImpl::areSameTypeParameterInContext(Type type1,
 }
 
 bool GenericSignatureImpl::isRequirementSatisfied(
-    Requirement requirement) const {
+    Requirement requirement, bool allowMissing) const {
   if (requirement.getFirstType()->hasTypeParameter()) {
     auto *genericEnv = getGenericEnvironment();
 
@@ -936,7 +964,7 @@ bool GenericSignatureImpl::isRequirementSatisfied(
   // FIXME: Need to check conditional requirements here.
   ArrayRef<Requirement> conditionalRequirements;
 
-  return requirement.isSatisfied(conditionalRequirements);
+  return requirement.isSatisfied(conditionalRequirements, allowMissing);
 }
 
 SmallVector<Requirement, 4> GenericSignatureImpl::requirementsNotSatisfiedBy(
@@ -1278,31 +1306,6 @@ unsigned GenericSignatureImpl::getGenericParamOrdinal(
   return GenericParamKey(param).findIndexIn(getGenericParams());
 }
 
-bool GenericSignature::hasTypeVariable() const {
-  return GenericSignature::hasTypeVariable(getRequirements());
-}
-
-bool GenericSignature::hasTypeVariable(ArrayRef<Requirement> requirements) {
-  for (const auto &req : requirements) {
-    if (req.getFirstType()->hasTypeVariable())
-      return true;
-
-    switch (req.getKind()) {
-    case RequirementKind::Layout:
-      break;
-
-    case RequirementKind::Conformance:
-    case RequirementKind::SameType:
-    case RequirementKind::Superclass:
-      if (req.getSecondType()->hasTypeVariable())
-        return true;
-      break;
-    }
-  }
-
-  return false;
-}
-
 void GenericSignature::Profile(llvm::FoldingSetNodeID &id) const {
   return GenericSignature::Profile(id, getPointer()->getGenericParams(),
                                      getPointer()->getRequirements());
@@ -1368,12 +1371,14 @@ ProtocolDecl *Requirement::getProtocolDecl() const {
 }
 
 bool
-Requirement::isSatisfied(ArrayRef<Requirement> &conditionalRequirements) const {
+Requirement::isSatisfied(ArrayRef<Requirement> &conditionalRequirements,
+                         bool allowMissing) const {
   switch (getKind()) {
   case RequirementKind::Conformance: {
     auto *proto = getProtocolDecl();
     auto *module = proto->getParentModule();
-    auto conformance = module->lookupConformance(getFirstType(), proto);
+    auto conformance = module->lookupConformance(
+        getFirstType(), proto, allowMissing);
     if (!conformance)
       return false;
 
@@ -1429,4 +1434,286 @@ bool Requirement::canBeSatisfied() const {
   }
 
   llvm_unreachable("Bad requirement kind");
+}
+
+/// Determine the canonical ordering of requirements.
+static unsigned getRequirementKindOrder(RequirementKind kind) {
+  switch (kind) {
+  case RequirementKind::Conformance: return 2;
+  case RequirementKind::Superclass: return 0;
+  case RequirementKind::SameType: return 3;
+  case RequirementKind::Layout: return 1;
+  }
+  llvm_unreachable("unhandled kind");
+}
+
+/// Linear order on requirements in a generic signature.
+int Requirement::compare(const Requirement &other) const {
+  int compareLHS =
+    compareDependentTypes(getFirstType(), other.getFirstType());
+
+  if (compareLHS != 0)
+    return compareLHS;
+
+  int compareKind = (getRequirementKindOrder(getKind()) -
+                     getRequirementKindOrder(other.getKind()));
+
+  if (compareKind != 0)
+    return compareKind;
+
+  // We should only have multiple conformance requirements.
+  assert(getKind() == RequirementKind::Conformance);
+
+  int compareProtos =
+    TypeDecl::compare(getProtocolDecl(), other.getProtocolDecl());
+
+  assert(compareProtos != 0 && "Duplicate conformance requirement");
+  return compareProtos;
+}
+
+/// Compare two associated types.
+int swift::compareAssociatedTypes(AssociatedTypeDecl *assocType1,
+                                  AssociatedTypeDecl *assocType2) {
+  // - by name.
+  if (int result = assocType1->getName().str().compare(
+                                              assocType2->getName().str()))
+    return result;
+
+  // Prefer an associated type with no overrides (i.e., an anchor) to one
+  // that has overrides.
+  bool hasOverridden1 = !assocType1->getOverriddenDecls().empty();
+  bool hasOverridden2 = !assocType2->getOverriddenDecls().empty();
+  if (hasOverridden1 != hasOverridden2)
+    return hasOverridden1 ? +1 : -1;
+
+  // - by protocol, so t_n_m.`P.T` < t_n_m.`Q.T` (given P < Q)
+  auto proto1 = assocType1->getProtocol();
+  auto proto2 = assocType2->getProtocol();
+  if (int compareProtocols = TypeDecl::compare(proto1, proto2))
+    return compareProtocols;
+
+  // Error case: if we have two associated types with the same name in the
+  // same protocol, just tie-break based on source location.
+  if (assocType1 != assocType2) {
+    auto &ctx = assocType1->getASTContext();
+    return ctx.SourceMgr.isBeforeInBuffer(assocType1->getLoc(),
+                                          assocType2->getLoc()) ? -1 : +1;
+  }
+
+  return 0;
+}
+
+/// Canonical ordering for type parameters.
+int swift::compareDependentTypes(Type type1, Type type2) {
+  // Fast-path check for equality.
+  if (type1->isEqual(type2)) return 0;
+
+  // Ordering is as follows:
+  // - Generic params
+  auto gp1 = type1->getAs<GenericTypeParamType>();
+  auto gp2 = type2->getAs<GenericTypeParamType>();
+  if (gp1 && gp2)
+    return GenericParamKey(gp1) < GenericParamKey(gp2) ? -1 : +1;
+
+  // A generic parameter is always ordered before a nested type.
+  if (static_cast<bool>(gp1) != static_cast<bool>(gp2))
+    return gp1 ? -1 : +1;
+
+  // - Dependent members
+  auto depMemTy1 = type1->castTo<DependentMemberType>();
+  auto depMemTy2 = type2->castTo<DependentMemberType>();
+
+  // - by base, so t_0_n.`P.T` < t_1_m.`P.T`
+  if (int compareBases =
+        compareDependentTypes(depMemTy1->getBase(), depMemTy2->getBase()))
+    return compareBases;
+
+  // - by name, so t_n_m.`P.T` < t_n_m.`P.U`
+  if (int compareNames = depMemTy1->getName().str().compare(
+                                                  depMemTy2->getName().str()))
+    return compareNames;
+
+  auto *assocType1 = depMemTy1->getAssocType();
+  auto *assocType2 = depMemTy2->getAssocType();
+  if (int result = compareAssociatedTypes(assocType1, assocType2))
+    return result;
+
+  return 0;
+}
+
+void GenericSignature::verify() const {
+  auto canSig = getCanonicalSignature();
+
+  PrettyStackTraceGenericSignature debugStack("checking", canSig);
+
+  auto canonicalRequirements = canSig.getRequirements();
+
+  // We collect conformance requirements to check that they're minimal.
+  llvm::SmallDenseMap<CanType, SmallVector<ProtocolDecl *, 2>, 2> conformances;
+
+  // Check that the requirements satisfy certain invariants.
+  for (unsigned idx : indices(canonicalRequirements)) {
+    debugStack.setRequirement(idx);
+
+    const auto &reqt = canonicalRequirements[idx];
+
+    // Left-hand side must be a canonical type parameter.
+    if (reqt.getKind() != RequirementKind::SameType) {
+      if (!reqt.getFirstType()->isTypeParameter()) {
+        llvm::errs() << "Left-hand side must be a type parameter: ";
+        reqt.dump(llvm::errs());
+        llvm::errs() << "\n";
+        abort();
+      }
+
+      if (!canSig->isCanonicalTypeInContext(reqt.getFirstType())) {
+        llvm::errs() << "Left-hand side is not canonical: ";
+        reqt.dump(llvm::errs());
+        llvm::errs() << "\n";
+        abort();
+      }
+    }
+
+    // Check canonicalization of requirement itself.
+    switch (reqt.getKind()) {
+    case RequirementKind::Superclass:
+      if (!canSig->isCanonicalTypeInContext(reqt.getSecondType())) {
+        llvm::errs() << "Right-hand side is not canonical: ";
+        reqt.dump(llvm::errs());
+        llvm::errs() << "\n";
+        abort();
+      }
+      break;
+
+    case RequirementKind::Layout:
+      break;
+
+    case RequirementKind::SameType: {
+      auto isCanonicalAnchor = [&](Type type) {
+        if (auto *dmt = type->getAs<DependentMemberType>())
+          return canSig->isCanonicalTypeInContext(dmt->getBase());
+        return type->is<GenericTypeParamType>();
+      };
+
+      auto firstType = reqt.getFirstType();
+      auto secondType = reqt.getSecondType();
+      if (!isCanonicalAnchor(firstType)) {
+        llvm::errs() << "Left hand side does not have a canonical parent: ";
+        reqt.dump(llvm::errs());
+        llvm::errs() << "\n";
+        abort();
+      }
+
+      if (reqt.getSecondType()->isTypeParameter()) {
+        if (!isCanonicalAnchor(secondType)) {
+          llvm::errs() << "Right hand side does not have a canonical parent: ";
+          reqt.dump(llvm::errs());
+          llvm::errs() << "\n";
+          abort();
+        }
+        if (compareDependentTypes(firstType, secondType) >= 0) {
+          llvm::errs() << "Out-of-order type parameters: ";
+          reqt.dump(llvm::errs());
+          llvm::errs() << "\n";
+          abort();
+        }
+      } else {
+        if (!canSig->isCanonicalTypeInContext(secondType)) {
+          llvm::errs() << "Right hand side is not canonical: ";
+          reqt.dump(llvm::errs());
+          llvm::errs() << "\n";
+          abort();
+        }
+      }
+      break;
+    }
+
+    case RequirementKind::Conformance:
+      // Collect all conformance requirements on each type parameter.
+      conformances[CanType(reqt.getFirstType())].push_back(
+          reqt.getProtocolDecl());
+      break;
+    }
+
+    // From here on, we're only interested in requirements beyond the first.
+    if (idx == 0) continue;
+
+    // Make sure that the left-hand sides are in nondecreasing order.
+    const auto &prevReqt = canonicalRequirements[idx-1];
+    int compareLHS =
+      compareDependentTypes(prevReqt.getFirstType(), reqt.getFirstType());
+    if (compareLHS > 0) {
+      llvm::errs() << "Out-of-order left-hand side: ";
+      reqt.dump(llvm::errs());
+      llvm::errs() << "\n";
+      abort();
+    }
+
+    // If we have two same-type requirements where the left-hand sides differ
+    // but fall into the same equivalence class, we can check the form.
+    if (compareLHS < 0 && reqt.getKind() == RequirementKind::SameType &&
+        prevReqt.getKind() == RequirementKind::SameType &&
+        canSig->areSameTypeParameterInContext(prevReqt.getFirstType(),
+                                              reqt.getFirstType())) {
+      // If it's a it's a type parameter, make sure the equivalence class is
+      // wired together sanely.
+      if (prevReqt.getSecondType()->isTypeParameter()) {
+        if (!prevReqt.getSecondType()->isEqual(reqt.getFirstType())) {
+          llvm::errs() << "Same-type requirement within an equiv. class "
+                       << "is out-of-order: ";
+          reqt.dump(llvm::errs());
+          llvm::errs() << "\n";
+          abort();
+        }
+      } else {
+        // Otherwise, the concrete types must match up.
+        if (!prevReqt.getSecondType()->isEqual(reqt.getSecondType())) {
+          llvm::errs() << "Inconsistent concrete requirement in equiv. class: ";
+          reqt.dump(llvm::errs());
+          llvm::errs() << "\n";
+          abort();
+        }
+      }
+    }
+
+    // If we have a concrete same-type requirement, we shouldn't have any
+    // other requirements on the same type.
+    if (reqt.getKind() == RequirementKind::SameType &&
+        !reqt.getSecondType()->isTypeParameter()) {
+      if (compareLHS >= 0) {
+        llvm::errs() << "Concrete subject type should not have "
+                     << "any other requirements: ";
+        reqt.dump(llvm::errs());
+        llvm::errs() << "\n";
+        abort();
+      }
+    }
+
+    if (prevReqt.compare(reqt) >= 0) {
+      llvm::errs() << "Out-of-order requirement: ";
+      reqt.dump(llvm::errs());
+      llvm::errs() << "\n";
+      abort();
+    }
+  }
+
+  // Make sure we don't have redundant protocol conformance requirements.
+  for (auto pair : conformances) {
+    const auto &protos = pair.second;
+    auto canonicalProtos = protos;
+
+    // canonicalizeProtocols() will sort them and filter out any protocols that
+    // are refined by other protocols in the list. It should be a no-op at this
+    // point.
+    ProtocolType::canonicalizeProtocols(canonicalProtos);
+
+    if (protos.size() != canonicalProtos.size()) {
+      llvm::errs() << "Redundant conformance requirements in signature\n";
+      abort();
+    }
+    if (!std::equal(protos.begin(), protos.end(), canonicalProtos.begin())) {
+      llvm::errs() << "Out-of-order conformance requirements\n";
+      abort();
+    }
+  }
 }

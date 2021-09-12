@@ -642,6 +642,7 @@ private:
   
   /// The DWARF importer delegate, if installed.
   DWARFImporterDelegate *DWARFImporter = nullptr;
+
 public:
   /// Only used for testing.
   void setDWARFImporterDelegate(DWARFImporterDelegate &delegate);
@@ -1420,6 +1421,11 @@ public:
 
   void loadRequirementSignature(const ProtocolDecl *decl, uint64_t contextData,
                                 SmallVectorImpl<Requirement> &reqs) override {
+    llvm_unreachable("unimplemented for ClangImporter");
+  }
+
+  void loadAssociatedTypes(const ProtocolDecl *decl, uint64_t contextData,
+                           SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override {
     llvm_unreachable("unimplemented for ClangImporter");
   }
 

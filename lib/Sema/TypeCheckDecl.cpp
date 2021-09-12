@@ -445,14 +445,6 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
       }
     }
 
-    // the init(transport:) initializer of a distributed actor is special, as
-    // it ties the actors lifecycle with the transport. As such, it must always
-    // be invoked by any other initializer, just like a designated initializer.
-    if (auto clazz = dyn_cast<ClassDecl>(decl->getDeclContext())) {
-      if (clazz->isDistributedActor() && decl->isDistributedActorLocalInit())
-        return CtorInitializerKind::Designated;
-    }
-
     if (decl->getDeclContext()->getExtendedProtocolDecl()) {
       return CtorInitializerKind::Convenience;
     }
@@ -490,14 +482,16 @@ BodyInitKindRequest::evaluate(Evaluator &evaluator,
       if (!apply)
         return { true, E };
 
+      auto *argList = apply->getArgs();
       auto Callee = apply->getSemanticFn();
       
       Expr *arg;
 
       if (isa<OtherConstructorDeclRefExpr>(Callee)) {
-        arg = apply->getArg();
+        arg = argList->getUnaryExpr();
+        assert(arg);
       } else if (auto *CRE = dyn_cast<ConstructorRefCallExpr>(Callee)) {
-        arg = CRE->getArg();
+        arg = CRE->getBase();
       } else if (auto *dotExpr = dyn_cast<UnresolvedDotExpr>(Callee)) {
         if (dotExpr->getName().getBaseName() != DeclBaseName::createConstructor())
           return { true, E };
@@ -674,34 +668,6 @@ ExistentialConformsToSelfRequest::evaluate(Evaluator &evaluator,
   // Check whether any of the inherited protocols fail to conform to themselves.
   for (auto proto : decl->getInheritedProtocols()) {
     if (!proto->existentialConformsToSelf())
-      return false;
-  }
-
-  return true;
-}
-
-bool
-ExistentialTypeSupportedRequest::evaluate(Evaluator &evaluator,
-                                          ProtocolDecl *decl) const {
-  // ObjC protocols can always be existential.
-  if (decl->isObjC())
-    return true;
-
-  for (auto member : decl->getMembers()) {
-    // Existential types cannot be used if the protocol has an associated type.
-    if (isa<AssociatedTypeDecl>(member))
-      return false;
-
-    // For value members, look at their type signatures.
-    if (auto valueMember = dyn_cast<ValueDecl>(member)) {
-      if (!decl->isAvailableInExistential(valueMember))
-        return false;
-    }
-  }
-
-  // Check whether all of the inherited protocols support existential types.
-  for (auto proto : decl->getInheritedProtocols()) {
-    if (!proto->existentialTypeSupported())
       return false;
   }
 
@@ -1524,46 +1490,6 @@ TypeChecker::lookupPrecedenceGroup(DeclContext *dc, Identifier name,
   return PrecedenceGroupLookupResult(dc, name, std::move(groups));
 }
 
-static NominalTypeDecl *resolveSingleNominalTypeDecl(
-    DeclContext *DC, SourceLoc loc, Identifier ident, ASTContext &Ctx,
-    TypeResolutionFlags flags = TypeResolutionFlags(0)) {
-  auto *TyR = new (Ctx) SimpleIdentTypeRepr(DeclNameLoc(loc),
-                                            DeclNameRef(ident));
-
-  const auto options =
-      TypeResolutionOptions(TypeResolverContext::TypeAliasDecl) | flags;
-
-  const auto result =
-      TypeResolution::forInterface(DC, options,
-                                   // FIXME: Should unbound generics be allowed
-                                   // to appear amongst designated types?
-                                   /*unboundTyOpener*/ nullptr,
-                                   /*placeholderHandler*/ nullptr)
-          .resolveType(TyR);
-
-  if (result->hasError())
-    return nullptr;
-  return result->getAnyNominal();
-}
-
-bool swift::checkDesignatedTypes(OperatorDecl *OD,
-                                 ArrayRef<Located<Identifier>> identifiers) {
-  auto &ctx = OD->getASTContext();
-  auto *DC = OD->getDeclContext();
-
-  SmallVector<NominalTypeDecl *, 1> designatedNominalTypes;
-  for (auto ident : identifiers) {
-    auto *decl = resolveSingleNominalTypeDecl(DC, ident.Loc, ident.Item, ctx);
-    if (!decl)
-      return true;
-
-    designatedNominalTypes.push_back(decl);
-  }
-
-  OD->setDesignatedNominalTypes(ctx.AllocateCopy(designatedNominalTypes));
-  return false;
-}
-
 /// Validate the given operator declaration.
 ///
 /// This establishes key invariants, such as an InfixOperatorDecl's
@@ -1575,49 +1501,26 @@ OperatorPrecedenceGroupRequest::evaluate(Evaluator &evaluator,
   auto &ctx = IOD->getASTContext();
   auto *dc = IOD->getDeclContext();
 
-  auto enableOperatorDesignatedTypes =
-      ctx.TypeCheckerOpts.EnableOperatorDesignatedTypes;
-
-  PrecedenceGroupDecl *group = nullptr;
-
-  auto identifiers = IOD->getIdentifiers();
-  if (!identifiers.empty()) {
-    auto name = identifiers[0].Item;
-    auto loc = identifiers[0].Loc;
-
-    auto canResolveType = [&]() -> bool {
-      return enableOperatorDesignatedTypes &&
-             resolveSingleNominalTypeDecl(dc, loc, name, ctx,
-                                          TypeResolutionFlags::SilenceErrors);
-    };
-
-    // Make sure not to diagnose in the case where we failed to find a
-    // precedencegroup, but we could resolve a type instead.
+  auto name = IOD->getPrecedenceGroupName();
+  if (!name.empty()) {
+    auto loc = IOD->getPrecedenceGroupLoc();
     auto groups = TypeChecker::lookupPrecedenceGroup(dc, name, loc);
-    if (groups.hasResults() || !canResolveType()) {
-      group = groups.getSingleOrDiagnose(loc);
-      identifiers = identifiers.slice(1);
-    }
+
+    if (groups.hasResults() ||
+        !ctx.TypeCheckerOpts.EnableOperatorDesignatedTypes)
+      return groups.getSingleOrDiagnose(loc);
+
+    // We didn't find the named precedence group and designated types are
+    // enabled, so we will assume that it was actually a designated type. Warn
+    // and fall through as though `PrecedenceGroupName` had never been set.
+    ctx.Diags.diagnose(IOD->getColonLoc(),
+                       diag::operator_decl_remove_designated_types)
+        .fixItRemove({IOD->getColonLoc(), loc});
   }
 
-  // Unless operator designed types are enabled, the parser will ensure that
-  // only one identifier is allowed in the clause, which we should have just
-  // handled.
-  assert(identifiers.empty() || enableOperatorDesignatedTypes);
-
-  if (!group) {
-    auto groups = TypeChecker::lookupPrecedenceGroup(
-        dc, ctx.Id_DefaultPrecedence, SourceLoc());
-    group = groups.getSingleOrDiagnose(IOD->getLoc(), /*forBuiltin*/ true);
-  }
-
-  auto nominalTypes = IOD->getDesignatedNominalTypes();
-  if (nominalTypes.empty() && enableOperatorDesignatedTypes) {
-    if (checkDesignatedTypes(IOD, identifiers)) {
-      IOD->setInvalid();
-    }
-  }
-  return group;
+  auto groups = TypeChecker::lookupPrecedenceGroup(
+      dc, ctx.Id_DefaultPrecedence, SourceLoc());
+  return groups.getSingleOrDiagnose(IOD->getLoc(), /*forBuiltin*/ true);
 }
 
 SelfAccessKind
@@ -2006,7 +1909,7 @@ bool swift::isMemberOperator(FuncDecl *decl, Type type) {
   auto selfNominal = DC->getSelfNominalTypeDecl();
 
   // Check the parameters for a reference to 'Self'.
-  bool isProtocol = selfNominal && isa<ProtocolDecl>(selfNominal);
+  bool isProtocol = isa_and_nonnull<ProtocolDecl>(selfNominal);
   for (auto param : *decl->getParameters()) {
     // Look through a metatype reference, if there is one.
     auto paramType = param->getInterfaceType()->getMetatypeInstanceType();
@@ -2084,6 +1987,13 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     resultTyRepr = funcDecl->getResultTypeRepr();
   } else {
     resultTyRepr = cast<SubscriptDecl>(decl)->getElementTypeRepr();
+  }
+
+  if (!resultTyRepr && decl->getClangDecl() &&
+      isa<clang::FunctionDecl>(decl->getClangDecl())) {
+    auto clangFn = cast<clang::FunctionDecl>(decl->getClangDecl());
+    return ctx.getClangModuleLoader()->importFunctionReturnType(
+        clangFn, decl->getDeclContext());
   }
 
   // Nothing to do if there's no result type.
@@ -2197,7 +2107,9 @@ static Type validateParameterType(ParamDecl *decl) {
     };
     // FIXME: Don't let placeholder types escape type resolution.
     // For now, just return the placeholder type.
-    placeholderHandler = PlaceholderType::get;
+    placeholderHandler = [](auto &ctx, auto *originator) {
+      return Type();
+    };
   } else if (isa<AbstractFunctionDecl>(dc)) {
     options = TypeResolutionOptions(TypeResolverContext::AbstractFunctionDecl);
   } else if (isa<SubscriptDecl>(dc)) {
@@ -2229,9 +2141,10 @@ static Type validateParameterType(ParamDecl *decl) {
   }
 
   if (decl->isVariadic()) {
-    Ty = TypeChecker::getArraySliceType(decl->getStartLoc(), Ty);
-    if (Ty->hasError()) {
-      decl->setInvalid();
+    Ty = VariadicSequenceType::get(Ty);
+    if (!ctx.getArrayDecl()) {
+      ctx.Diags.diagnose(decl->getTypeRepr()->getLoc(),
+                         diag::sugar_type_not_found, 0);
       return ErrorType::get(ctx);
     }
 
@@ -2705,6 +2618,10 @@ static ArrayRef<Decl *> evaluateMembersRequest(
         (void) var->getPropertyWrapperAuxiliaryVariables();
         (void) var->getPropertyWrapperInitializerInfo();
       }
+
+      if (auto *func = dyn_cast<FuncDecl>(member)) {
+        (void) func->getDistributedActorRemoteFuncDecl();
+      }
     }
   }
 
@@ -2830,7 +2747,9 @@ ExtendedTypeRequest::evaluate(Evaluator &eval, ExtensionDecl *ext) const {
       },
       // FIXME: Don't let placeholder types escape type resolution.
       // For now, just return the placeholder type.
-      PlaceholderType::get);
+      [](auto &ctx, auto *originator) {
+        return Type();
+      });
 
   const auto extendedType = resolution.resolveType(extendedRepr);
 

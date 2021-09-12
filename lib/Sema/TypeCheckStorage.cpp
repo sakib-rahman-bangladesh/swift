@@ -128,8 +128,7 @@ static void computeLoweredStoredProperties(NominalTypeDecl *decl) {
 
       if (auto actorProto = ctx.getProtocol(KnownProtocolKind::Actor)) {
         SmallVector<ProtocolConformance *, 1> conformances;
-        classDecl->lookupConformance(
-            decl->getModuleContext(), actorProto, conformances);
+        classDecl->lookupConformance(actorProto, conformances);
         for (auto conformance : conformances)
           TypeChecker::checkConformance(conformance->getRootNormalConformance());
       }
@@ -138,8 +137,7 @@ static void computeLoweredStoredProperties(NominalTypeDecl *decl) {
       if (classDecl->isDistributedActor()) {
         if (auto actorProto = ctx.getProtocol(KnownProtocolKind::DistributedActor)) {
           SmallVector<ProtocolConformance *, 1> conformances;
-          classDecl->lookupConformance(
-              decl->getModuleContext(), actorProto, conformances);
+          classDecl->lookupConformance(actorProto, conformances);
           for (auto conformance : conformances)
             TypeChecker::checkConformance(conformance->getRootNormalConformance());
         }
@@ -267,6 +265,7 @@ PatternBindingEntryRequest::evaluate(Evaluator &eval,
   // If the pattern contains some form of unresolved type, we'll need to
   // check the initializer.
   if (patternType->hasUnresolvedType() ||
+      patternType->hasPlaceholder() ||
       patternType->hasUnboundGenericType()) {
     if (TypeChecker::typeCheckPatternBinding(binding, entryNumber,
                                              patternType)) {
@@ -546,11 +545,10 @@ static bool doesAccessorHaveBody(AccessorDecl *accessor) {
   return true;
 }
 
-
-/// Build a reference to the subscript index variables for this subscript
-/// accessor.
-static Expr *buildSubscriptIndexReference(ASTContext &ctx,
-                                          AccessorDecl *accessor) {
+/// Build an argument list referencing the subscript parameters for this
+/// subscript accessor.
+static ArgumentList *buildSubscriptArgumentList(ASTContext &ctx,
+                                                AccessorDecl *accessor) {
   // Pull out the body parameters, which we should have cloned
   // previously to be forwardable.  Drop the initial buffer/value
   // parameter in accessors that have one.
@@ -562,8 +560,8 @@ static Expr *buildSubscriptIndexReference(ASTContext &ctx,
     params = params.slice(1);
   }
 
-  // Okay, everything else should be forwarded, build the expression.
-  return buildArgumentForwardingExpr(params, ctx);
+  // Okay, everything else should be forwarded, build the argument list.
+  return buildForwardingArgumentList(params, ctx);
 }
 
 namespace {
@@ -931,11 +929,11 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
                                            /*hasLeadingDot=*/true);
     Expr *args[3] = {selfDRE, propertyKeyPath, storageKeyPath};
 
-    SubscriptDecl *subscriptDecl = enclosingSelfAccess->subscript;
-    lookupExpr = SubscriptExpr::create(
-        ctx, wrapperMetatype, SourceLoc(), args,
-        subscriptDecl->getName().getArgumentNames(), { }, SourceLoc(),
-        /*trailingClosures=*/{}, subscriptDecl, /*Implicit=*/true);
+    auto *subscriptDecl = enclosingSelfAccess->subscript;
+    auto argList =
+        ArgumentList::forImplicitCallTo(subscriptDecl->getIndices(), args, ctx);
+    lookupExpr = SubscriptExpr::create(ctx, wrapperMetatype, argList,
+                                       subscriptDecl, /*Implicit=*/true);
 
     // FIXME: Since we're not resolving overloads or anything, we should be
     // building fully type-checked AST above; we already have all the
@@ -955,8 +953,8 @@ static Expr *buildStorageReference(AccessorDecl *accessor,
       }
     }
   } else if (isa<SubscriptDecl>(storage)) {
-    Expr *indices = buildSubscriptIndexReference(ctx, accessor);
-    lookupExpr = SubscriptExpr::create(ctx, selfDRE, indices, memberRef,
+    auto *argList = buildSubscriptArgumentList(ctx, accessor);
+    lookupExpr = SubscriptExpr::create(ctx, selfDRE, argList, memberRef,
                                        /*IsImplicit=*/true, semantics);
 
     if (selfAccessKind == SelfAccessorKind::Super)
@@ -1076,7 +1074,7 @@ static Expr *synthesizeCopyWithZoneCall(Expr *Val, VarDecl *VD,
   // Drop the self type
   copyMethodType = copyMethodType->getResult()->castTo<FunctionType>();
 
-  auto DSCE = new (Ctx) DotSyntaxCallExpr(DRE, SourceLoc(), Val);
+  auto DSCE = DotSyntaxCallExpr::create(Ctx, DRE, SourceLoc(), Val);
   DSCE->setImplicit();
   DSCE->setType(copyMethodType);
   DSCE->setThrows(false);
@@ -1084,7 +1082,9 @@ static Expr *synthesizeCopyWithZoneCall(Expr *Val, VarDecl *VD,
   Expr *Nil = new (Ctx) NilLiteralExpr(SourceLoc(), /*implicit*/true);
   Nil->setType(copyMethodType->getParams()[0].getParameterType());
 
-  auto *Call = CallExpr::createImplicit(Ctx, DSCE, { Nil }, { Ctx.Id_with });
+  auto *argList =
+      ArgumentList::forImplicitCallTo(copyMethod->getParameters(), {Nil}, Ctx);
+  auto *Call = CallExpr::createImplicit(Ctx, DSCE, argList);
   Call->setType(copyMethodType->getResult());
   Call->setThrows(false);
 
@@ -1561,7 +1561,7 @@ synthesizeObservedSetterBody(AccessorDecl *Set, TargetImpl target,
       auto *SelfDRE =
           buildSelfReference(SelfDecl, SelfAccessorKind::Peer, IsSelfLValue);
       SelfDRE = maybeWrapInOutExpr(SelfDRE, Ctx);
-      auto *DSCE = new (Ctx) DotSyntaxCallExpr(Callee, SourceLoc(), SelfDRE);
+      auto *DSCE = DotSyntaxCallExpr::create(Ctx, Callee, SourceLoc(), SelfDRE);
 
       if (auto funcType = type->getAs<FunctionType>())
         type = funcType->getResult();
@@ -1572,9 +1572,10 @@ synthesizeObservedSetterBody(AccessorDecl *Set, TargetImpl target,
 
     CallExpr *Call = nullptr;
     if (arg) {
-      Call = CallExpr::createImplicit(Ctx, Callee, {ValueDRE}, {Identifier()});
+      auto *argList = ArgumentList::forImplicitUnlabeled(Ctx, {ValueDRE});
+      Call = CallExpr::createImplicit(Ctx, Callee, argList);
     } else {
-      Call = CallExpr::createImplicit(Ctx, Callee, {}, {});
+      Call = CallExpr::createImplicitEmpty(Ctx, Callee);
     }
 
     if (auto funcType = type->getAs<FunctionType>())
@@ -1742,7 +1743,7 @@ synthesizeModifyCoroutineBodyWithSimpleDidSet(AccessorDecl *accessor,
       auto *SelfDRE = buildSelfReference(SelfDecl, SelfAccessorKind::Peer,
                                          storage->isSetterMutating());
       SelfDRE = maybeWrapInOutExpr(SelfDRE, ctx);
-      auto *DSCE = new (ctx) DotSyntaxCallExpr(Callee, SourceLoc(), SelfDRE);
+      auto *DSCE = DotSyntaxCallExpr::create(ctx, Callee, SourceLoc(), SelfDRE);
 
       if (auto funcType = type->getAs<FunctionType>())
         type = funcType->getResult();
@@ -1751,7 +1752,7 @@ synthesizeModifyCoroutineBodyWithSimpleDidSet(AccessorDecl *accessor,
       Callee = DSCE;
     }
 
-    auto *Call = CallExpr::createImplicit(ctx, Callee, {}, {});
+    auto *Call = CallExpr::createImplicitEmpty(ctx, Callee);
     if (auto funcType = type->getAs<FunctionType>())
       type = funcType->getResult();
     Call->setType(type);
@@ -2586,31 +2587,24 @@ static VarDecl *synthesizePropertyWrapperProjectionVar(
 
 static void typeCheckSynthesizedWrapperInitializer(VarDecl *wrappedVar,
                                                    Expr *&initializer) {
-  // Figure out the context in which the initializer was written.
-  auto *parentPBD = wrappedVar->getParentPatternBinding();
-  auto i = parentPBD->getPatternEntryIndexForVarDecl(wrappedVar);
-  DeclContext *originalDC = parentPBD->getDeclContext();
-  if (!originalDC->isLocalContext()) {
-    auto initContext =
-        cast_or_null<PatternBindingInitializer>(parentPBD->getInitContext(i));
-    if (initContext)
-      originalDC = initContext;
-  }
+  auto *dc = wrappedVar->getInnermostDeclContext();
+  auto &ctx = wrappedVar->getASTContext();
+  auto *initContext = new (ctx) PropertyWrapperInitializer(
+      dc, wrappedVar, PropertyWrapperInitializer::Kind::WrappedValue);
 
   // Type-check the initialization.
-  auto *pattern = parentPBD->getPattern(i);
-  TypeChecker::typeCheckBinding(pattern, initializer, originalDC,
-                                wrappedVar->getType(), parentPBD, i);
+  using namespace constraints;
+  auto target = SolutionApplicationTarget::forPropertyWrapperInitializer(
+      wrappedVar, initContext, initializer);
+  auto result = TypeChecker::typeCheckExpression(target);
+  if (!result)
+    return;
 
-  if (auto initializerContext =
-          dyn_cast_or_null<Initializer>(parentPBD->getInitContext(i))) {
-    TypeChecker::contextualizeInitializer(initializerContext, initializer);
-  }
+  initializer = result->getAsExpr();
 
-  auto *backingVar = wrappedVar->getPropertyWrapperBackingProperty();
-  auto *backingPBD = backingVar->getParentPatternBinding();
-  checkPropertyWrapperActorIsolation(backingPBD, initializer);
-  TypeChecker::checkPropertyWrapperEffects(backingPBD, initializer);
+  TypeChecker::contextualizeInitializer(initContext, initializer);
+  checkPropertyWrapperActorIsolation(wrappedVar, initializer);
+  TypeChecker::checkInitializerEffects(initContext, initializer);
 }
 
 static PropertyWrapperMutability::Value
@@ -2881,16 +2875,17 @@ PropertyWrapperInitializerInfoRequest::evaluate(Evaluator &evaluator,
         && parentPBD->isDefaultInitializable(patternNumber)
         && !wrapperInfo.defaultInit) {
       auto ty = parentPBD->getPattern(patternNumber)->getType();
-      if (auto defaultInit = TypeChecker::buildDefaultInitializer(ty))
-        parentPBD->setInit(patternNumber, defaultInit);
-    }
-
-    if (parentPBD->isInitialized(patternNumber) &&
-        !parentPBD->isInitializerChecked(patternNumber)) {
-      TypeChecker::typeCheckPatternBinding(parentPBD, patternNumber);
+      if (auto defaultInit = TypeChecker::buildDefaultInitializer(ty)) {
+        typeCheckSynthesizedWrapperInitializer(var, defaultInit);
+        parentPBD->setInit(0, defaultInit);
+        parentPBD->setInitializerChecked(0);
+      }
     }
 
     if ((initializer = parentPBD->getInit(patternNumber))) {
+      assert(parentPBD->isInitializerChecked(0) &&
+             "Initializer should to be type-checked");
+
       pbd->setInit(0, initializer);
       pbd->setInitializerChecked(0);
       wrappedValue = findWrappedValuePlaceholder(initializer);
@@ -2969,21 +2964,7 @@ PropertyWrapperInitializerInfoRequest::evaluate(Evaluator &evaluator,
              !var->getName().hasDollarPrefix()) {
     wrappedValueInit = PropertyWrapperValuePlaceholderExpr::create(
         ctx, var->getSourceRange(), var->getType(), /*wrappedValue=*/nullptr);
-
-    if (auto *param = dyn_cast<ParamDecl>(var)) {
-      wrappedValueInit = buildPropertyWrapperInitCall(
-          var, storageType, wrappedValueInit, PropertyWrapperInitKind::WrappedValue);
-      TypeChecker::typeCheckExpression(wrappedValueInit, dc);
-
-      // Check initializer effects.
-      auto *initContext = new (ctx) PropertyWrapperInitializer(
-          dc, param, PropertyWrapperInitializer::Kind::WrappedValue);
-      TypeChecker::contextualizeInitializer(initContext, wrappedValueInit);
-      checkInitializerActorIsolation(initContext, wrappedValueInit);
-      TypeChecker::checkInitializerEffects(initContext, wrappedValueInit);
-    } else {
-      typeCheckSynthesizedWrapperInitializer(var, wrappedValueInit);
-    }
+    typeCheckSynthesizedWrapperInitializer(var, wrappedValueInit);
   }
 
   return PropertyWrapperInitializerInfo(wrappedValueInit, projectedValueInit);

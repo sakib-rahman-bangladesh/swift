@@ -157,6 +157,7 @@ LayoutConstraint Parser::parseLayoutConstraint(Identifier LayoutConstraintID) {
 ///     type-simple '!'
 ///     type-collection
 ///     type-array
+///     '_'
 ParserResult<TypeRepr> Parser::parseTypeSimple(
     Diag<> MessageID, ParseTypeReason reason) {
   ParserResult<TypeRepr> ty;
@@ -189,6 +190,9 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
     ty = parseTypeCollection();
     break;
   }
+  case tok::kw__:
+    ty = makeParserResult(new (Context) PlaceholderTypeRepr(consumeToken()));
+    break;
   case tok::kw_protocol:
     if (startsWithLess(peekToken())) {
       ty = parseOldStyleProtocolComposition();
@@ -550,7 +554,7 @@ ParserResult<TypeRepr> Parser::parseType(
 
 ParserResult<TypeRepr> Parser::parseTypeWithOpaqueParams(Diag<> MessageID) {
   GenericParamList *genericParams = nullptr;
-  if (Context.LangOpts.EnableExperimentalOpaqueReturnTypes) {
+  if (Context.LangOpts.EnableExperimentalNamedOpaqueTypes) {
     auto result = maybeParseGenericParams();
     genericParams = result.getPtrOrNull();
     if (result.hasCodeCompletion())
@@ -1038,13 +1042,6 @@ ParserResult<TypeRepr> Parser::parseTypeTupleBody() {
       Backtracking.emplace(*this);
       ObsoletedInOutLoc = consumeToken(tok::kw_inout);
     }
-                                    
-    // If the label is "some", this could end up being an opaque type
-    // description if there's `some <identifier>` without a following colon,
-    // so we may need to backtrack as well.
-    if (Tok.isContextualKeyword("some")) {
-      Backtracking.emplace(*this);
-    }
 
     // If the tuple element starts with a potential argument label followed by a
     // ':' or another potential argument label, then the identifier is an
@@ -1475,6 +1472,9 @@ bool Parser::canParseType() {
     }
     if (!consumeIf(tok::r_square))
       return false;
+    break;
+  case tok::kw__:
+    consumeToken();
     break;
 
 

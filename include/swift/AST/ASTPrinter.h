@@ -48,6 +48,8 @@ enum class PrintNameContext {
   Normal,
   /// Keyword context, where no keywords are escaped.
   Keyword,
+  /// Keyword for introducing a declarations e.g. 'func', 'struct'.
+  IntroducerKeyword,
   /// Type member context, e.g. properties or enum cases.
   TypeMember,
   /// Generic parameter context, where 'Self' is not escaped.
@@ -84,6 +86,20 @@ enum class PrintStructureKind {
   TupleElement,
   NumberLiteral,
   StringLiteral,
+  /// ' = defaultValue'.
+  DefaultArgumentClause,
+  /// '<T, U: Requirement>'.
+  DeclGenericParameterClause,
+  /// 'where T: Collection, T.Element: Equtable'.
+  DeclGenericRequirementClause,
+  /// ' async throws'.
+  EffectsSpecifiers,
+  /// ' -> ResultTy' or ': ResultTy'.
+  DeclResultTypeClause,
+  /// '(a: Int, b param: String)' in function declarations.
+  FunctionParameterList,
+  /// '@attribute ParamTy...' in parameter declarations.
+  FunctionParameterType,
 };
 
 /// An abstract class used to print an AST.
@@ -214,6 +230,17 @@ public:
     callPrintNamePre(PrintNameContext::Keyword);
     *this << name;
     printNamePost(PrintNameContext::Keyword);
+    *this << Suffix;
+  }
+
+  void printIntroducerKeyword(StringRef name,
+                              const PrintOptions &Opts,
+                              StringRef Suffix = "") {
+    if (Opts.SkipIntroducerKeywords)
+      return;
+    callPrintNamePre(PrintNameContext::IntroducerKeyword);
+    *this << name;
+    printNamePost(PrintNameContext::IntroducerKeyword);
     *this << Suffix;
   }
 

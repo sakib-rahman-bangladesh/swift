@@ -574,12 +574,14 @@ AbstractionPattern AbstractionPattern::getFunctionResultType() const {
         // If there's a single argument, abstract it according to its formal type
         // in the ObjC signature.
         unsigned callbackResultIndex = 0;
-        if (callbackErrorIndex && callbackResultIndex >= *callbackErrorIndex)
-          ++callbackResultIndex;
-        if (callbackErrorFlagIndex
-            && callbackResultIndex >= *callbackErrorFlagIndex)
-          ++callbackResultIndex;
-
+        for (auto index : indices(callbackParamTy->getParamTypes())) {
+          if (callbackErrorIndex && index == *callbackErrorIndex)
+            continue;
+          if (callbackErrorFlagIndex && index == *callbackErrorFlagIndex)
+            continue;
+          callbackResultIndex = index;
+          break;
+        }
         auto clangResultType = callbackParamTy
           ->getParamType(callbackResultIndex)
           .getTypePtr();
@@ -1229,5 +1231,157 @@ AbstractionPattern AbstractionPattern::getAutoDiffDerivativeFunctionType(
     return getOpaqueDerivativeFunction();
   default:
     llvm_unreachable("called on unsupported abstraction pattern kind");
+  }
+}
+
+AbstractionPattern::CallingConventionKind
+AbstractionPattern::getResultConvention(TypeConverter &TC) const {
+  // Tuples should be destructured.
+  if (isTuple()) {
+    return Destructured;
+  }
+  switch (getKind()) {
+  case Kind::Opaque:
+    // Maximally abstracted values are always passed indirectly.
+    return Indirect;
+  
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::ObjCMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::CXXOperatorMethodType:
+  case Kind::CurriedCXXOperatorMethodType:
+  case Kind::PartialCurriedCXXOperatorMethodType:
+    // Function types are always passed directly
+    return Direct;
+      
+  case Kind::ClangType:
+  case Kind::Type:
+  case Kind::Discard:
+    // Pass according to the formal type.
+    return SILType::isFormallyReturnedIndirectly(getType(),
+                                                 TC,
+                                                 getGenericSignatureOrNull())
+      ? Indirect : Direct;
+  
+  case Kind::Invalid:
+  case Kind::Tuple:
+  case Kind::ObjCCompletionHandlerArgumentsType:
+    llvm_unreachable("should not get here");
+  }
+}
+
+AbstractionPattern::CallingConventionKind
+AbstractionPattern::getParameterConvention(TypeConverter &TC) const {
+  // Tuples should be destructured.
+  if (isTuple()) {
+    return Destructured;
+  }
+  switch (getKind()) {
+  case Kind::Opaque:
+    // Maximally abstracted values are always passed indirectly.
+    return Indirect;
+  
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+  case Kind::PartialCurriedObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::ObjCMethodType:
+  case Kind::CXXMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::CXXOperatorMethodType:
+  case Kind::CurriedCXXOperatorMethodType:
+  case Kind::PartialCurriedCXXOperatorMethodType:
+    // Function types are always passed directly
+    return Direct;
+      
+  case Kind::ClangType:
+  case Kind::Type:
+  case Kind::Discard:
+    // Pass according to the formal type.
+    return SILType::isFormallyPassedIndirectly(getType(),
+                                                 TC,
+                                                 getGenericSignatureOrNull())
+      ? Indirect : Direct;
+  
+  case Kind::Invalid:
+  case Kind::Tuple:
+  case Kind::ObjCCompletionHandlerArgumentsType:
+    llvm_unreachable("should not get here");
+  }
+}
+
+bool
+AbstractionPattern::operator==(const AbstractionPattern &other) const {
+  if (TheKind != other.TheKind)
+    return false;
+  
+  switch (getKind()) {
+  case Kind::Opaque:
+  case Kind::Invalid:
+  case Kind::OpaqueFunction:
+  case Kind::OpaqueDerivativeFunction:
+    // No additional info to compare.
+    return true;
+
+  case Kind::Tuple:
+    if (getNumTupleElements() != other.getNumTupleElements()) {
+      return false;
+    }
+    for (unsigned i = 0; i < getNumTupleElements(); ++i) {
+      if (getTupleElementType(i) != other.getTupleElementType(i)) {
+        return false;
+      }
+    }
+    return true;
+  
+  case Kind::Type:
+  case Kind::Discard:
+    return OrigType == other.OrigType
+      && GenericSig == other.GenericSig;
+      
+  case Kind::ClangType:
+    return OrigType == other.OrigType
+      && GenericSig == other.GenericSig
+      && ClangType == other.ClangType;
+
+  case Kind::ObjCCompletionHandlerArgumentsType:
+  case Kind::CFunctionAsMethodType:
+  case Kind::CurriedCFunctionAsMethodType:
+  case Kind::PartialCurriedCFunctionAsMethodType:
+    return OrigType == other.OrigType
+      && GenericSig == other.GenericSig
+      && ClangType == other.ClangType
+      && OtherData == other.OtherData;
+
+  case Kind::ObjCMethodType:
+  case Kind::CurriedObjCMethodType:
+  case Kind::PartialCurriedObjCMethodType:
+    return OrigType == other.OrigType
+      && GenericSig == other.GenericSig
+      && ObjCMethod == other.ObjCMethod
+      && OtherData == other.OtherData;
+      
+  case Kind::CXXMethodType:
+  case Kind::CXXOperatorMethodType:
+  case Kind::CurriedCXXMethodType:
+  case Kind::CurriedCXXOperatorMethodType:
+  case Kind::PartialCurriedCXXMethodType:
+  case Kind::PartialCurriedCXXOperatorMethodType:
+    return OrigType == other.OrigType
+      && GenericSig == other.GenericSig
+      && CXXMethod == other.CXXMethod
+      && OtherData == other.OtherData;
   }
 }

@@ -1422,7 +1422,7 @@ ConstExprFunctionState::initializeAddressFromSingleWriter(SILValue addr) {
     // Ignore markers, loads, and other things that aren't stores to this stack
     // value.
     if (isa<LoadInst>(user) || isa<DeallocStackInst>(user) ||
-        isa<DestroyAddrInst>(user) || isa<DebugValueAddrInst>(user))
+        isa<DestroyAddrInst>(user) || DebugValueInst::hasAddrVal(user))
       continue;
 
     // TODO: Allow BeginAccess/EndAccess users.
@@ -1737,8 +1737,7 @@ llvm::Optional<SymbolicValue> ConstExprFunctionState::evaluateClosureCreation(
 llvm::Optional<SymbolicValue>
 ConstExprFunctionState::evaluateFlowSensitive(SILInstruction *inst) {
   // These are just markers.
-  if (isa<DebugValueInst>(inst) || isa<DebugValueAddrInst>(inst) ||
-      isa<EndAccessInst>(inst) ||
+  if (isa<DebugValueInst>(inst) || isa<EndAccessInst>(inst) ||
       // The interpreter doesn't model these memory management instructions, so
       // skip them.
       isa<DestroyAddrInst>(inst) || isa<RetainValueInst>(inst) ||
@@ -1929,13 +1928,13 @@ ConstExprFunctionState::evaluateInstructionAndGetNext(
     // tuple-typed argument.
     assert(caseBB->getNumArguments() == 1);
 
-    if (caseBB->getParent()->hasOwnership() &&
-        switchInst.getDefaultBBOrNull() == caseBB) {
-      // If we are visiting the default block and we are in ossa, then we may
-      // have uses of the failure parameter. That means we need to map the
-      // original value to the argument.
-      setValue(caseBB->getArgument(0), value);
-      return {caseBB->begin(), None};
+    if (caseBB == switchInst.getDefaultBBOrNull().getPtrOrNull()) {
+      if (!switchInst.getUniqueCaseForDefault()) {
+        // In OSSA, the default block forward the original enum value whenever
+        // it does not correspond to a unique case.
+        setValue(caseBB->getArgument(0), value);
+        return {caseBB->begin(), None};
+      }
     }
 
     assert(value.getKind() == SymbolicValue::EnumWithPayload);

@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend -emit-module %S/Inputs/rdar79564324_other.swift -emit-module-path %t/rdar79564324_other.swiftmodule -requirement-machine=on -debug-requirement-machine 2>&1 | %FileCheck %s
+// RUN: %target-swift-frontend -emit-module %S/Inputs/rdar79564324_other.swift -emit-module-path %t/rdar79564324_other.swiftmodule -requirement-machine=on -dump-requirement-machine 2>&1 | %FileCheck %s
 // RUN: %target-swift-frontend -emit-silgen %s -I %t -requirement-machine=on
 
 import rdar79564324_other
@@ -35,6 +35,6 @@ public func test<T : P>(_ t: T) where T == T.A {
 // CHECK-NEXT: }
 // CHECK-NEXT: Property map: {
 // CHECK-NEXT:   [P:A] => { conforms_to: [P] }
-// CHECK-NEXT:   τ_0_0 => { conforms_to: [P] }
 // CHECK-NEXT:   τ_0_1 => { conforms_to: [P] }
+// CHECK-NEXT:   τ_0_0 => { conforms_to: [P] }
 // CHECK-NEXT: }

@@ -397,7 +397,8 @@ bool Remangler::mangleStandardSubstitution(Node *node) {
   if (node->getChild(1)->getKind() != Node::Kind::Identifier)
     return false;
 
-  if (auto Subst = getStandardTypeSubst(node->getChild(1)->getText())) {
+  if (auto Subst = getStandardTypeSubst(
+          node->getChild(1)->getText(), /*allowConcurrencyManglings=*/true)) {
     if (!SubstMerging.tryMergeSubst(*this, *Subst, /*isStandardSubst*/ true)) {
       Buffer << 'S' << *Subst;
     }
@@ -441,9 +442,11 @@ std::pair<int, Node *> Remangler::mangleConstrainedType(Node *node,
     Chain.push_back(node->getChild(1), Factory);
     node = getChildOfType(node->getFirstChild());
   }
-  
+
   if (node->getKind() != Node::Kind::DependentGenericParamType) {
     mangle(node, depth + 1);
+    if (!Chain.size())
+      return {-1, nullptr};
     node = nullptr;
   }
 

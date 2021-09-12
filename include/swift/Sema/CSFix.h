@@ -328,6 +328,13 @@ enum class FixKind : uint8_t {
   /// another property wrapper that is a part of the same composed
   /// property wrapper.
   AllowWrappedValueMismatch,
+
+  /// Specify a type for an explicitly written placeholder that could not be
+  /// resolved.
+  SpecifyTypeForPlaceholder,
+
+  /// Allow `weak` declarations to be bound to a non-optional type.
+  AllowNonOptionalWeak,
 };
 
 class ConstraintFix {
@@ -2257,6 +2264,25 @@ public:
                                              ConstraintLocator * locator);
 };
 
+class SpecifyTypeForPlaceholder final : public ConstraintFix {
+  SpecifyTypeForPlaceholder(ConstraintSystem &cs, ConstraintLocator *locator)
+      : ConstraintFix(cs, FixKind::SpecifyTypeForPlaceholder, locator) {}
+
+public:
+  std::string getName() const override {
+    return "specify type for placeholder";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
+  }
+
+  static SpecifyTypeForPlaceholder *create(ConstraintSystem &cs,
+                                           ConstraintLocator *locator);
+};
+
 class AllowRefToInvalidDecl final : public ConstraintFix {
   AllowRefToInvalidDecl(ConstraintSystem &cs, ConstraintLocator *locator)
       : ConstraintFix(cs, FixKind::AllowRefToInvalidDecl, locator) {}
@@ -2399,6 +2425,21 @@ class AllowInvalidStaticMemberRefOnProtocolMetatype final
 
   static AllowInvalidStaticMemberRefOnProtocolMetatype *
   create(ConstraintSystem &cs, ConstraintLocator *locator);
+};
+
+class AllowNonOptionalWeak final : public ConstraintFix {
+  AllowNonOptionalWeak(ConstraintSystem &cs, ConstraintLocator *locator)
+      : ConstraintFix(cs, FixKind::AllowNonOptionalWeak, locator) {}
+
+public:
+  std::string getName() const override {
+    return "allow `weak` with non-optional type";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static AllowNonOptionalWeak *create(ConstraintSystem &cs,
+                                      ConstraintLocator *locator);
 };
 
 } // end namespace constraints

@@ -41,8 +41,17 @@
 
 namespace swift {
 
-// Uncomment to enable helpful debug spew to stderr
-//#define SWIFT_TASK_PRINTF_DEBUG 1
+// Set to 1 to enable helpful debug spew to stderr
+// If this is enabled, tests with `swift_task_debug_log` requirement can run.
+#if 0
+#define SWIFT_TASK_DEBUG_LOG(fmt, ...)                                         \
+  fprintf(stderr, "[%lu] [%s:%d](%s) " fmt "\n",                               \
+          (unsigned long)_swift_get_thread_id(),                               \
+          __FILE__, __LINE__, __FUNCTION__,                                    \
+          __VA_ARGS__)
+#else
+#define SWIFT_TASK_DEBUG_LOG(fmt, ...) (void)0
+#endif
 
 #if defined(_WIN32)
 using ThreadID = decltype(GetCurrentThreadId());
@@ -76,6 +85,14 @@ void _swift_task_dealloc_specific(AsyncTask *task, void *ptr);
 /// related to the active task.
 void runJobInEstablishedExecutorContext(Job *job);
 
+/// Adopt the voucher stored in `task`. This removes the voucher from the task
+/// and adopts it on the current thread.
+void adoptTaskVoucher(AsyncTask *task);
+
+/// Restore the voucher for `task`. This un-adopts the current thread's voucher
+/// and stores it back into the task again.
+void restoreTaskVoucher(AsyncTask *task);
+
 /// Initialize the async let storage for the given async-let child task.
 void asyncLet_addImpl(AsyncTask *task, AsyncLet *asyncLet,
                       bool didAllocateInParentTask);
@@ -106,12 +123,14 @@ void _swift_tsan_release(void *addr);
 /// executors.
 #define DISPATCH_QUEUE_GLOBAL_EXECUTOR (void *)1
 
+#if !defined(SWIFT_STDLIB_SINGLE_THREADED_RUNTIME)
 inline SerialExecutorWitnessTable *
 _swift_task_getDispatchQueueSerialExecutorWitnessTable() {
   extern SerialExecutorWitnessTable wtable
     SWIFT_ASM_LABEL_WITH_PREFIX("$ss17DispatchQueueShimCScfsWP");
   return &wtable;
 }
+#endif
 
 // ==== ------------------------------------------------------------------------
 
@@ -236,7 +255,7 @@ public:
   ActiveTaskStatus withEscalatedPriority(JobPriority priority) const {
     assert(priority > getStoredPriority());
     return ActiveTaskStatus(Record,
-                            (Flags & PriorityMask)
+                            (Flags & ~PriorityMask)
                                | IsEscalated | uintptr_t(priority));
   }
   ActiveTaskStatus withoutStoredPriorityEscalation() const {
@@ -264,9 +283,7 @@ public:
 };
 
 /// The size of an allocator slab.
-///
-/// TODO: find the optimal value by experiment.
-static constexpr size_t SlabCapacity = 1024;
+static constexpr size_t SlabCapacity = 1000;
 
 using TaskAllocator = StackAllocator<SlabCapacity>;
 
@@ -350,11 +367,13 @@ inline bool AsyncTask::isCancelled() const {
 }
 
 inline void AsyncTask::flagAsRunning() {
+  SWIFT_TASK_DEBUG_LOG("%p->flagAsRunning()", this);
   auto oldStatus = _private().Status.load(std::memory_order_relaxed);
   while (true) {
     assert(!oldStatus.isRunning());
     if (oldStatus.isLocked()) {
       flagAsRunning_slow();
+      adoptTaskVoucher(this);
       swift_task_enterThreadLocalContext(
           (char *)&_private().ExclusivityAccessSet[0]);
       return;
@@ -369,6 +388,7 @@ inline void AsyncTask::flagAsRunning() {
     if (_private().Status.compare_exchange_weak(oldStatus, newStatus,
                                                 std::memory_order_relaxed,
                                                 std::memory_order_relaxed)) {
+      adoptTaskVoucher(this);
       swift_task_enterThreadLocalContext(
           (char *)&_private().ExclusivityAccessSet[0]);
       return;
@@ -377,6 +397,7 @@ inline void AsyncTask::flagAsRunning() {
 }
 
 inline void AsyncTask::flagAsSuspended() {
+  SWIFT_TASK_DEBUG_LOG("%p->flagAsSuspended()", this);
   auto oldStatus = _private().Status.load(std::memory_order_relaxed);
   while (true) {
     assert(oldStatus.isRunning());
@@ -384,6 +405,7 @@ inline void AsyncTask::flagAsSuspended() {
       flagAsSuspended_slow();
       swift_task_exitThreadLocalContext(
           (char *)&_private().ExclusivityAccessSet[0]);
+      restoreTaskVoucher(this);
       return;
     }
 
@@ -398,6 +420,7 @@ inline void AsyncTask::flagAsSuspended() {
                                                 std::memory_order_relaxed)) {
       swift_task_exitThreadLocalContext(
           (char *)&_private().ExclusivityAccessSet[0]);
+      restoreTaskVoucher(this);
       return;
     }
   }
@@ -407,10 +430,7 @@ inline void AsyncTask::flagAsSuspended() {
 // that can be used when debugging locally to instrument when a task actually is
 // dealloced.
 inline void AsyncTask::flagAsCompleted() {
-#if SWIFT_TASK_PRINTF_DEBUG
-  fprintf(stderr, "[%lu] task completed %p\n",
-          _swift_get_thread_id(), this);
-#endif
+  SWIFT_TASK_DEBUG_LOG("task completed %p", this);
 }
 
 inline void AsyncTask::localValuePush(const HeapObject *key,
