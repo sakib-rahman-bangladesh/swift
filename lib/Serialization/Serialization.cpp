@@ -802,6 +802,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(control_block, METADATA);
   BLOCK_RECORD(control_block, MODULE_NAME);
   BLOCK_RECORD(control_block, TARGET);
+  BLOCK_RECORD(control_block, SDK_NAME);
 
   BLOCK(OPTIONS_BLOCK);
   BLOCK_RECORD(options_block, SDK_PATH);
@@ -890,6 +891,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(sil_block, SIL_INST_WITNESS_METHOD);
   BLOCK_RECORD(sil_block, SIL_SPECIALIZE_ATTR);
   BLOCK_RECORD(sil_block, SIL_ONE_OPERAND_EXTRA_ATTR);
+  BLOCK_RECORD(sil_block, SIL_ONE_TYPE_ONE_OPERAND_EXTRA_ATTR);
   BLOCK_RECORD(sil_block, SIL_TWO_OPERANDS_EXTRA_ATTR);
 
   // These layouts can exist in both decl blocks and sil blocks.
@@ -951,6 +953,7 @@ void Serializer::writeHeader(const SerializationOptions &options) {
     control_block::ModuleNameLayout ModuleName(Out);
     control_block::MetadataLayout Metadata(Out);
     control_block::TargetLayout Target(Out);
+    control_block::SDKNameLayout SDKName(Out);
 
     ModuleName.emit(ScratchRecord, M->getName().str());
 
@@ -983,6 +986,9 @@ void Serializer::writeHeader(const SerializationOptions &options) {
                   userModuleMajor, userModuleMinor,
                   userModuleSubminor, userModuleBuild,
                   versionString.str());
+
+    if (!options.SDKName.empty())
+      SDKName.emit(ScratchRecord, options.SDKName);
 
     Target.emit(ScratchRecord, M->getASTContext().LangOpts.Target.str());
 

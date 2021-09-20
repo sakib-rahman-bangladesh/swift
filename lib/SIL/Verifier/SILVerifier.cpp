@@ -3199,6 +3199,7 @@ public:
   }
 
   SILType getMethodSelfType(CanSILFunctionType ft) {
+    SILFunctionConventions fnConv(ft, F.getModule());
     return fnConv.getSILType(ft->getParameters().back(),
                              F.getTypeExpansionContext());
   }
@@ -5269,6 +5270,13 @@ public:
                        }),
             "entry point address argument must have an indirect calling "
             "convention");
+  }
+
+  void checkMoveValueInst(MoveValueInst *mvi) {
+    require(mvi->getOperand()->getType().isObject(),
+            "Operand value should be an object");
+    require(mvi->getType() == mvi->getOperand()->getType(),
+            "Result and operand must have the same type, today.");
   }
 
   void verifyEpilogBlocks(SILFunction *F) {
