@@ -33,6 +33,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Errc.h"
@@ -198,8 +199,10 @@ public:
 
 namespace path = llvm::sys::path;
 
-static bool serializedASTLooksValid(const llvm::MemoryBuffer &buf) {
-  auto VI = serialization::validateSerializedAST(buf.getBuffer());
+static bool serializedASTLooksValid(const llvm::MemoryBuffer &buf,
+                                    bool requiresOSSAModules) {
+  auto VI = serialization::validateSerializedAST(buf.getBuffer(),
+                                                 requiresOSSAModules);
   return VI.status == serialization::Status::Valid;
 }
 
@@ -497,7 +500,8 @@ class ModuleInterfaceLoaderImpl {
 
     LLVM_DEBUG(llvm::dbgs() << "Validating deps of " << path << "\n");
     auto validationInfo = serialization::validateSerializedAST(
-        buf.getBuffer(), /*ExtendedValidationInfo=*/nullptr, &allDeps);
+        buf.getBuffer(), requiresOSSAModules,
+        /*ExtendedValidationInfo=*/nullptr, &allDeps);
 
     if (validationInfo.status != serialization::Status::Valid) {
       rebuildInfo.setSerializationStatus(path, validationInfo.status);
@@ -538,7 +542,7 @@ class ModuleInterfaceLoaderImpl {
 
     // First, make sure the underlying module path exists and is valid.
     auto modBuf = fs.getBufferForFile(fwd.underlyingModulePath);
-    if (!modBuf || !serializedASTLooksValid(*modBuf.get()))
+    if (!modBuf || !serializedASTLooksValid(*modBuf.get(), requiresOSSAModules))
       return false;
 
     // Next, check the dependencies in the forwarding file.
@@ -646,12 +650,6 @@ class ModuleInterfaceLoaderImpl {
   }
 
   std::pair<std::string, std::string> getCompiledModuleCandidates() {
-    // If we require ossa modules, then we /always/ rebuild the module interface
-    // regardless of the module loading mode.
-    if (requiresOSSAModules) {
-      return {};
-    }
-
     std::pair<std::string, std::string> result;
     // Keep track of whether we should attempt to load a .swiftmodule adjacent
     // to the .swiftinterface.
@@ -1574,7 +1572,7 @@ InterfaceSubContextDelegateImpl::getCacheHash(StringRef useInterfacePath) {
       // ensure that we compile all swift interface files with the option set.
       unsigned(genericSubInvocation.getSILOptions().EnableOSSAModules));
 
-  return llvm::APInt(64, H).toString(36, /*Signed=*/false);
+  return llvm::toString(llvm::APInt(64, H), 36, /*Signed=*/false);
 }
 
 std::error_code
@@ -1742,7 +1740,13 @@ bool ExplicitSwiftModuleLoader::findModule(ImportPath::Element ModuleID,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
            std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
            bool skipBuildingInterface, bool &IsFramework, bool &IsSystemModule) {
-  StringRef moduleName = ModuleID.Item.str();
+  // Find a module with an actual, physical name on disk, in case
+  // -module-alias is used (otherwise same).
+  //
+  // For example, if '-module-alias Foo=Bar' is passed in to the frontend, and an
+  // input file has 'import Foo', a module called Bar (real name) should be searched.
+  StringRef moduleName = Ctx.getRealModuleName(ModuleID.Item).str();
+
   auto it = Impl.ExplicitModuleMap.find(moduleName);
   // If no explicit module path is given matches the name, return with an
   // error code.

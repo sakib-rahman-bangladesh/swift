@@ -590,12 +590,9 @@ public:
     auto *Parent = DebugScopeStack.size() ? DebugScopeStack.back().getPointer()
                                           : F.getDebugScope();
     auto *DS = Parent;
-    // Don't create a pointless scope for the function body's BraceStmt.
-    if (!DebugScopeStack.empty())
-      // Don't nest a scope for Loc under Parent unless it's actually different.
-      if (RegularLocation(DS->getLoc()) != RegularLocation(Loc))
-        DS = new (SGM.M)
-          SILDebugScope(RegularLocation(Loc), &getFunction(), DS);
+    // Don't nest a scope for Loc under Parent unless it's actually different.
+    if (RegularLocation(DS->getLoc()) != RegularLocation(Loc))
+      DS = new (SGM.M) SILDebugScope(RegularLocation(Loc), &getFunction(), DS);
     DebugScopeStack.emplace_back(DS, isBindingScope);
     B.setCurrentDebugScope(DS);
   }
@@ -637,6 +634,9 @@ public:
   /// Generates code for an artificial top-level function that starts an
   /// application based on a main type and optionally a main type.
   void emitArtificialTopLevel(Decl *mainDecl);
+
+  /// Generate code into @main for starting the async main on the main thread.
+  void emitAsyncMainThreadStart(SILDeclRef entryPoint);
 
   /// Generates code for a class deallocating destructor. This
   /// calls the destroying destructor and then deallocates 'self'.

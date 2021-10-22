@@ -649,7 +649,7 @@ public:
     if (Name.empty()) {
       {
         llvm::raw_svector_ostream S(Name);
-        S << '_' << NumAnonVars++;
+        S << "$_" << NumAnonVars++;
       }
       AnonymousVariables.insert({Decl, Name});
     }
@@ -952,9 +952,6 @@ public:
         if (ValueVariables.insert(shadow).second)
           ValueDomPoints.push_back({shadow, getActiveDominancePoint()});
       }
-      auto inst = cast<llvm::Instruction>(shadow);
-      llvm::IRBuilder<> builder(inst->getNextNode());
-      shadow = builder.CreateLoad(shadow);
     }
 
     return shadow;
@@ -1013,7 +1010,8 @@ public:
         auto shadow = Alloca.getAddress();
         auto inst = cast<llvm::Instruction>(shadow);
         llvm::IRBuilder<> builder(inst->getNextNode());
-        shadow = builder.CreateLoad(shadow);
+        shadow = builder.CreateLoad(shadow->getType()->getPointerElementType(),
+                                    shadow);
         copy.push_back(shadow);
         return;
       }
@@ -1027,16 +1025,9 @@ public:
       LTI.initialize(*this, e, Alloca, false /* isOutlined */);
       auto shadow = Alloca.getAddress();
       // Async functions use the value of the artificial address.
-      if (CurSILFn->isAsync() && emitLifetimeExtendingUse(shadow)) {
+      if (CurSILFn->isAsync() && emitLifetimeExtendingUse(shadow))
         if (ValueVariables.insert(shadow).second)
           ValueDomPoints.push_back({shadow, getActiveDominancePoint()});
-        auto inst = cast<llvm::Instruction>(shadow);
-        llvm::IRBuilder<> builder(inst->getNextNode());
-        shadow = builder.CreateLoad(shadow);
-        copy.push_back(shadow);
-        return;
-      }
-
     }
     copy.push_back(Alloca.getAddress());
   }
@@ -1193,10 +1184,6 @@ public:
   void visitObjCMethodInst(ObjCMethodInst *i);
   void visitObjCSuperMethodInst(ObjCSuperMethodInst *i);
   void visitWitnessMethodInst(WitnessMethodInst *i);
-
-  void visitAllocValueBufferInst(AllocValueBufferInst *i);
-  void visitProjectValueBufferInst(ProjectValueBufferInst *i);
-  void visitDeallocValueBufferInst(DeallocValueBufferInst *i);
 
   void visitOpenExistentialAddrInst(OpenExistentialAddrInst *i);
   void visitOpenExistentialMetatypeInst(OpenExistentialMetatypeInst *i);
@@ -2496,7 +2483,9 @@ void IRGenSILFunction::visitDifferentiabilityWitnessFunctionInst(
     llvm_unreachable("Not yet implemented");
   }
 
-  diffWitness = Builder.CreateStructGEP(diffWitness, offset);
+  diffWitness = Builder.CreateStructGEP(
+      diffWitness->getType()->getScalarType()->getPointerElementType(),
+      diffWitness, offset);
   diffWitness = Builder.CreateLoad(diffWitness, IGM.getPointerAlignment());
 
   auto fnType = cast<SILFunctionType>(i->getType().getASTType());
@@ -2987,8 +2976,7 @@ void IRGenSILFunction::visitBuiltinInst(swift::BuiltinInst *i) {
   }
   
   Explosion result;
-  emitBuiltinCall(*this, builtin, i->getName(), i->getType(),
-                  argTypes, args, result, i->getSubstitutions());
+  emitBuiltinCall(*this, builtin, i, argTypes, args, result);
   
   setLoweredExplosion(i, result);
 }
@@ -4749,11 +4737,15 @@ void IRGenSILFunction::visitDebugValueInst(DebugValueInst *i) {
   VarInfo->Name = getVarName(i, IsAnonymous);
   DebugTypeInfo DbgTy;
   SILType SILTy;
-  if (auto MaybeSILTy = VarInfo->Type)
+  bool IsFragmentType = false;
+  if (auto MaybeSILTy = VarInfo->Type) {
     // If there is auxiliary type info, use it
     SILTy = *MaybeSILTy;
-  else
+  } else {
     SILTy = SILVal->getType();
+    if (VarInfo->DIExpr)
+      IsFragmentType = VarInfo->DIExpr.hasFragment();
+  }
 
   auto RealTy = SILTy.getASTType();
   if (IsAddrVal && IsInCoro)
@@ -4769,11 +4761,12 @@ void IRGenSILFunction::visitDebugValueInst(DebugValueInst *i) {
 
   // Figure out the debug variable type
   if (VarDecl *Decl = i->getDecl()) {
-    DbgTy = DebugTypeInfo::getLocalVariable(
-        Decl, RealTy, getTypeInfo(SILVal->getType()));
+    DbgTy = DebugTypeInfo::getLocalVariable(Decl, RealTy, getTypeInfo(SILTy),
+                                            IsFragmentType);
   } else if (!SILTy.hasArchetype() && !VarInfo->Name.empty()) {
     // Handle the cases that read from a SIL file
-    DbgTy = DebugTypeInfo::getFromTypeInfo(RealTy, getTypeInfo(SILTy));
+    DbgTy = DebugTypeInfo::getFromTypeInfo(RealTy, getTypeInfo(SILTy),
+                                           IsFragmentType);
   } else
     return;
 
@@ -5128,18 +5121,24 @@ void IRGenSILFunction::emitDebugInfoForAllocStack(AllocStackInst *i,
   }
 
   SILType SILTy;
-  if (auto MaybeSILTy = VarInfo->Type)
+  bool IsFragmentType = false;
+  if (auto MaybeSILTy = VarInfo->Type) {
     // If there is auxiliary type info, use it
     SILTy = *MaybeSILTy;
-  else
+  } else {
     SILTy = i->getType();
+    if (VarInfo->DIExpr)
+      IsFragmentType = VarInfo->DIExpr.hasFragment();
+  }
   auto RealType = SILTy.getASTType();
   DebugTypeInfo DbgTy;
   if (Decl) {
-    DbgTy = DebugTypeInfo::getLocalVariable(Decl, RealType, type);
+    DbgTy =
+        DebugTypeInfo::getLocalVariable(Decl, RealType, type, IsFragmentType);
   } else if (i->getFunction()->isBare() && !SILTy.hasArchetype() &&
              !VarInfo->Name.empty()) {
-    DbgTy = DebugTypeInfo::getFromTypeInfo(RealType, getTypeInfo(SILTy));
+    DbgTy = DebugTypeInfo::getFromTypeInfo(RealType, getTypeInfo(SILTy),
+                                           IsFragmentType);
   } else
     return;
 
@@ -5151,7 +5150,8 @@ void IRGenSILFunction::emitDebugInfoForAllocStack(AllocStackInst *i,
       ValueDomPoints.push_back({shadow, getActiveDominancePoint()});
     auto inst = cast<llvm::Instruction>(shadow);
     llvm::IRBuilder<> builder(inst->getNextNode());
-    addr = builder.CreateLoad(shadow);
+    addr =
+        builder.CreateLoad(shadow->getType()->getPointerElementType(), shadow);
   }
 
   bindArchetypes(DbgTy.getType());
@@ -5359,7 +5359,7 @@ void IRGenSILFunction::visitAllocBoxInst(swift::AllocBoxInst *i) {
       IGM.getMaximalTypeExpansionContext(),
       i->getBoxType(), IGM.getSILModule().Types, 0);
   auto RealType = SILTy.getASTType();
-  auto DbgTy = DebugTypeInfo::getLocalVariable(Decl, RealType, type);
+  auto DbgTy = DebugTypeInfo::getLocalVariable(Decl, RealType, type, false);
 
   auto VarInfo = i->getVarInfo();
   assert(VarInfo && "debug_value without debug info");
@@ -6246,8 +6246,12 @@ void IRGenSILFunction::visitKeyPathInst(swift::KeyPathInst *I) {
     for (unsigned i : indices(I->getAllOperands())) {
       auto operand = I->getAllOperands()[i].get();
       auto &ti = getTypeInfo(operand->getType());
-      auto ptr = Builder.CreateInBoundsGEP(argsBuf.getAddress(),
-                                           operandOffsets[i]);
+      auto ptr =
+          Builder.CreateInBoundsGEP(argsBuf.getAddress()
+                                        ->getType()
+                                        ->getScalarType()
+                                        ->getPointerElementType(),
+                                    argsBuf.getAddress(), operandOffsets[i]);
       auto addr = ti.getAddressForPointer(
         Builder.CreateBitCast(ptr, ti.getStorageType()->getPointerTo()));
       if (operand->getType().isAddress()) {
@@ -6337,34 +6341,12 @@ void IRGenSILFunction::visitIndexRawPointerInst(swift::IndexRawPointerInst *i) {
   llvm::Value *index = indexValues.claimNext();
   
   // We don't expose a non-inbounds GEP operation.
-  llvm::Value *destValue = Builder.CreateInBoundsGEP(base, index);
-  
+  llvm::Value *destValue = Builder.CreateInBoundsGEP(
+      base->getType()->getScalarType()->getPointerElementType(), base, index);
+
   Explosion result;
   result.add(destValue);
   setLoweredExplosion(i, result);
-}
-
-void IRGenSILFunction::visitAllocValueBufferInst(
-                                          swift::AllocValueBufferInst *i) {
-  Address buffer = getLoweredAddress(i->getOperand());
-  auto valueType = i->getValueType();
-  Address value = emitAllocateValueInBuffer(*this, valueType, buffer);
-  setLoweredAddress(i, value);
-}
-
-void IRGenSILFunction::visitProjectValueBufferInst(
-                                          swift::ProjectValueBufferInst *i) {
-  Address buffer = getLoweredAddress(i->getOperand());
-  auto valueType = i->getValueType();
-  Address value = emitProjectValueInBuffer(*this, valueType, buffer);
-  setLoweredAddress(i, value);
-}
-
-void IRGenSILFunction::visitDeallocValueBufferInst(
-                                          swift::DeallocValueBufferInst *i) {
-  Address buffer = getLoweredAddress(i->getOperand());
-  auto valueType = i->getValueType();
-  emitDeallocateValueInBuffer(*this, valueType, buffer);
 }
 
 void IRGenSILFunction::visitInitExistentialAddrInst(swift::InitExistentialAddrInst *i) {
@@ -6568,8 +6550,18 @@ void IRGenSILFunction::visitWitnessMethodInst(swift::WitnessMethodInst *i) {
 
   assert(member.requiresNewWitnessTableEntry());
 
-  if (IGM.isResilient(conformance.getRequirement(),
-                      ResilienceExpansion::Maximal)) {
+  bool shouldUseDispatchThunk = false;
+  if (IGM.isResilient(conformance.getRequirement(), ResilienceExpansion::Maximal)) {
+    shouldUseDispatchThunk = true;
+  } else if (IGM.getOptions().WitnessMethodElimination) {
+    // For WME, use a thunk if the target protocol is defined in another module.
+    // This way, we guarantee all wmethod call sites are visible to the LLVM VFE
+    // optimization in GlobalDCE.
+    auto protoDecl = cast<ProtocolDecl>(member.getDecl()->getDeclContext());
+    shouldUseDispatchThunk = protoDecl->getModuleContext() != IGM.getSwiftModule();
+  }
+
+  if (shouldUseDispatchThunk) {
     llvm::Constant *fnPtr = IGM.getAddrOfDispatchThunk(member, NotForDefinition);
     llvm::Constant *secondaryValue = nullptr;
 

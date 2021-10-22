@@ -306,9 +306,12 @@ namespace {
           // the compiler's idea of the offset.
           auto metadataBytes =
             IGF.Builder.CreateBitCast(metadata, IGF.IGM.Int8PtrTy);
-          auto fieldOffsetPtr =
-            IGF.Builder.CreateInBoundsGEP(metadataBytes,
-                  IGF.IGM.getSize(scanner.FieldOffset - scanner.AddressPoint));
+          auto fieldOffsetPtr = IGF.Builder.CreateInBoundsGEP(
+              metadataBytes->getType()
+                  ->getScalarType()
+                  ->getPointerElementType(),
+              metadataBytes,
+              IGF.IGM.getSize(scanner.FieldOffset - scanner.AddressPoint));
           fieldOffsetPtr =
             IGF.Builder.CreateBitCast(fieldOffsetPtr,
                                       IGF.IGM.Int32Ty->getPointerTo());
@@ -355,7 +358,7 @@ namespace {
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
       if (!IGM.getOptions().ForceStructTypeLayouts) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
       if (!areFieldsABIAccessible()) {
         return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
@@ -542,7 +545,7 @@ namespace {
                                           SILType T) const override {
       if (!IGM.getOptions().ForceStructTypeLayouts || getCXXDestructor(T) ||
           !areFieldsABIAccessible()) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
 
       std::vector<TypeLayoutEntry *> fields;
@@ -622,7 +625,7 @@ namespace {
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
       if (!IGM.getOptions().ForceStructTypeLayouts) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
 
       if (!areFieldsABIAccessible()) {
@@ -684,7 +687,7 @@ namespace {
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
       if (!IGM.getOptions().ForceStructTypeLayouts) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
 
       if (!areFieldsABIAccessible()) {

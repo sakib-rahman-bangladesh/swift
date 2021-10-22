@@ -114,6 +114,7 @@ namespace {
     SILFunction *target = nullptr;
     Identifier spiGroupID;
     ModuleDecl *spiModule;
+    AvailabilityContext availability = AvailabilityContext::alwaysAvailable();
   };
 
   class SILParser {
@@ -778,7 +779,6 @@ static bool parseSILLinkage(Optional<SILLinkage> &Result, Parser &P) {
     .Case("public_external", SILLinkage::PublicExternal)
     .Case("hidden_external", SILLinkage::HiddenExternal)
     .Case("shared_external", SILLinkage::SharedExternal)
-    .Case("private_external", SILLinkage::PrivateExternal)
     .Default(None);
 
   // If we succeed, consume the token.
@@ -1092,9 +1092,9 @@ static bool parseDeclSILOptional(bool *isTransparent,
       SpecializeAttr *Attr;
       StringRef targetFunctionName;
       ModuleDecl *module = nullptr;
-
+      AvailabilityContext availability = AvailabilityContext::alwaysAvailable();
       if (!SP.P.parseSpecializeAttribute(
-              tok::r_square, AtLoc, Loc, Attr,
+              tok::r_square, AtLoc, Loc, Attr, &availability,
               [&targetFunctionName](Parser &P) -> bool {
                 if (P.Tok.getKind() != tok::string_literal) {
                   P.diagnose(P.Tok, diag::expected_in_attribute_list);
@@ -1136,6 +1136,7 @@ static bool parseDeclSILOptional(bool *isTransparent,
                           : SILSpecializeAttr::SpecializationKind::Partial;
       SpecAttr.exported = Attr->isExported();
       SpecAttr.target = targetFunction;
+      SpecAttr.availability = availability;
       SpecAttrs->emplace_back(SpecAttr);
       if (!Attr->getSPIGroups().empty()) {
         SpecAttr.spiGroupID = Attr->getSPIGroups()[0];
@@ -1680,7 +1681,11 @@ bool SILParser::parseSILDebugInfoExpression(SILDebugInfoExpression &DIExpr) {
   // All operators that we currently support
   static const SILDIExprOperator AllOps[] = {
     SILDIExprOperator::Dereference,
-    SILDIExprOperator::Fragment
+    SILDIExprOperator::Fragment,
+    SILDIExprOperator::Plus,
+    SILDIExprOperator::Minus,
+    SILDIExprOperator::ConstUInt,
+    SILDIExprOperator::ConstSInt
   };
 
   do {
@@ -1711,6 +1716,22 @@ bool SILParser::parseSILDebugInfoExpression(SILDebugInfoExpression &DIExpr) {
             return true;
           }
           auto NewOperand = SILDIExprElement::createDecl(Result.getDecl());
+          DIExpr.push_back(NewOperand);
+          break;
+        }
+        case SILDIExprElement::ConstIntKind: {
+          bool IsNegative = false;
+          if (P.Tok.is(tok::oper_prefix) && P.Tok.getRawText() == "-") {
+            P.consumeToken();
+            IsNegative = true;
+          }
+          int64_t Val;
+          if (parseInteger(Val, diag::sil_invalid_constant))
+            return true;
+          if (IsNegative)
+            Val = -Val;
+          auto NewOperand =
+            SILDIExprElement::createConstInt(static_cast<uint64_t>(Val));
           DIExpr.push_back(NewOperand);
           break;
         }
@@ -2873,31 +2894,6 @@ bool SILParser::parseSpecificSILInstruction(SILBuilder &B,
       return true;
 
     ResultVal = B.createCondFail(InstLoc, Val, message);
-    break;
-  }
-
-  case SILInstructionKind::AllocValueBufferInst: {
-    SILType Ty;
-    if (parseSILType(Ty) || parseVerbatim("in") || parseTypedValueRef(Val, B) ||
-        parseSILDebugLocation(InstLoc, B))
-      return true;
-    ResultVal = B.createAllocValueBuffer(InstLoc, Ty, Val);
-    break;
-  }
-  case SILInstructionKind::ProjectValueBufferInst: {
-    SILType Ty;
-    if (parseSILType(Ty) || parseVerbatim("in") || parseTypedValueRef(Val, B) ||
-        parseSILDebugLocation(InstLoc, B))
-      return true;
-    ResultVal = B.createProjectValueBuffer(InstLoc, Ty, Val);
-    break;
-  }
-  case SILInstructionKind::DeallocValueBufferInst: {
-    SILType Ty;
-    if (parseSILType(Ty) || parseVerbatim("in") || parseTypedValueRef(Val, B) ||
-        parseSILDebugLocation(InstLoc, B))
-      return true;
-    ResultVal = B.createDeallocValueBuffer(InstLoc, Ty, Val);
     break;
   }
 
@@ -6279,7 +6275,7 @@ bool SILParserState::parseDeclSIL(Parser &P) {
                 GenericSignature());
           FunctionState.F->addSpecializeAttr(SILSpecializeAttr::create(
               FunctionState.F->getModule(), genericSig, Attr.exported,
-              Attr.kind, Attr.target, Attr.spiGroupID, Attr.spiModule));
+              Attr.kind, Attr.target, Attr.spiGroupID, Attr.spiModule, Attr.availability));
         }
       }
 

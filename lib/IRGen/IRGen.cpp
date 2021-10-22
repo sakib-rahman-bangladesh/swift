@@ -548,7 +548,7 @@ bool swift::performLLVM(const IRGenOptions &Opts,
   if (!OutputFilename.empty()) {
     // Try to open the output file.  Clobbering an existing file is fine.
     // Open in binary mode if we're doing binary output.
-    llvm::sys::fs::OpenFlags OSFlags = llvm::sys::fs::F_None;
+    llvm::sys::fs::OpenFlags OSFlags = llvm::sys::fs::OF_None;
     std::error_code EC;
     RawOS.emplace(OutputFilename, EC, OSFlags);
 
@@ -846,7 +846,7 @@ static void embedBitcode(llvm::Module *M, const IRGenOptions &Opts)
 
   // Save llvm.compiler.used and remove it.
   SmallVector<llvm::Constant*, 2> UsedArray;
-  SmallSet<llvm::GlobalValue*, 4> UsedGlobals;
+  SmallVector<llvm::GlobalValue*, 4> UsedGlobals;
   auto *UsedElementType =
     llvm::Type::getInt8Ty(M->getContext())->getPointerTo(0);
   llvm::GlobalVariable *Used =
@@ -1105,12 +1105,13 @@ GeneratedModule IRGenRequest::evaluate(Evaluator &evaluator,
     } else {
       // Emit protocol conformances into a section we can recognize at runtime.
       // In JIT mode these are manually registered above.
-      IGM.emitSwiftProtocols();
-      IGM.emitProtocolConformances();
-      IGM.emitTypeMetadataRecords();
+      IGM.emitSwiftProtocols(/*asContiguousArray*/ false);
+      IGM.emitProtocolConformances(/*asContiguousArray*/ false);
+      IGM.emitTypeMetadataRecords(/*asContiguousArray*/ false);
       IGM.emitBuiltinReflectionMetadata();
       IGM.emitReflectionMetadataVersion();
       irgen.emitEagerClassInitialization();
+      irgen.emitObjCActorsNeedingSuperclassSwizzle();
       irgen.emitDynamicReplacements();
     }
 
@@ -1351,6 +1352,7 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
   irgen.emitReflectionMetadataVersion();
 
   irgen.emitEagerClassInitialization();
+  irgen.emitObjCActorsNeedingSuperclassSwizzle();
 
   // Emit reflection metadata for builtin and imported types.
   irgen.emitBuiltinReflectionMetadata();
@@ -1555,7 +1557,7 @@ bool swift::performLLVM(const IRGenOptions &Opts, ASTContext &Ctx,
 
   auto *Clang = static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
   // Use clang's datalayout.
-  Module->setDataLayout(Clang->getTargetInfo().getDataLayout());
+  Module->setDataLayout(Clang->getTargetInfo().getDataLayoutString());
 
   embedBitcode(Module, Opts);
   if (::performLLVM(Opts, Ctx.Diags, nullptr, nullptr, Module,

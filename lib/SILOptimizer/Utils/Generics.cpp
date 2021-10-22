@@ -13,6 +13,7 @@
 #define DEBUG_TYPE "generic-specializer"
 
 #include "swift/SILOptimizer/Utils/Generics.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -2485,6 +2486,19 @@ usePrespecialized(SILOptFunctionBuilder &funcBuilder, ApplySite apply,
           !currentModule->isImportedAsSPI(spiGroup, funcModule))
         continue;
     }
+    // Check whether the availability of the specialization allows for using
+    // it. We check the  deployment target or the current functions availability
+    // target depending which one is more recent.
+    auto specializationAvail = SA->getAvailability();
+    auto &ctxt = funcBuilder.getModule().getSwiftModule()->getASTContext();
+    auto deploymentAvail = AvailabilityContext::forDeploymentTarget(ctxt);
+    auto currentFnAvailability = apply.getFunction()->getAvailabilityForLinkage();
+    if (!currentFnAvailability.isAlwaysAvailable() &&
+        !deploymentAvail.isContainedIn(currentFnAvailability))
+      deploymentAvail = currentFnAvailability;
+    if (!deploymentAvail.isContainedIn(specializationAvail))
+      continue;
+
     ReabstractionInfo reInfo(funcBuilder.getModule().getSwiftModule(),
                              funcBuilder.getModule().isWholeModule(), refF,
                              SA->getSpecializedSignature(),
@@ -2499,9 +2513,51 @@ usePrespecialized(SILOptFunctionBuilder &funcBuilder, ApplySite apply,
         mangler.mangleReabstracted(subs, reInfo.needAlternativeMangling());
 
     prespecializedReInfo = reInfo;
-    return lookupOrCreatePrespecialization(funcBuilder, refF, name, reInfo);
+    auto fn = lookupOrCreatePrespecialization(funcBuilder, refF, name, reInfo);
+    if (!specializationAvail.isAlwaysAvailable())
+      fn->setAvailabilityForLinkage(specializationAvail);
+    return fn;
   }
   return nullptr;
+}
+
+static void transferSpecializeAttributeTargets(SILModule &M,
+                                               SILOptFunctionBuilder &builder,
+                                               Decl *d) {
+  auto *vd = cast<AbstractFunctionDecl>(d);
+  for (auto *A : vd->getAttrs().getAttributes<SpecializeAttr>()) {
+    auto *SA = cast<SpecializeAttr>(A);
+    // Filter _spi.
+    auto spiGroups = SA->getSPIGroups();
+    auto hasSPIGroup = !spiGroups.empty();
+    if (hasSPIGroup) {
+      if (vd->getModuleContext() != M.getSwiftModule() &&
+          !M.getSwiftModule()->isImportedAsSPI(SA, vd)) {
+        continue;
+      }
+    }
+    if (auto *targetFunctionDecl = SA->getTargetFunctionDecl(vd)) {
+      auto target = SILDeclRef(targetFunctionDecl);
+      auto targetSILFunction = builder.getOrCreateFunction(
+          SILLocation(vd), target, NotForDefinition,
+          [&builder](SILLocation loc, SILDeclRef constant) -> SILFunction * {
+            return builder.getOrCreateFunction(loc, constant, NotForDefinition);
+          });
+      auto kind = SA->getSpecializationKind() ==
+                          SpecializeAttr::SpecializationKind::Full
+                      ? SILSpecializeAttr::SpecializationKind::Full
+                      : SILSpecializeAttr::SpecializationKind::Partial;
+      Identifier spiGroupIdent;
+      if (hasSPIGroup) {
+        spiGroupIdent = spiGroups[0];
+      }
+      auto availability = AvailabilityInference::annotatedAvailableRangeForAttr(
+          SA, M.getSwiftModule()->getASTContext());
+      targetSILFunction->addSpecializeAttr(SILSpecializeAttr::create(
+          M, SA->getSpecializedSignature(), SA->isExported(), kind, nullptr,
+          spiGroupIdent, vd->getModuleContext(), availability));
+    }
+  }
 }
 
 void swift::trySpecializeApplyOfGeneric(
@@ -2557,6 +2613,13 @@ void swift::trySpecializeApplyOfGeneric(
   // Check if there is a pre-specialization available in a library.
   SILFunction *prespecializedF = nullptr;
   ReabstractionInfo prespecializedReInfo;
+
+  FuncBuilder.getModule().performOnceForPrespecializedImportedExtensions(
+      [&FuncBuilder](AbstractFunctionDecl *pre) {
+        transferSpecializeAttributeTargets(FuncBuilder.getModule(), FuncBuilder,
+                                           pre);
+      });
+
   if ((prespecializedF = usePrespecialized(FuncBuilder, Apply, RefF, ReInfo,
                                            prespecializedReInfo))) {
     ReInfo = prespecializedReInfo;

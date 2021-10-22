@@ -83,7 +83,9 @@ namespace {
       IGF.IGM.getSize(Size(index)),               //     [index]
       llvm::ConstantInt::get(IGF.IGM.Int32Ty, 1)  //       .Offset
     };
-    auto slot = IGF.Builder.CreateInBoundsGEP(asTuple, indices);
+    auto slot = IGF.Builder.CreateInBoundsGEP(
+        asTuple->getType()->getScalarType()->getPointerElementType(), asTuple,
+        indices);
 
     return IGF.Builder.CreateLoad(slot, IGF.IGM.getPointerAlignment(),
                                   metadata->getName()
@@ -233,7 +235,7 @@ namespace {
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
       if (!IGM.getOptions().ForceStructTypeLayouts) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
       if (getFields().empty()) {
         return IGM.typeLayoutCache.getEmptyEntry();
@@ -278,7 +280,7 @@ namespace {
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
       if (!IGM.getOptions().ForceStructTypeLayouts) {
-        return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T);
       }
       if (getFields().empty()) {
         return IGM.typeLayoutCache.getEmptyEntry();

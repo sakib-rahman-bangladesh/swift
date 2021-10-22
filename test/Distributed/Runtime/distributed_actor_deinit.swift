@@ -7,25 +7,25 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
-// temporary non-support. tracked in rdar://82593574
+// FIXME(distributed): Distributed actors currently have some issues on windows, isRemote always returns false. rdar://82593574
 // UNSUPPORTED: windows
 
 import _Distributed
 
 @available(SwiftStdlib 5.5, *)
-    actor A {}
+actor A {}
 
 @available(SwiftStdlib 5.5, *)
 distributed actor DA {
   init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
+    defer { transport.actorReady(self) } // FIXME(distributed): rdar://81783599 this should be injected automatically
   }
 }
 
 @available(SwiftStdlib 5.5, *)
 distributed actor DA_userDefined {
   init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
+    defer { transport.actorReady(self) } // FIXME(distributed): rdar://81783599 this should be injected automatically
   }
 
   deinit {}
@@ -34,7 +34,7 @@ distributed actor DA_userDefined {
 @available(SwiftStdlib 5.5, *)
 distributed actor DA_userDefined2 {
   init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
+    defer { transport.actorReady(self) } // FIXME(distributed): rdar://81783599 this should be injected automatically
   }
 
   deinit {
@@ -49,7 +49,7 @@ distributed actor DA_state {
   var age = 42
 
   init(transport: ActorTransport) {
-    defer { transport.actorReady(self) }
+    defer { transport.actorReady(self) } // FIXME(distributed): rdar://81783599 this should be injected automatically
   }
 
   deinit {

@@ -104,6 +104,10 @@ static llvm::cl::opt<bool>
 EnableExperimentalConcurrency("enable-experimental-concurrency",
                    llvm::cl::desc("Enable experimental concurrency model."));
 
+static llvm::cl::opt<bool> EnableExperimentalLexicalLifetimes(
+    "enable-experimental-lexical-lifetimes",
+    llvm::cl::desc("Enable experimental lexical lifetimes."));
+
 static llvm::cl::opt<bool>
 EnableExperimentalDistributed("enable-experimental-distributed",
                    llvm::cl::desc("Enable experimental distributed actors."));
@@ -507,6 +511,8 @@ int main(int argc, char **argv) {
   SILOpts.EnableOSSAModules = EnableOSSAModules;
   SILOpts.EnableCopyPropagation = EnableCopyPropagation;
   SILOpts.DisableCopyPropagation = DisableCopyPropagation;
+  SILOpts.EnableExperimentalLexicalLifetimes =
+      EnableExperimentalLexicalLifetimes;
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
@@ -638,7 +644,7 @@ int main(int argc, char **argv) {
       SILMod->print(llvm::outs(), CI.getMainModule(), SILOpts, !DisableASTDump);
     } else {
       std::error_code EC;
-      llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::F_None);
+      llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::OF_None);
       if (EC) {
         llvm::errs() << "while opening '" << OutputFile << "': "
                      << EC.message() << '\n';

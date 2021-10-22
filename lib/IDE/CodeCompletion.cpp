@@ -1462,13 +1462,13 @@ void CodeCompletionContext::sortCompletionResults(
   // Sort nameCache, and then transform Results to return the pointers in order.
   std::sort(nameCache.begin(), nameCache.end(),
             [](const ResultAndName &LHS, const ResultAndName &RHS) {
-    int Result = StringRef(LHS.name).compare_lower(RHS.name);
-    // If the case insensitive comparison is equal, then secondary sort order
-    // should be case sensitive.
-    if (Result == 0)
-      Result = LHS.name.compare(RHS.name);
-    return Result < 0;
-  });
+              int Result = StringRef(LHS.name).compare_insensitive(RHS.name);
+              // If the case insensitive comparison is equal, then secondary
+              // sort order should be case sensitive.
+              if (Result == 0)
+                Result = LHS.name.compare(RHS.name);
+              return Result < 0;
+            });
 
   llvm::transform(nameCache, Results.begin(),
                   [](const ResultAndName &entry) { return entry.result; });
@@ -3366,7 +3366,7 @@ public:
   void addConstructorCallsForType(Type type, Identifier name,
                                   DeclVisibilityKind Reason,
                                   DynamicLookupInfo dynamicLookupInfo) {
-    if (!Ctx.LangOpts.CodeCompleteInitsInPostfixExpr)
+    if (!Sink.addInitsToTopLevel)
       return;
 
     assert(CurrDeclContext);
@@ -4459,7 +4459,7 @@ public:
     });
 
     // Optionally add object literals.
-    if (CompletionContext->includeObjectLiterals()) {
+    if (Sink.includeObjectLiterals) {
       auto floatType = context.getFloatType();
       addFromProto(LK::ColorLiteral, [&](Builder &builder) {
         builder.addBaseName("#colorLiteral");
@@ -5766,7 +5766,7 @@ void CodeCompletionCallbacksImpl::completePostfixExprParen(Expr *E,
   CodeCompleteTokenExpr = static_cast<CodeCompletionExpr*>(CodeCompletionE);
 
   ShouldCompleteCallPatternAfterParen = true;
-  if (Context.LangOpts.CodeCompleteCallPatternHeuristics) {
+  if (CompletionContext.getCallPatternHeuristics()) {
     // Lookahead one token to decide what kind of call completions to provide.
     // When it appears that there is already code for the call present, just
     // complete values and/or argument labels.  Otherwise give the entire call
@@ -5908,7 +5908,7 @@ void CodeCompletionCallbacksImpl::completeCallArg(CodeCompletionExpr *E,
   ShouldCompleteCallPatternAfterParen = false;
   if (isFirst) {
     ShouldCompleteCallPatternAfterParen = true;
-    if (Context.LangOpts.CodeCompleteCallPatternHeuristics) {
+    if (CompletionContext.getCallPatternHeuristics()) {
       // Lookahead one token to decide what kind of call completions to provide.
       // When it appears that there is already code for the call present, just
       // complete values and/or argument labels.  Otherwise give the entire call
@@ -6623,7 +6623,6 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
       // ModuleFilename can be empty if something strange happened during
       // module loading, for example, the module file is corrupted.
       if (!ModuleFilename.empty()) {
-        auto &Ctx = TheModule->getASTContext();
         CodeCompletionCache::Key K{
             ModuleFilename.str(),
             std::string(TheModule->getName()),
@@ -6635,7 +6634,7 @@ static void deliverCompletionResults(CodeCompletionContext &CompletionContext,
             SF.hasTestableOrPrivateImport(
                 AccessLevel::Internal, TheModule,
                 SourceFile::ImportQueryKind::PrivateOnly),
-            Ctx.LangOpts.CodeCompleteInitsInPostfixExpr,
+            CompletionContext.getAddInitsToTopLevel(),
             CompletionContext.getAnnotateResult(),
         };
 
@@ -7600,7 +7599,11 @@ void SimpleCachingCodeCompletionConsumer::handleResultsAndModules(
     if (!V.hasValue()) {
       // No cached results found. Fill the cache.
       V = context.Cache.createValue();
-      (*V)->Sink.annotateResult = context.getAnnotateResult();
+      CodeCompletionResultSink &Sink = (*V)->Sink;
+      Sink.annotateResult = context.getAnnotateResult();
+      Sink.addInitsToTopLevel = context.getAddInitsToTopLevel();
+      Sink.enableCallPatternHeuristics = context.getCallPatternHeuristics();
+      Sink.includeObjectLiterals = context.includeObjectLiterals();
       lookupCodeCompletionResultsFromModule(
           (*V)->Sink, R.TheModule, R.Key.AccessPath,
           R.Key.ResultsHaveLeadingDot, SF);

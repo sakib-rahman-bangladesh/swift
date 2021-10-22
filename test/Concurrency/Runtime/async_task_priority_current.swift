@@ -18,9 +18,18 @@ extension TaskPriority: CustomStringConvertible {
 }
 
 @available(SwiftStdlib 5.5, *)
+@main struct Main {
+  static func main() async {
+    print("main priority: \(Task.currentPriority)") // CHECK: main priority: TaskPriority(rawValue: [[#MAIN_PRIORITY:]])
+    await test_detach()
+    await test_multiple_lo_indirectly_escalated()
+  }
+}
+
+@available(SwiftStdlib 5.5, *)
 func test_detach() async {
   let a1 = Task.currentPriority
-  print("a1: \(a1)") // CHECK: TaskPriority(rawValue: 21)
+  print("a1: \(a1)") // CHECK: a1: TaskPriority(rawValue: [[#MAIN_PRIORITY]])
 
   // Note: remember to detach using a higher priority, otherwise a lower one
   // might be escalated by the get() and we could see `default` in the detached
@@ -31,7 +40,7 @@ func test_detach() async {
   }.get()
 
   let a3 = Task.currentPriority
-  print("a3: \(a3)") // CHECK: a3: TaskPriority(rawValue: 21)
+  print("a3: \(a3)") // CHECK: a3: TaskPriority(rawValue: [[#MAIN_PRIORITY]])
 }
 
 @available(SwiftStdlib 5.5, *)
@@ -66,10 +75,4 @@ func test_multiple_lo_indirectly_escalated() async {
   print("default done") // CHECK: default done
 }
 
-@available(SwiftStdlib 5.5, *)
-@main struct Main {
-  static func main() async {
-    await test_detach()
-    await test_multiple_lo_indirectly_escalated()
-  }
-}
+

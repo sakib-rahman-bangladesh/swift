@@ -68,6 +68,10 @@ def emit_abi_descriptor_path
   : Separate<["-"], "emit-abi-descriptor-path">, MetaVarName<"<path>">,
     HelpText<"Output the ABI descriptor of current module to <path>">;
 
+def emit_module_semantic_info_path
+  : Separate<["-"], "emit-module-semantic-info-path">, MetaVarName<"<path>">,
+    HelpText<"Output semantic info of current module to <path>">;
+
 def serialize_module_interface_dependency_hashes
   : Flag<["-"], "serialize-module-interface-dependency-hashes">,
     Flags<[HelpHidden]>;
@@ -137,6 +141,10 @@ def enable_testable_attr_requires_testable_module :
 def disable_testable_attr_requires_testable_module :
   Flag<["-"], "disable-testable-attr-requires-testable-module">,
   HelpText<"Disable checking of @testable">;
+
+def enable_clang_spi :
+  Flag<["-"], "enable-clang-spi">,
+  HelpText<"Import Clang SPIs as Swift SPIs">;
 
 def enable_target_os_checking :
   Flag<["-"], "enable-target-os-checking">,
@@ -461,6 +469,10 @@ def disable_availability_checking : Flag<["-"],
   "disable-availability-checking">,
   HelpText<"Disable checking for potentially unavailable APIs">;
 
+def check_api_availability_only : Flag<["-"],
+  "check-api-availability-only">,
+  HelpText<"Only check the availability of the APIs, ignore function bodies">;
+
 def enable_conformance_availability_errors : Flag<["-"],
   "enable-conformance-availability-errors">,
   HelpText<"Diagnose conformance availability violations as errors">;
@@ -506,6 +518,10 @@ def internalize_at_link : Flag<["-"], "internalize-at-link">,
   HelpText<"Allow internalizing public symbols and vtables at link time (assume"
   " all client code of public types is part of the same link unit, or that"
   " external symbols are explicitly requested via -exported_symbols_list)">;
+
+def conditional_runtime_records : Flag<["-"], "conditional-runtime-records">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Allow removal of runtime metadata records (public types, protocol conformances) based on whether they're used or unused">;
 
 def disable_previous_implementation_calls_in_dynamic_replacements :
   Flag<["-"], "disable-previous-implementation-calls-in-dynamic-replacements">,
@@ -758,6 +774,10 @@ def experimental_print_full_convention :
 def experimental_one_way_closure_params :
   Flag<["-"], "experimental-one-way-closure-params">,
   HelpText<"Enable experimental support for one-way closure parameters">;
+
+def experimental_multi_statement_closures :
+  Flag<["-"], "experimental-multi-statement-closures">,
+  HelpText<"Enable experimental support for type inference in multi-statement closures">;
 
 def prebuilt_module_cache_path :
   Separate<["-"], "prebuilt-module-cache-path">,

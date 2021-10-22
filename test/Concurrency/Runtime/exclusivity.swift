@@ -3,10 +3,10 @@
 // REQUIRES: executable_test
 // REQUIRES: concurrency
 
-// rdar://76038845
-// REQUIRES: rdar83064974
 // REQUIRES: concurrency_runtime
 // UNSUPPORTED: back_deployment_runtime
+// UNSUPPORTED: OS=wasi
+// UNSUPPORTED: use_os_stdlib
 
 // This test makes sure that:
 //

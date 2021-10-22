@@ -362,7 +362,8 @@ getSemanticResults(SILFunctionType *functionType, IndexSubset *parameterIndices,
 }
 
 static CanGenericSignature buildDifferentiableGenericSignature(CanGenericSignature sig,
-                                                               CanType tanType) {
+                                                               CanType tanType,
+                                                               CanType origTypeOfAbstraction) {
   if (!sig)
     return sig;
 
@@ -390,10 +391,50 @@ static CanGenericSignature buildDifferentiableGenericSignature(CanGenericSignatu
     }
   }
 
+  if (origTypeOfAbstraction) {
+    (void) origTypeOfAbstraction.findIf([&](Type t) -> bool {
+      if (auto *at = t->getAs<ArchetypeType>()) {
+        types.insert(at->getInterfaceType()->getCanonicalType());
+        for (auto *proto : at->getConformsTo()) {
+          reqs.push_back(Requirement(RequirementKind::Conformance,
+                                     at->getInterfaceType(),
+                                     proto->getDeclaredInterfaceType()));
+        }
+      }
+      return false;
+    });
+  }
+
   return evaluateOrDefault(
       ctx.evaluator,
       AbstractGenericSignatureRequest{sig.getPointer(), {}, reqs},
       GenericSignature()).getCanonicalSignature();
+}
+
+/// Given an original type, computes its tangent type for the purpose of
+/// building a linear map using this type.  When the original type is an
+/// archetype or contains a type parameter, appends a new generic parameter and
+/// a corresponding replacement type to the given containers.
+static CanType getAutoDiffTangentTypeForLinearMap(
+  Type originalType,
+  LookupConformanceFn lookupConformance,
+  SmallVectorImpl<GenericTypeParamType *> &substGenericParams,
+  SmallVectorImpl<Type> &substReplacements,
+  ASTContext &context
+) {
+  auto maybeTanType = originalType->getAutoDiffTangentSpace(lookupConformance);
+  assert(maybeTanType && "Type does not have a tangent space?");
+  auto tanType = maybeTanType->getCanonicalType();
+  // If concrete, the tangent type is concrete.
+  if (!tanType->hasArchetype() && !tanType->hasTypeParameter())
+    return tanType;
+  // Otherwise, the tangent type is a new generic parameter substituted for the
+  // tangent type.
+  auto gpIndex = substGenericParams.size();
+  auto gpType = CanGenericTypeParamType::get(0, gpIndex, context);
+  substGenericParams.push_back(gpType);
+  substReplacements.push_back(tanType);
+  return gpType;
 }
 
 /// Returns the differential type for the given original function type,
@@ -401,6 +442,7 @@ static CanGenericSignature buildDifferentiableGenericSignature(CanGenericSignatu
 static CanSILFunctionType getAutoDiffDifferentialType(
     SILFunctionType *originalFnTy, IndexSubset *parameterIndices,
     IndexSubset *resultIndices, LookupConformanceFn lookupConformance,
+    CanType origTypeOfAbstraction,
     TypeConverter &TC) {
   // Given the tangent type and the corresponding original parameter's
   // convention, returns the tangent parameter's convention.
@@ -408,7 +450,7 @@ static CanSILFunctionType getAutoDiffDifferentialType(
       [&](CanType tanType,
           ParameterConvention origParamConv) -> ParameterConvention {
     auto sig = buildDifferentiableGenericSignature(
-      originalFnTy->getSubstGenericSignature(), tanType);
+      originalFnTy->getSubstGenericSignature(), tanType, origTypeOfAbstraction);
 
     tanType = tanType->getCanonicalType(sig);
     AbstractionPattern pattern(sig, tanType);
@@ -436,7 +478,7 @@ static CanSILFunctionType getAutoDiffDifferentialType(
       [&](CanType tanType,
           ResultConvention origResConv) -> ResultConvention {
     auto sig = buildDifferentiableGenericSignature(
-      originalFnTy->getSubstGenericSignature(), tanType);
+      originalFnTy->getSubstGenericSignature(), tanType, origTypeOfAbstraction);
 
     tanType = tanType->getCanonicalType(sig);
     AbstractionPattern pattern(sig, tanType);
@@ -471,45 +513,32 @@ static CanSILFunctionType getAutoDiffDifferentialType(
   getDifferentiabilityParameters(originalFnTy, parameterIndices, diffParams);
   SmallVector<SILParameterInfo, 8> differentialParams;
   for (auto &param : diffParams) {
-    auto paramTan =
-        param.getInterfaceType()->getAutoDiffTangentSpace(lookupConformance);
-    assert(paramTan && "Parameter type does not have a tangent space?");
-    auto paramTanType = paramTan->getCanonicalType();
-    auto paramConv = getTangentParameterConvention(paramTanType,
-                                                   param.getConvention());
-    if (!paramTanType->hasArchetype() && !paramTanType->hasTypeParameter()) {
-      differentialParams.push_back(
-          {paramTan->getCanonicalType(), paramConv});
-    } else {
-      auto gpIndex = substGenericParams.size();
-      auto gpType = CanGenericTypeParamType::get(0, gpIndex, ctx);
-      substGenericParams.push_back(gpType);
-      substReplacements.push_back(paramTanType);
-      differentialParams.push_back({gpType, paramConv});
-    }
+    auto paramTanType = getAutoDiffTangentTypeForLinearMap(
+        param.getInterfaceType(), lookupConformance,
+        substGenericParams, substReplacements, ctx);
+    auto paramConv = getTangentParameterConvention(
+        // FIXME(rdar://82549134): Use `resultTanType` to compute it instead.
+        param.getInterfaceType()
+            ->getAutoDiffTangentSpace(lookupConformance)
+            ->getCanonicalType(),
+        param.getConvention());
+    differentialParams.push_back({paramTanType, paramConv});
   }
   SmallVector<SILResultInfo, 1> differentialResults;
   for (auto resultIndex : resultIndices->getIndices()) {
     // Handle formal original result.
     if (resultIndex < originalFnTy->getNumResults()) {
       auto &result = originalResults[resultIndex];
-      auto resultTan =
-          result.getInterfaceType()->getAutoDiffTangentSpace(lookupConformance);
-      assert(resultTan && "Result type does not have a tangent space?");
-      auto resultTanType = resultTan->getCanonicalType();
-      auto resultConv =
-          getTangentResultConvention(resultTanType, result.getConvention());
-      if (!resultTanType->hasArchetype() &&
-          !resultTanType->hasTypeParameter()) {
-        differentialResults.push_back(
-            {resultTan->getCanonicalType(), resultConv});
-      } else {
-        auto gpIndex = substGenericParams.size();
-        auto gpType = CanGenericTypeParamType::get(0, gpIndex, ctx);
-        substGenericParams.push_back(gpType);
-        substReplacements.push_back(resultTanType);
-        differentialResults.push_back({gpType, resultConv});
-      }
+      auto resultTanType = getAutoDiffTangentTypeForLinearMap(
+          result.getInterfaceType(), lookupConformance,
+          substGenericParams, substReplacements, ctx);
+      auto resultConv = getTangentResultConvention(
+          // FIXME(rdar://82549134): Use `resultTanType` to compute it instead.
+          result.getInterfaceType()
+              ->getAutoDiffTangentSpace(lookupConformance)
+              ->getCanonicalType(),
+          result.getConvention());
+      differentialResults.push_back({resultTanType, resultConv});
       continue;
     }
     // Handle original `inout` parameter.
@@ -524,11 +553,11 @@ static CanSILFunctionType getAutoDiffDifferentialType(
     if (parameterIndices->contains(paramIndex))
       continue;
     auto inoutParam = originalFnTy->getParameters()[paramIndex];
-    auto paramTan = inoutParam.getInterfaceType()->getAutoDiffTangentSpace(
-        lookupConformance);
-    assert(paramTan && "Parameter type does not have a tangent space?");
+    auto inoutParamTanType = getAutoDiffTangentTypeForLinearMap(
+        inoutParam.getInterfaceType(), lookupConformance,
+        substGenericParams, substReplacements, ctx);
     differentialResults.push_back(
-        {paramTan->getCanonicalType(), ResultConvention::Indirect});
+        {inoutParamTanType, ResultConvention::Indirect});
   }
 
   SubstitutionMap substitutions;
@@ -552,7 +581,7 @@ static CanSILFunctionType getAutoDiffDifferentialType(
 static CanSILFunctionType getAutoDiffPullbackType(
     SILFunctionType *originalFnTy, IndexSubset *parameterIndices,
     IndexSubset *resultIndices, LookupConformanceFn lookupConformance,
-    TypeConverter &TC) {
+    CanType origTypeOfAbstraction, TypeConverter &TC) {
   auto &ctx = originalFnTy->getASTContext();
   SmallVector<GenericTypeParamType *, 4> substGenericParams;
   SmallVector<Requirement, 4> substRequirements;
@@ -569,7 +598,7 @@ static CanSILFunctionType getAutoDiffPullbackType(
       [&](CanType tanType,
           ResultConvention origResConv) -> ParameterConvention {
     auto sig = buildDifferentiableGenericSignature(
-      originalFnTy->getSubstGenericSignature(), tanType);
+      originalFnTy->getSubstGenericSignature(), tanType, origTypeOfAbstraction);
 
     tanType = tanType->getCanonicalType(sig);
     AbstractionPattern pattern(sig, tanType);
@@ -600,7 +629,7 @@ static CanSILFunctionType getAutoDiffPullbackType(
       [&](CanType tanType,
           ParameterConvention origParamConv) -> ResultConvention {
     auto sig = buildDifferentiableGenericSignature(
-      originalFnTy->getSubstGenericSignature(), tanType);
+      originalFnTy->getSubstGenericSignature(), tanType, origTypeOfAbstraction);
 
     tanType = tanType->getCanonicalType(sig);
     AbstractionPattern pattern(sig, tanType);
@@ -635,23 +664,16 @@ static CanSILFunctionType getAutoDiffPullbackType(
     // Handle formal original result.
     if (resultIndex < originalFnTy->getNumResults()) {
       auto &origRes = originalResults[resultIndex];
-      auto resultTan = origRes.getInterfaceType()->getAutoDiffTangentSpace(
-          lookupConformance);
-      assert(resultTan && "Result type does not have a tangent space?");
-      auto resultTanType = resultTan->getCanonicalType();
-      auto paramTanConvention = getTangentParameterConventionForOriginalResult(
-          resultTanType, origRes.getConvention());
-      if (!resultTanType->hasArchetype() &&
-          !resultTanType->hasTypeParameter()) {
-        auto resultTanType = resultTan->getCanonicalType();
-        pullbackParams.push_back({resultTanType, paramTanConvention});
-      } else {
-        auto gpIndex = substGenericParams.size();
-        auto gpType = CanGenericTypeParamType::get(0, gpIndex, ctx);
-        substGenericParams.push_back(gpType);
-        substReplacements.push_back(resultTanType);
-        pullbackParams.push_back({gpType, paramTanConvention});
-      }
+      auto resultTanType = getAutoDiffTangentTypeForLinearMap(
+          origRes.getInterfaceType(), lookupConformance,
+          substGenericParams, substReplacements, ctx);
+      auto paramConv = getTangentParameterConventionForOriginalResult(
+          // FIXME(rdar://82549134): Use `resultTanType` to compute it instead.
+          origRes.getInterfaceType()
+              ->getAutoDiffTangentSpace(lookupConformance)
+              ->getCanonicalType(),
+          origRes.getConvention());
+      pullbackParams.push_back({resultTanType, paramConv});
       continue;
     }
     // Handle original `inout` parameter.
@@ -661,28 +683,18 @@ static CanSILFunctionType getAutoDiffPullbackType(
     auto paramIndex =
         std::distance(originalFnTy->getParameters().begin(), &*inoutParamIt);
     auto inoutParam = originalFnTy->getParameters()[paramIndex];
-    auto paramTan = inoutParam.getInterfaceType()->getAutoDiffTangentSpace(
-        lookupConformance);
-    assert(paramTan && "Parameter type does not have a tangent space?");
     // The pullback parameter convention depends on whether the original `inout`
     // paramater is a differentiability parameter.
     // - If yes, the pullback parameter convention is `@inout`.
     // - If no, the pullback parameter convention is `@in_guaranteed`.
+    auto inoutParamTanType = getAutoDiffTangentTypeForLinearMap(
+        inoutParam.getInterfaceType(), lookupConformance,
+        substGenericParams, substReplacements, ctx);
     bool isWrtInoutParameter = parameterIndices->contains(paramIndex);
     auto paramTanConvention = isWrtInoutParameter
-                                  ? inoutParam.getConvention()
-                                  : ParameterConvention::Indirect_In_Guaranteed;
-    auto paramTanType = paramTan->getCanonicalType();
-    if (!paramTanType->hasArchetype() && !paramTanType->hasTypeParameter()) {
-      pullbackParams.push_back(
-          SILParameterInfo(paramTanType, paramTanConvention));
-    } else {
-      auto gpIndex = substGenericParams.size();
-      auto gpType = CanGenericTypeParamType::get(0, gpIndex, ctx);
-      substGenericParams.push_back(gpType);
-      substReplacements.push_back(paramTanType);
-      pullbackParams.push_back({gpType, paramTanConvention});
-    }
+        ? inoutParam.getConvention()
+        : ParameterConvention::Indirect_In_Guaranteed;
+    pullbackParams.push_back({inoutParamTanType, paramTanConvention});
   }
 
   // Collect pullback results.
@@ -694,21 +706,16 @@ static CanSILFunctionType getAutoDiffPullbackType(
     // and always appear as pullback parameters.
     if (param.isIndirectInOut())
       continue;
-    auto paramTan =
-        param.getInterfaceType()->getAutoDiffTangentSpace(lookupConformance);
-    assert(paramTan && "Parameter type does not have a tangent space?");
-    auto paramTanType = paramTan->getCanonicalType();
+    auto paramTanType = getAutoDiffTangentTypeForLinearMap(
+        param.getInterfaceType(), lookupConformance,
+        substGenericParams, substReplacements, ctx);
     auto resultTanConvention = getTangentResultConventionForOriginalParameter(
-        paramTanType, param.getConvention());
-    if (!paramTanType->hasArchetype() && !paramTanType->hasTypeParameter()) {
-      pullbackResults.push_back({paramTanType, resultTanConvention});
-    } else {
-      auto gpIndex = substGenericParams.size();
-      auto gpType = CanGenericTypeParamType::get(0, gpIndex, ctx);
-      substGenericParams.push_back(gpType);
-      substReplacements.push_back(paramTanType);
-      pullbackResults.push_back({gpType, resultTanConvention});
-    }
+        // FIXME(rdar://82549134): Use `resultTanType` to compute it instead.
+        param.getInterfaceType()
+            ->getAutoDiffTangentSpace(lookupConformance)
+            ->getCanonicalType(),
+        param.getConvention());
+    pullbackResults.push_back({paramTanType, resultTanConvention});
   }
   SubstitutionMap substitutions;
   if (!substGenericParams.empty()) {
@@ -789,7 +796,8 @@ CanSILFunctionType SILFunctionType::getAutoDiffDerivativeFunctionType(
     AutoDiffDerivativeFunctionKind kind, TypeConverter &TC,
     LookupConformanceFn lookupConformance,
     CanGenericSignature derivativeFnInvocationGenSig,
-    bool isReabstractionThunk) {
+    bool isReabstractionThunk,
+    CanType origTypeOfAbstraction) {
   assert(parameterIndices);
   assert(!parameterIndices->isEmpty() && "Parameter indices must not be empty");
   assert(resultIndices);
@@ -819,12 +827,14 @@ CanSILFunctionType SILFunctionType::getAutoDiffDerivativeFunctionType(
   case AutoDiffDerivativeFunctionKind::JVP:
     closureType =
         getAutoDiffDifferentialType(constrainedOriginalFnTy, parameterIndices,
-                                    resultIndices, lookupConformance, TC);
+                                    resultIndices, lookupConformance,
+                                    origTypeOfAbstraction, TC);
     break;
   case AutoDiffDerivativeFunctionKind::VJP:
     closureType =
         getAutoDiffPullbackType(constrainedOriginalFnTy, parameterIndices,
-                                resultIndices, lookupConformance, TC);
+                                resultIndices, lookupConformance,
+                                origTypeOfAbstraction, TC);
     break;
   }
   // Compute the derivative function parameters.
@@ -2212,8 +2222,13 @@ static CanSILFunctionType getSILFunctionType(
 
   // Lower the capture context parameters, if any.
   if (constant && constant->getAnyFunctionRef()) {
+    // Lower in the context of the closure. Since the set of captures is a
+    // private contract between the closure and its enclosing context, we
+    // don't need to keep its capture types opaque.
     auto expansion = TypeExpansionContext::maximal(
-        expansionContext.getContext(), expansionContext.isWholeModuleContext());
+        constant->getAnyFunctionRef()->getAsDeclContext(), false);
+    // ...unless it's inlinable, in which case it might get inlined into
+    // some place we need to keep opaque types opaque.
     if (constant->isSerialized())
       expansion = TypeExpansionContext::minimal();
     lowerCaptureContextParameters(TC, *constant, genericSig, expansion, inputs);
@@ -2535,6 +2550,9 @@ static CanSILFunctionType getNativeSILFunctionType(
     case SILDeclRef::Kind::Deallocator:
       return getSILFunctionTypeForConventions(DeallocatorConventions());
 
+    case SILDeclRef::Kind::AsyncEntryPoint:
+      return getSILFunctionTypeForConventions(
+          DefaultConventions(NormalParameterConvention::Guaranteed));
     case SILDeclRef::Kind::EntryPoint:
       llvm_unreachable("Handled by getSILFunctionTypeForAbstractCFunction");
     }
@@ -3080,6 +3098,7 @@ static ObjCSelectorFamily getObjCSelectorFamily(SILDeclRef c) {
   case SILDeclRef::Kind::PropertyWrapperBackingInitializer:
   case SILDeclRef::Kind::PropertyWrapperInitFromProjectedValue:
   case SILDeclRef::Kind::EntryPoint:
+  case SILDeclRef::Kind::AsyncEntryPoint:
     llvm_unreachable("Unexpected Kind of foreign SILDeclRef");
   }
 
@@ -3352,6 +3371,8 @@ TypeConverter::getDeclRefRepresentation(SILDeclRef c) {
     case SILDeclRef::Kind::IVarDestroyer:
       return SILFunctionTypeRepresentation::Method;
 
+    case SILDeclRef::Kind::AsyncEntryPoint:
+      return SILFunctionTypeRepresentation::Thin;
     case SILDeclRef::Kind::EntryPoint:
       return SILFunctionTypeRepresentation::CFunctionPointer;
   }
@@ -4179,6 +4200,7 @@ static AbstractFunctionDecl *getBridgedFunction(SILDeclRef declRef) {
   case SILDeclRef::Kind::IVarInitializer:
   case SILDeclRef::Kind::IVarDestroyer:
   case SILDeclRef::Kind::EntryPoint:
+  case SILDeclRef::Kind::AsyncEntryPoint:
     return nullptr;
   }
   llvm_unreachable("bad SILDeclRef kind");

@@ -25,7 +25,6 @@
 #include "swift/AST/DiagnosticsParse.h"
 #include "swift/AST/Effects.h"
 #include "swift/AST/GenericEnvironment.h"
-#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/ImportCache.h"
 #include "swift/AST/ModuleNameLookup.h"
 #include "swift/AST/NameLookup.h"
@@ -107,6 +106,7 @@ public:
   IGNORED_ATTR(NoDerivative)
   IGNORED_ATTR(SpecializeExtension)
   IGNORED_ATTR(Sendable)
+  IGNORED_ATTR(NonSendable)
   IGNORED_ATTR(AtRethrows)
   IGNORED_ATTR(AtReasync)
   IGNORED_ATTR(UnsafeSendable)
@@ -256,7 +256,6 @@ public:
 
   void visitActorAttr(ActorAttr *attr);
   void visitDistributedActorAttr(DistributedActorAttr *attr);
-  void visitDistributedActorIndependentAttr(DistributedActorIndependentAttr *attr);
   void visitGlobalActorAttr(GlobalActorAttr *attr);
   void visitAsyncAttr(AsyncAttr *attr);
   void visitMarkerAttr(MarkerAttr *attr);
@@ -1889,41 +1888,29 @@ synthesizeMainBody(AbstractFunctionDecl *fn, void *arg) {
   Expr *returnedExpr;
 
   if (mainFunction->hasAsync()) {
-    // Pass main into _runAsyncMain(_ asyncFunc: () async throws -> ())
-    // Resulting $main looks like:
-    // $main() { _runAsyncMain(main) }
+    // Ensure that the concurrency module is loaded
     auto *concurrencyModule = context.getLoadedModule(context.Id_Concurrency);
     if (!concurrencyModule) {
       context.Diags.diagnose(mainFunction->getAsyncLoc(),
                              diag::async_main_no_concurrency);
       auto result = new (context) ErrorExpr(mainFunction->getSourceRange());
-      SmallVector<ASTNode, 1> stmts;
-      stmts.push_back(result);
-      auto body = BraceStmt::create(context, SourceLoc(), stmts,
-                                    SourceLoc(), /*Implicit*/true);
-
+      ASTNode stmts[] = {result};
+      auto body = BraceStmt::create(context, SourceLoc(), stmts, SourceLoc(),
+                                    /*Implicit*/ true);
       return std::make_pair(body, /*typechecked*/true);
     }
 
-    SmallVector<ValueDecl *, 1> decls;
-    concurrencyModule->lookupQualified(
-        concurrencyModule,
-        DeclNameRef(context.getIdentifier("_runAsyncMain")),
-        NL_QualifiedDefault | NL_IncludeUsableFromInline,
-        decls);
-    assert(!decls.empty() && "Failed to find _runAsyncMain");
-    FuncDecl *runner = cast<FuncDecl>(decls[0]);
-
-    auto asyncRunnerDeclRef = ConcreteDeclRef(runner, substitutionMap);
-
-    DeclRefExpr *funcExpr = new (context) DeclRefExpr(asyncRunnerDeclRef,
-                                                      DeclNameLoc(),
-                                                      /*implicit=*/true);
-    funcExpr->setType(runner->getInterfaceType());
-    auto *argList =
-        ArgumentList::forImplicitUnlabeled(context, {memberRefExpr});
-    auto *callExpr = CallExpr::createImplicit(context, funcExpr, argList);
-    returnedExpr = callExpr;
+    // $main() async { await main() }
+    Expr *awaitExpr =
+        new (context) AwaitExpr(callExpr->getLoc(), callExpr,
+                                context.TheEmptyTupleType, /*implicit*/ true);
+    if (mainFunction->hasThrows()) {
+      // $main() async throws { try await main() }
+      awaitExpr =
+          new (context) TryExpr(callExpr->getLoc(), awaitExpr,
+                                context.TheEmptyTupleType, /*implicit*/ true);
+    }
+    returnedExpr = awaitExpr;
   } else if (mainFunction->hasThrows()) {
     auto *tryExpr = new (context) TryExpr(
         callExpr->getLoc(), callExpr, context.TheEmptyTupleType, /*implicit=*/true);
@@ -2040,7 +2027,7 @@ SynthesizeMainFunctionRequest::evaluate(Evaluator &evaluator,
       DeclName(context, DeclBaseName(context.Id_MainEntryPoint),
                ParameterList::createEmpty(context)),
       /*NameLoc=*/SourceLoc(),
-      /*Async=*/false,
+      /*Async=*/mainFunction->hasAsync(),
       /*Throws=*/mainFunction->hasThrows(),
       /*GenericParams=*/nullptr, ParameterList::createEmpty(context),
       /*FnRetType=*/TupleType::getEmpty(context), declContext);
@@ -2243,28 +2230,17 @@ void AttributeChecker::visitSpecializeAttr(SpecializeAttr *attr) {
     return;
   }
 
-  // Form a new generic signature based on the old one.
-  GenericSignatureBuilder Builder(D->getASTContext());
+  InferredGenericSignatureRequest request{
+      DC->getParentModule(),
+      genericSig.getPointer(),
+      /*genericParams=*/nullptr,
+      WhereClauseOwner(FD, attr),
+      /*addedRequirements=*/{},
+      /*inferenceSources=*/{},
+      /*allowConcreteGenericParams=*/true};
 
-  // First, add the old generic signature.
-  Builder.addGenericSignature(genericSig);
-
-  // Go over the set of requirements, adding them to the builder.
-  WhereClauseOwner(FD, attr).visitRequirements(TypeResolutionStage::Interface,
-      [&](const Requirement &req, RequirementRepr *reqRepr) {
-        // Add the requirement to the generic signature builder.
-        using FloatingRequirementSource =
-          GenericSignatureBuilder::FloatingRequirementSource;
-        Builder.addRequirement(req, reqRepr,
-                               FloatingRequirementSource::forExplicit(
-                                 reqRepr->getSeparatorLoc()),
-                               nullptr, DC->getParentModule());
-        return false;
-      });
-
-  // Check the result.
-  auto specializedSig = std::move(Builder).computeGenericSignature(
-      /*allowConcreteGenericParams=*/true);
+  auto specializedSig = evaluateOrDefault(Ctx.evaluator, request,
+                                          GenericSignature());
 
   // Check the validity of provided requirements.
   checkSpecializeAttrRequirements(attr, genericSig, specializedSig, Ctx);
@@ -2502,7 +2478,7 @@ static FuncDecl *findSimilarAccessor(DeclNameRef replacedVarName,
   }
 
   assert(!isa<FuncDecl>(results[0]));
-  
+
   auto *origStorage = cast<AbstractStorageDecl>(results[0]);
   if (forDynamicReplacement && !origStorage->isDynamic()) {
     Diags.diagnose(attr->getLocation(),
@@ -3303,9 +3279,9 @@ void AttributeChecker::checkOriginalDefinedInAttrs(Decl *D,
                AttrName);
       return;
     }
-    if (IntroVer.getValue() >= Attr->MovedVersion) {
+    if (IntroVer.getValue() > Attr->MovedVersion) {
       diagnose(AtLoc,
-               diag::originally_definedin_must_after_available_version,
+               diag::originally_definedin_must_not_before_available_version,
                AttrName);
       return;
     }
@@ -4278,7 +4254,8 @@ bool resolveDifferentiableAttrDerivativeGenericSignature(
   // - If the `@differentiable` attribute has a `where` clause, use it to
   //   compute the derivative generic signature.
   // - Otherwise, use the original function's generic signature by default.
-  derivativeGenSig = original->getGenericSignature();
+  auto originalGenSig = original->getGenericSignature();
+  derivativeGenSig = originalGenSig;
 
   // Handle the `where` clause, if it exists.
   // - Resolve attribute where clause requirements and store in the attribute
@@ -4303,7 +4280,6 @@ bool resolveDifferentiableAttrDerivativeGenericSignature(
       return true;
     }
 
-    auto originalGenSig = original->getGenericSignature();
     if (!originalGenSig) {
       // `where` clauses are valid only when the original function is generic.
       diags
@@ -4316,51 +4292,34 @@ bool resolveDifferentiableAttrDerivativeGenericSignature(
       return true;
     }
 
-    // Build a new generic signature for autodiff derivative functions.
-    GenericSignatureBuilder builder(ctx);
-    // Add the original function's generic signature.
-    builder.addGenericSignature(originalGenSig);
+    InferredGenericSignatureRequest request{
+        original->getParentModule(),
+        originalGenSig.getPointer(),
+        /*genericParams=*/nullptr,
+        WhereClauseOwner(original, attr),
+        /*addedRequirements=*/{},
+        /*inferenceSources=*/{},
+        /*allowConcreteParams=*/true};
 
-    using FloatingRequirementSource =
-        GenericSignatureBuilder::FloatingRequirementSource;
+    // Compute generic signature for derivative functions.
+    derivativeGenSig = evaluateOrDefault(ctx.evaluator, request,
+                                         GenericSignature());
 
-    bool errorOccurred = false;
-    WhereClauseOwner(original, attr)
-        .visitRequirements(
-            TypeResolutionStage::Structural,
-            [&](const Requirement &req, RequirementRepr *reqRepr) {
-              switch (req.getKind()) {
-              case RequirementKind::SameType:
-              case RequirementKind::Superclass:
-              case RequirementKind::Conformance:
-                break;
+    bool hadInvalidRequirements = false;
+    for (auto req : derivativeGenSig.requirementsNotSatisfiedBy(originalGenSig)) {
+      if (req.getKind() == RequirementKind::Layout) {
+        // Layout requirements are not supported.
+        diags
+            .diagnose(attr->getLocation(),
+                      diag::differentiable_attr_layout_req_unsupported);
+        hadInvalidRequirements = true;
+      }
+    }
 
-              // Layout requirements are not supported.
-              case RequirementKind::Layout:
-                diags
-                    .diagnose(attr->getLocation(),
-                              diag::differentiable_attr_layout_req_unsupported)
-                    .highlight(reqRepr->getSourceRange());
-                errorOccurred = true;
-                return false;
-              }
-
-              // Add requirement to generic signature builder.
-              builder.addRequirement(
-                  req, reqRepr, FloatingRequirementSource::forExplicit(
-                    reqRepr->getSeparatorLoc()),
-                  nullptr, original->getModuleContext());
-              return false;
-            });
-
-    if (errorOccurred) {
+    if (hadInvalidRequirements) {
       attr->setInvalid();
       return true;
     }
-
-    // Compute generic signature for derivative functions.
-    derivativeGenSig = std::move(builder).computeGenericSignature(
-        /*allowConcreteGenericParams=*/true);
   }
 
   attr->setDerivativeGenericSignature(derivativeGenSig);
@@ -5400,7 +5359,7 @@ void AttributeChecker::visitActorAttr(ActorAttr *attr) {
 void AttributeChecker::visitDistributedActorAttr(DistributedActorAttr *attr) {
   auto dc = D->getDeclContext();
 
-  // distributed can be applied to actor class definitions and async functions
+  // distributed can be applied to actor definitions and their methods
   if (auto varDecl = dyn_cast<VarDecl>(D)) {
     // distributed can not be applied to stored properties
     diagnoseAndRemoveAttr(attr, diag::distributed_actor_property);
@@ -5473,7 +5432,13 @@ void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
       // distributed actors. Attempts of nonisolated access would be
       // cross-actor, and that means they might be accessing on a remote actor,
       // in which case the stored property storage does not exist.
-      if (nominal && nominal->isDistributedActor()) {
+      //
+      // The synthesized "id" and "actorTransport" are the only exceptions,
+      // because the implementation mirrors them.
+      if (nominal && nominal->isDistributedActor() &&
+          !(var->isImplicit() &&
+            (var->getName() == Ctx.Id_id ||
+             var->getName() == Ctx.Id_actorTransport))) {
         diagnoseAndRemoveAttr(attr,
                               diag::nonisolated_distributed_actor_storage);
         return;
@@ -5501,16 +5466,6 @@ void AttributeChecker::visitNonisolatedAttr(NonisolatedAttr *attr) {
 
   if (auto VD = dyn_cast<ValueDecl>(D)) {
     (void)getActorIsolation(VD);
-  }
-}
-
-void AttributeChecker::visitDistributedActorIndependentAttr(DistributedActorIndependentAttr *attr) {
-  /// user-inaccessible _distributedActorIndependent can only be applied to let properties
-  if (auto var = dyn_cast<VarDecl>(D)) {
-    if (!var->isLet()) {
-      diagnoseAndRemoveAttr(attr, diag::distributed_actor_independent_property_must_be_let);
-      return;
-    }
   }
 }
 
@@ -5589,6 +5544,12 @@ void AttributeChecker::visitMarkerAttr(MarkerAttr *attr) {
       inheritedProto->diagnose(
           diag::decl_declared_here, inheritedProto->getName());
     }
+  }
+
+  if (Type superclass = proto->getSuperclass()) {
+    proto->diagnose(
+        diag::marker_protocol_inherit_class,
+        proto->getName(), superclass);
   }
 
   // A marker protocol cannot have any requirements.

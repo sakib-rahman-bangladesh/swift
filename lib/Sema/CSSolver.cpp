@@ -180,11 +180,13 @@ Solution ConstraintSystem::finalize() {
   }
 
   // Remember contextual types.
-  solution.contextualTypes.assign(
-      contextualTypes.begin(), contextualTypes.end());
+  for (auto &entry : contextualTypes) {
+    solution.contextualTypes.push_back({entry.first, entry.second.first});
+  }
 
   solution.solutionApplicationTargets = solutionApplicationTargets;
   solution.caseLabelItems = caseLabelItems;
+  solution.isolatedParams.append(isolatedParams.begin(), isolatedParams.end());
 
   for (const auto &transformed : resultBuilderTransformed) {
     solution.resultBuilderTransformed.insert(transformed);
@@ -230,9 +232,10 @@ void ConstraintSystem::applySolution(const Solution &solution) {
   // Register constraint restrictions.
   // FIXME: Copy these directly into some kind of partial solution?
   for (auto restriction : solution.ConstraintRestrictions) {
-    ConstraintRestrictions.push_back(
-        std::make_tuple(restriction.first.first, restriction.first.second,
-                        restriction.second));
+    auto &types = restriction.first;
+    ConstraintRestrictions.push_back(std::make_tuple(types.first.getPointer(),
+                                                     types.second.getPointer(),
+                                                     restriction.second));
   }
 
   // Register the solution's disjunction choices.
@@ -288,6 +291,10 @@ void ConstraintSystem::applySolution(const Solution &solution) {
   for (const auto &info : solution.caseLabelItems) {
     if (!getCaseLabelItemInfo(info.first))
       setCaseLabelItemInfo(info.first, info.second);
+  }
+
+  for (auto param : solution.isolatedParams) {
+    isolatedParams.insert(param);
   }
 
   for (const auto &transformed : solution.resultBuilderTransformed) {
@@ -519,6 +526,7 @@ ConstraintSystem::SolverScope::SolverScope(ConstraintSystem &cs)
   numContextualTypes = cs.contextualTypes.size();
   numSolutionApplicationTargets = cs.solutionApplicationTargets.size();
   numCaseLabelItems = cs.caseLabelItems.size();
+  numIsolatedParams = cs.isolatedParams.size();
   numImplicitValueConversions = cs.ImplicitValueConversions.size();
   numArgumentLists = cs.ArgumentLists.size();
 
@@ -626,6 +634,9 @@ ConstraintSystem::SolverScope::~SolverScope() {
 
   // Remove any case label item infos.
   truncate(cs.caseLabelItems, numCaseLabelItems);
+
+  // Remove any isolated parameters.
+  truncate(cs.isolatedParams, numIsolatedParams);
 
   // Remove any implicit value conversions.
   truncate(cs.ImplicitValueConversions, numImplicitValueConversions);
@@ -1605,8 +1616,7 @@ ConstraintSystem::filterDisjunction(
     // be attempted in-place because that would also try to operate on that
     // constraint, so instead let's keep the disjunction, but disable all
     // unviable choices.
-    if (choice->getOverloadChoice().getKind() ==
-        OverloadChoiceKind::KeyPathDynamicMemberLookup) {
+    if (choice->getOverloadChoice().isKeyPathDynamicMemberLookup()) {
       // Early simplification of the "keypath dynamic member lookup" choice
       // is impossible because it requires constraints associated with
       // subscript index expression to be present.
@@ -2195,6 +2205,18 @@ Constraint *ConstraintSystem::selectDisjunction() {
   return nullptr;
 }
 
+Constraint *ConstraintSystem::selectConjunction() {
+  for (auto &constraint : InactiveConstraints) {
+    if (constraint.isDisabled())
+      continue;
+
+    if (constraint.getKind() == ConstraintKind::Conjunction)
+      return &constraint;
+  }
+
+  return nullptr;
+}
+
 bool DisjunctionChoice::attempt(ConstraintSystem &cs) const {
   cs.simplifyDisjunctionChoice(Choice);
 
@@ -2298,4 +2320,18 @@ void DisjunctionChoice::propagateConversionInfo(ConstraintSystem &cs) const {
   if (constraints.empty())
     cs.addConstraint(ConstraintKind::Bind, typeVar, conversionType,
                      Choice->getLocator());
+}
+
+bool ConjunctionElement::attempt(ConstraintSystem &cs) const {
+  // First, let's bring all referenced variables into scope.
+  {
+    llvm::SmallPtrSet<TypeVariableType *, 4> referencedVars;
+    findReferencedVariables(cs, referencedVars);
+
+    for (auto *typeVar : referencedVars)
+      cs.addTypeVariable(typeVar);
+  }
+
+  auto result = cs.simplifyConstraint(*Element);
+  return result != ConstraintSystem::SolutionKind::Error;
 }

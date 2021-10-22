@@ -202,6 +202,7 @@ AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
     TypeDependentOperands.size();
   assert(SILNode::Bits.AllocStackInst.NumOperands ==
          TypeDependentOperands.size() && "Truncation");
+  auto *VD = Loc.getLocation().getAsASTNode<VarDecl>();
   SILNode::Bits.AllocStackInst.VarInfo =
       TailAllocatedDebugVariable(Var, getTrailingObjects<char>(),
                                  getTrailingObjects<SILType>(),
@@ -209,7 +210,7 @@ AllocStackInst::AllocStackInst(SILDebugLocation Loc, SILType elementType,
                                  getTrailingObjects<const SILDebugScope *>(),
                                  getTrailingObjects<SILDIExprElement>())
           .getRawValue();
-  if (auto *VD = Loc.getLocation().getAsASTNode<VarDecl>()) {
+  if (Var && VD) {
     TailAllocatedDebugVariable DbgVar(SILNode::Bits.AllocStackInst.VarInfo);
     DbgVar.setImplicit(VD->isImplicit() || DbgVar.isImplicit());
     SILNode::Bits.AllocStackInst.VarInfo = DbgVar.getRawValue();
@@ -308,11 +309,10 @@ AllocBoxInst::AllocBoxInst(SILDebugLocation Loc, CanSILBoxType BoxType,
                            ArrayRef<SILValue> TypeDependentOperands,
                            SILFunction &F, Optional<SILDebugVariable> Var,
                            bool hasDynamicLifetime)
-    : InstructionBaseWithTrailingOperands(TypeDependentOperands, Loc,
-                                      SILType::getPrimitiveObjectType(BoxType)),
+    : InstructionBaseWithTrailingOperands(
+          TypeDependentOperands, Loc, SILType::getPrimitiveObjectType(BoxType)),
       VarInfo(Var, getTrailingObjects<char>()),
-      dynamicLifetime(hasDynamicLifetime) {
-}
+      dynamicLifetime(hasDynamicLifetime) {}
 
 AllocBoxInst *AllocBoxInst::create(SILDebugLocation Loc,
                                    CanSILBoxType BoxType,
@@ -398,26 +398,6 @@ AllocExistentialBoxInst *AllocExistentialBoxInst::create(
                                                 Conformances,
                                                 TypeDependentOperands,
                                                 F);
-}
-
-AllocValueBufferInst::AllocValueBufferInst(
-    SILDebugLocation DebugLoc, SILType valueType, SILValue operand,
-    ArrayRef<SILValue> TypeDependentOperands)
-    : UnaryInstructionWithTypeDependentOperandsBase(DebugLoc, operand,
-                                                    TypeDependentOperands,
-                                                 valueType.getAddressType()) {}
-
-AllocValueBufferInst *
-AllocValueBufferInst::create(SILDebugLocation DebugLoc, SILType valueType,
-                             SILValue operand, SILFunction &F) {
-  SmallVector<SILValue, 8> TypeDependentOperands;
-  collectTypeDependentOperands(TypeDependentOperands, F, valueType.getASTType());
-  void *Buffer = F.getModule().allocateInst(
-      sizeof(AllocValueBufferInst) +
-          sizeof(Operand) * (TypeDependentOperands.size() + 1),
-      alignof(AllocValueBufferInst));
-  return ::new (Buffer) AllocValueBufferInst(DebugLoc, valueType, operand,
-                                             TypeDependentOperands);
 }
 
 BuiltinInst *BuiltinInst::create(SILDebugLocation Loc, Identifier Name,
@@ -1777,17 +1757,15 @@ SwitchValueInst *SwitchValueInst::create(
 
 SelectValueInst::SelectValueInst(SILDebugLocation DebugLoc, SILValue Operand,
                                  SILType Type, SILValue DefaultResult,
-                                 ArrayRef<SILValue> CaseValuesAndResults,
-                                 ValueOwnershipKind forwardingOwnership)
+                                 ArrayRef<SILValue> CaseValuesAndResults)
     : InstructionBaseWithTrailingOperands(Operand, CaseValuesAndResults,
-                                          DebugLoc, Type, forwardingOwnership) {
-}
+                                          DebugLoc, Type) {}
 
 SelectValueInst *
 SelectValueInst::create(SILDebugLocation Loc, SILValue Operand, SILType Type,
                         SILValue DefaultResult,
                         ArrayRef<std::pair<SILValue, SILValue>> CaseValues,
-                        SILModule &M, ValueOwnershipKind forwardingOwnership) {
+                        SILModule &M) {
   // Allocate enough room for the instruction with tail-allocated data for all
   // the case values and the SILSuccessor arrays. There are `CaseBBs.size()`
   // SILValues and `CaseBBs.size() + (DefaultBB ? 1 : 0)` successors.
@@ -1802,8 +1780,8 @@ SelectValueInst::create(SILDebugLocation Loc, SILValue Operand, SILType Type,
 
   auto Size = totalSizeToAlloc<swift::Operand>(CaseValuesAndResults.size() + 1);
   auto Buf = M.allocateInst(Size, alignof(SelectValueInst));
-  return ::new (Buf) SelectValueInst(Loc, Operand, Type, DefaultResult,
-                                     CaseValuesAndResults, forwardingOwnership);
+  return ::new (Buf)
+      SelectValueInst(Loc, Operand, Type, DefaultResult, CaseValuesAndResults);
 }
 
 template <typename SELECT_ENUM_INST>

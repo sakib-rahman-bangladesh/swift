@@ -1116,9 +1116,10 @@ void ConstraintSystem::print(raw_ostream &out) const {
   
   out << "Score: " << CurrentScore << "\n";
 
-  for (const auto &contextualType : contextualTypes) {
-    out << "Contextual Type: " << contextualType.second.getType().getString(PO);
-    if (TypeRepr *TR = contextualType.second.typeLoc.getTypeRepr()) {
+  for (const auto &contextualTypeEntry : contextualTypes) {
+    auto info = contextualTypeEntry.second.first;
+    out << "Contextual Type: " << info.getType().getString(PO);
+    if (TypeRepr *TR = info.typeLoc.getTypeRepr()) {
       out << " at ";
       TR->getSourceRange().print(out, getASTContext().SourceMgr, /*text*/false);
     }
@@ -1498,7 +1499,10 @@ CheckedCastKind TypeChecker::typeCheckCheckedCast(Type fromType,
       case BridgingCoercion:
         return CheckedCastKind::BridgingCoercion;
       }
+
       assert(hasCoercion && "Not a coercion?");
+      (void)hasCoercion;
+
       return CheckedCastKind::Coercion;
     }
   }
@@ -2025,7 +2029,12 @@ HasDynamicCallableAttributeRequest::evaluate(Evaluator &evaluator,
 }
 
 bool swift::shouldTypeCheckInEnclosingExpression(ClosureExpr *expr) {
-  return expr->hasSingleExpressionBody();
+  if (expr->hasSingleExpressionBody())
+    return true;
+
+  auto &ctx = expr->getASTContext();
+  return !expr->hasEmptyBody() &&
+         ctx.TypeCheckerOpts.EnableMultiStatementClosureInference;
 }
 
 void swift::forEachExprInConstraintSystem(

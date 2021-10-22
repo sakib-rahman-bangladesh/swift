@@ -45,7 +45,6 @@ enum SILLinkageEncoding : uint8_t {
   SIL_LINKAGE_PUBLIC_EXTERNAL,
   SIL_LINKAGE_HIDDEN_EXTERNAL,
   SIL_LINKAGE_SHARED_EXTERNAL,
-  SIL_LINKAGE_PRIVATE_EXTERNAL,
 };
 using SILLinkageField = BCFixed<4>;
 
@@ -309,7 +308,8 @@ namespace sil_block {
                      GenericSignatureIDField, // specialized signature
                      DeclIDField, // Target SILFunction name or 0.
                      DeclIDField,  // SPIGroup or 0.
-                     DeclIDField // SPIGroup Module name id.
+                     DeclIDField, // SPIGroup Module name id.
+                     BC_AVAIL_TUPLE // Availability
                      >;
 
   // Has an optional argument list where each argument is a typed valueref.

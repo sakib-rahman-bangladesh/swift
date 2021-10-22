@@ -351,9 +351,11 @@ public:
                             std::pair<Type, Type> conformance)
       : RequirementFailure(solution, conformance.first, conformance.second,
                            locator) {
+#ifndef NDEBUG
     auto reqElt = locator->castLastElementTo<LocatorPathElt::AnyRequirement>();
     assert(reqElt.getRequirementKind() == RequirementKind::Conformance ||
            reqElt.getRequirementKind() == RequirementKind::Layout);
+#endif
   }
 
   bool diagnoseAsError() override;
@@ -408,8 +410,10 @@ public:
   SameTypeRequirementFailure(const Solution &solution, Type lhs, Type rhs,
                              ConstraintLocator *locator)
       : RequirementFailure(solution, lhs, rhs, locator) {
+#ifndef NDEBUG
     auto reqElt = locator->castLastElementTo<LocatorPathElt::AnyRequirement>();
     assert(reqElt.getRequirementKind() == RequirementKind::SameType);
+#endif
   }
 
 protected:
@@ -444,8 +448,10 @@ public:
   SuperclassRequirementFailure(const Solution &solution, Type lhs, Type rhs,
                                ConstraintLocator *locator)
       : RequirementFailure(solution, lhs, rhs, locator) {
+#ifndef NDEBUG
     auto reqElt = locator->castLastElementTo<LocatorPathElt::AnyRequirement>();
     assert(reqElt.getRequirementKind() == RequirementKind::Superclass);
+#endif
   }
 
 protected:
@@ -869,9 +875,11 @@ public:
   ThrowingFunctionConversionFailure(const Solution &solution, Type fromType,
                                     Type toType, ConstraintLocator *locator)
       : ContextualFailure(solution, fromType, toType, locator) {
+#ifndef NDEBUG
     auto fnType1 = fromType->castTo<FunctionType>();
     auto fnType2 = toType->castTo<FunctionType>();
     assert(fnType1->isThrowing() != fnType2->isThrowing());
+#endif
   }
 
   bool diagnoseAsError() override;
@@ -890,9 +898,11 @@ public:
   AsyncFunctionConversionFailure(const Solution &solution, Type fromType,
                                  Type toType, ConstraintLocator *locator)
       : ContextualFailure(solution, fromType, toType, locator) {
+#ifndef NDEBUG
     auto fnType1 = fromType->castTo<FunctionType>();
     auto fnType2 = toType->castTo<FunctionType>();
     assert(fnType1->isAsync() != fnType2->isAsync());
+#endif
   }
 
   bool diagnoseAsError() override;
@@ -2602,6 +2612,26 @@ public:
 class InvalidWeakAttributeUse final : public FailureDiagnostic {
 public:
   InvalidWeakAttributeUse(const Solution &solution, ConstraintLocator *locator)
+      : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose situations where Swift -> C pointer implicit conversion
+/// is attempted on a Swift function instead of one imported from C header.
+///
+/// \code
+/// func test(_: UnsafePointer<UInt8>) {}
+///
+/// func pass_ptr(ptr: UnsafeRawPointer) {
+///   test(ptr) // Only okay if `test` was an imported C function.
+/// }
+/// \endcode
+class SwiftToCPointerConversionInInvalidContext final
+    : public FailureDiagnostic {
+public:
+  SwiftToCPointerConversionInInvalidContext(const Solution &solution,
+                                            ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
 
   bool diagnoseAsError() override;

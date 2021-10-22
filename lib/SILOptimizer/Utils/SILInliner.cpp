@@ -293,9 +293,12 @@ protected:
   /// This hook is called after either of the top-level visitors:
   /// cloneReachableBlocks or cloneSILFunction.
   ///
-  /// After fixUp, the SIL must be valid and semantically equivalent to the SIL
-  /// before cloning.
-  void fixUp(SILFunction *calleeFunction);
+  /// After `preFixUp` is called `commonFixUp` will be called.
+  void preFixUp(SILFunction *calleeFunction);
+
+  /// After postFixUp, the SIL must be valid and semantically equivalent to the
+  /// SIL before cloning.
+  void postFixUp(SILFunction *calleeFunction);
 
   const SILDebugScope *getOrCreateInlineScope(const SILDebugScope *DS);
 
@@ -424,17 +427,19 @@ SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
   SmallVector<SILValue, 4> entryArgs;
   entryArgs.reserve(AppliedArgs.size());
   SmallBitVector borrowedArgs(AppliedArgs.size());
+  SmallBitVector copiedArgs(AppliedArgs.size());
 
   auto calleeConv = getCalleeFunction()->getConventions();
   for (auto p : llvm::enumerate(AppliedArgs)) {
     SILValue callArg = p.value();
     unsigned idx = p.index();
-    // Insert begin/end borrow for guaranteed arguments.
-    if (idx >= calleeConv.getSILArgIndexOfFirstParam() &&
-        calleeConv.getParamInfoForSILArg(idx).isGuaranteed()) {
-      if (SILValue newValue = borrowFunctionArgument(callArg, Apply)) {
-        callArg = newValue;
-        borrowedArgs[idx] = true;
+    if (idx >= calleeConv.getSILArgIndexOfFirstParam()) {
+      // Insert begin/end borrow for guaranteed arguments.
+      if (calleeConv.getParamInfoForSILArg(idx).isGuaranteed()) {
+        if (SILValue newValue = borrowFunctionArgument(callArg, Apply)) {
+          callArg = newValue;
+          borrowedArgs[idx] = true;
+        }
       }
     }
     entryArgs.push_back(callArg);
@@ -443,7 +448,6 @@ SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
   // Create the return block and set ReturnToBB for use in visitTerminator
   // callbacks.
   SILBasicBlock *callerBlock = Apply.getParent();
-  SILBasicBlock *throwBlock = nullptr;
   SmallVector<SILInstruction *, 1> endBorrowInsertPts;
 
   switch (Apply.getKind()) {
@@ -476,7 +480,7 @@ SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
     auto *tai = cast<TryApplyInst>(Apply);
     ReturnToBB = tai->getNormalBB();
     endBorrowInsertPts.push_back(&*ReturnToBB->begin());
-    throwBlock = tai->getErrorBB();
+    endBorrowInsertPts.push_back(&*tai->getErrorBB()->begin());
     break;
   }
   }
@@ -492,11 +496,6 @@ SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
       for (auto *insertPt : endBorrowInsertPts) {
         SILBuilderWithScope returnBuilder(insertPt, getBuilder());
         returnBuilder.createEndBorrow(Apply.getLoc(), entryArgs[i]);
-      }
-
-      if (throwBlock) {
-        SILBuilderWithScope throwBuilder(throwBlock->begin(), getBuilder());
-        throwBuilder.createEndBorrow(Apply.getLoc(), entryArgs[i]);
       }
     }
   }
@@ -567,12 +566,14 @@ void SILInlineCloner::visitTerminator(SILBasicBlock *BB) {
   visit(BB->getTerminator());
 }
 
-void SILInlineCloner::fixUp(SILFunction *calleeFunction) {
+void SILInlineCloner::preFixUp(SILFunction *calleeFunction) {
   // "Completing" the BeginApply only fixes the end of the apply scope. The
   // begin_apply itself lingers.
   if (BeginApply)
     BeginApply->complete();
+}
 
+void SILInlineCloner::postFixUp(SILFunction *calleeFunction) {
   NextIter = std::next(Apply.getInstruction()->getIterator());
 
   assert(!Apply.getInstruction()->hasUsesOfAnyResult());
@@ -596,13 +597,28 @@ void SILInlineCloner::fixUp(SILFunction *calleeFunction) {
 
 SILValue SILInlineCloner::borrowFunctionArgument(SILValue callArg,
                                                  FullApplySite AI) {
-  if (!AI.getFunction()->hasOwnership() ||
-      callArg.getOwnershipKind() != OwnershipKind::Owned) {
+  auto enableLexicalLifetimes = Apply.getFunction()
+                                    ->getModule()
+                                    .getASTContext()
+                                    .SILOpts.EnableExperimentalLexicalLifetimes;
+  auto argOwnershipRequiresBorrow = [&]() {
+    auto kind = callArg.getOwnershipKind();
+    if (enableLexicalLifetimes) {
+      // At this point, we know that the function argument is @guaranteed.
+      // If the value passed as that parameter has ownership, always add a
+      // lexical borrow scope to ensure that the value stays alive for the
+      // duration of the inlined callee.
+      return kind != OwnershipKind::None;
+    }
+    return kind == OwnershipKind::Owned;
+  };
+  if (!AI.getFunction()->hasOwnership() || !argOwnershipRequiresBorrow()) {
     return SILValue();
   }
 
   SILBuilderWithScope beginBuilder(AI.getInstruction(), getBuilder());
-  return beginBuilder.createBeginBorrow(AI.getLoc(), callArg);
+  return beginBuilder.createBeginBorrow(AI.getLoc(), callArg,
+                                        /*isLexical=*/enableLexicalLifetimes);
 }
 
 void SILInlineCloner::visitDebugValueInst(DebugValueInst *Inst) {
@@ -802,7 +818,6 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::AllocRefInst:
   case SILInstructionKind::AllocRefDynamicInst:
   case SILInstructionKind::AllocStackInst:
-  case SILInstructionKind::AllocValueBufferInst:
   case SILInstructionKind::BeginApplyInst:
   case SILInstructionKind::ValueMetatypeInst:
   case SILInstructionKind::WitnessMethodInst:
@@ -827,12 +842,10 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeallocPartialRefInst:
   case SILInstructionKind::DeallocStackInst:
-  case SILInstructionKind::DeallocValueBufferInst:
   case SILInstructionKind::DeinitExistentialAddrInst:
   case SILInstructionKind::DeinitExistentialValueInst:
   case SILInstructionKind::DestroyAddrInst:
   case SILInstructionKind::EndApplyInst:
-  case SILInstructionKind::ProjectValueBufferInst:
   case SILInstructionKind::ProjectBoxInst:
   case SILInstructionKind::ProjectExistentialBoxInst:
   case SILInstructionKind::ReleaseValueInst:

@@ -40,6 +40,7 @@
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Dwarf.h"
 #include "swift/Basic/FileSystem.h"
+#include "swift/Basic/PathRemapper.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Version.h"
 #include "swift/ClangImporter/ClangImporter.h"
@@ -48,9 +49,9 @@
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Serialization/SerializationOptions.h"
 #include "swift/Strings.h"
-#include "clang/AST/DeclTemplate.h"
-#include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "swift/SymbolGraphGen/SymbolGraphGen.h"
+#include "swift/SymbolGraphGen/SymbolGraphOptions.h"
+#include "clang/AST/DeclTemplate.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
@@ -78,6 +79,10 @@ using swift::version::Version;
 using llvm::BCBlockRAII;
 
 ASTContext &SerializerBase::getASTContext() const { return M->getASTContext(); }
+
+static StringRef withNullAsEmptyStringRef(const char *data) {
+  return StringRef(data ? data : "");
+}
 
 /// Used for static_assert.
 static constexpr bool declIDFitsIn32Bits() {
@@ -511,7 +516,7 @@ static uint8_t getRawOpaqueReadOwnership(swift::OpaqueReadOwnership ownership) {
   CASE(OwnedOrBorrowed)
 #undef CASE
   }
-  llvm_unreachable("bad kind");  
+  llvm_unreachable("bad kind");
 }
 
 static uint8_t getRawReadImplKind(swift::ReadImplKind kind) {
@@ -750,8 +755,10 @@ IdentifierID Serializer::addModuleRef(const ModuleDecl *module) {
     return CURRENT_MODULE_ID;
   if (module == this->M->getASTContext().TheBuiltinModule)
     return BUILTIN_MODULE_ID;
+  // Use module 'real name', which can be different from 'name'
+  // in case module aliasing was used (-module-alias flag)
   auto moduleName =
-      module->getASTContext().getIdentifier(module->getName().str());
+      module->getASTContext().getIdentifier(module->getRealName().str());
   return addDeclBaseNameRef(moduleName);
 }
 
@@ -805,6 +812,7 @@ void Serializer::writeBlockInfoBlock() {
   BLOCK_RECORD(control_block, TARGET);
   BLOCK_RECORD(control_block, SDK_NAME);
   BLOCK_RECORD(control_block, REVISION);
+  BLOCK_RECORD(control_block, IS_OSSA);
 
   BLOCK(OPTIONS_BLOCK);
   BLOCK_RECORD(options_block, SDK_PATH);
@@ -957,8 +965,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
     control_block::TargetLayout Target(Out);
     control_block::SDKNameLayout SDKName(Out);
     control_block::RevisionLayout Revision(Out);
+    control_block::IsOSSALayout IsOSSA(Out);
 
-    ModuleName.emit(ScratchRecord, M->getName().str());
+    // Write module 'real name', which can be different from 'name'
+    // in case module aliasing is used (-module-alias flag)
+    ModuleName.emit(ScratchRecord, M->getRealName().str());
 
     SmallString<32> versionStringBuf;
     llvm::raw_svector_ostream versionString(versionStringBuf);
@@ -1006,6 +1017,8 @@ void Serializer::writeHeader(const SerializationOptions &options) {
 
       Revision.emit(ScratchRecord, revision);
     }
+
+    IsOSSA.emit(ScratchRecord, options.IsOSSA);
 
     {
       llvm::BCBlockRAII restoreBlock(Out, OPTIONS_BLOCK_ID, 4);
@@ -1058,25 +1071,35 @@ void Serializer::writeHeader(const SerializationOptions &options) {
         options_block::SDKPathLayout SDKPath(Out);
         options_block::XCCLayout XCC(Out);
 
-        SDKPath.emit(ScratchRecord, M->getASTContext().SearchPathOpts.SDKPath);
+        const auto &PathRemapper = options.DebuggingOptionsPrefixMap;
+        SDKPath.emit(
+            ScratchRecord,
+            PathRemapper.remapPath(M->getASTContext().SearchPathOpts.SDKPath));
         auto &Opts = options.ExtraClangOptions;
-        for (auto Arg = Opts.begin(), E = Opts.end(); Arg != E; ++Arg) { 
-          // FIXME: This is a hack and calls for a better design.
-          //
-          // Filter out any -ivfsoverlay options that include an
-          // unextended-module-overlay.yaml overlay. By convention the Xcode
-          // buildsystem uses these while *building* mixed Objective-C and Swift
-          // frameworks; but they should never be used to *import* the module
-          // defined in the framework.
-          if (StringRef(*Arg).startswith("-ivfsoverlay")) {
+        for (auto Arg = Opts.begin(), E = Opts.end(); Arg != E; ++Arg) {
+          StringRef arg(*Arg);
+          if (arg.startswith("-ivfsoverlay")) {
+            // FIXME: This is a hack and calls for a better design.
+            //
+            // Filter out any -ivfsoverlay options that include an
+            // unextended-module-overlay.yaml overlay. By convention the Xcode
+            // buildsystem uses these while *building* mixed Objective-C and
+            // Swift frameworks; but they should never be used to *import* the
+            // module defined in the framework.
             auto Next = std::next(Arg);
             if (Next != E &&
                 StringRef(*Next).endswith("unextended-module-overlay.yaml")) {
               ++Arg;
               continue;
             }
+          } else if (arg.startswith("-fdebug-prefix-map=")) {
+            // We don't serialize the debug prefix map flags as these
+            // contain absoute paths that are not usable on different
+            // machines. These flags are not necessary to compile the
+            // clang modules again so are safe to remove.
+            continue;
           }
-          XCC.emit(ScratchRecord, *Arg);
+          XCC.emit(ScratchRecord, arg);
         }
       }
     }
@@ -1086,6 +1109,8 @@ void Serializer::writeHeader(const SerializationOptions &options) {
 static void flattenImportPath(const ImportedModule &import,
                               SmallVectorImpl<char> &out) {
   llvm::raw_svector_ostream outStream(out);
+  // This will write the module 'real name', which can be different
+  // from the 'name' in case module aliasing was used (see `-module-alias`)
   import.importedModule->getReverseFullModuleName().printForward(
       outStream, StringRef("\0", 1));
 
@@ -1127,14 +1152,16 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
   input_block::ModuleInterfaceLayout ModuleInterface(Out);
 
   if (options.SerializeOptionsForDebugging) {
+    const auto &PathMapper = options.DebuggingOptionsPrefixMap;
     const SearchPathOptions &searchPathOpts = M->getASTContext().SearchPathOpts;
     // Put the framework search paths first so that they'll be preferred upon
     // deserialization.
     for (auto &framepath : searchPathOpts.FrameworkSearchPaths)
       SearchPath.emit(ScratchRecord, /*framework=*/true, framepath.IsSystem,
-                      framepath.Path);
+                      PathMapper.remapPath(framepath.Path));
     for (auto &path : searchPathOpts.ImportSearchPaths)
-      SearchPath.emit(ScratchRecord, /*framework=*/false, /*system=*/false, path);
+      SearchPath.emit(ScratchRecord, /*framework=*/false, /*system=*/false,
+                      PathMapper.remapPath(path));
   }
 
   // Note: We're not using StringMap here because we don't need to own the
@@ -1468,7 +1495,7 @@ void Serializer::writeASTBlockEntity(const SILLayout *layout) {
       typeRef |= 0x80000000U;
     data.push_back(typeRef);
   }
-  
+
   unsigned abbrCode
     = DeclTypeAbbrCodes[SILLayoutLayout::Code];
 
@@ -1703,7 +1730,7 @@ static bool shouldSerializeMember(Decl *D) {
 
   case DeclKind::OpaqueType:
     return true;
-      
+
   case DeclKind::EnumElement:
   case DeclKind::Protocol:
   case DeclKind::Constructor:
@@ -1801,14 +1828,14 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
     if (auto opaque = dyn_cast<OpaqueTypeDecl>(generic)) {
       if (!opaque->hasName()) {
         abbrCode = DeclTypeAbbrCodes[XRefOpaqueReturnTypePathPieceLayout::Code];
-        
+
         XRefOpaqueReturnTypePathPieceLayout::emitRecord(Out, ScratchRecord,
                   abbrCode,
                   addDeclBaseNameRef(opaque->getOpaqueReturnTypeIdentifier()));
         break;
       }
     }
-      
+
     assert(generic->hasName());
 
     abbrCode = DeclTypeAbbrCodes[XRefTypePathPieceLayout::Code];
@@ -1849,7 +1876,7 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
   case DeclContextKind::SubscriptDecl: {
     auto SD = cast<SubscriptDecl>(DC);
     writeCrossReference(DC->getParent(), pathLen + 1);
-    
+
     Type ty = SD->getInterfaceType()->getCanonicalType();
 
     abbrCode = DeclTypeAbbrCodes[XRefValuePathPieceLayout::Code];
@@ -1860,7 +1887,7 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
                                          SD->isStatic());
     break;
   }
-      
+
   case DeclContextKind::AbstractFunctionDecl: {
     if (auto fn = dyn_cast<AccessorDecl>(DC)) {
       auto storage = fn->getStorage();
@@ -1972,7 +1999,7 @@ void Serializer::writeCrossReference(const Decl *D) {
                    addDeclBaseNameRef(opaque->getOpaqueReturnTypeIdentifier()));
     return;
   }
-  
+
   if (auto genericParam = dyn_cast<GenericTypeParamDecl>(D)) {
     assert(!D->getDeclContext()->isModuleScopeContext() &&
            "Cannot cross reference a generic type decl at module scope.");
@@ -2469,6 +2496,14 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       return;
     }
 
+    case DAK_NonSendable: {
+      auto *theAttr = cast<NonSendableAttr>(DA);
+      auto abbrCode = S.DeclTypeAbbrCodes[NonSendableDeclAttrLayout::Code];
+      NonSendableDeclAttrLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
+                                        (unsigned)theAttr->getKind());
+      return;
+    }
+
     case DAK_Optimize: {
       auto *theAttr = cast<OptimizeAttr>(DA);
       auto abbrCode = S.DeclTypeAbbrCodes[OptimizeDeclAttrLayout::Code];
@@ -2576,12 +2611,16 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       auto numSPIGroups = attr->getSPIGroups().size();
       assert(pieces.size() == numArgs + numSPIGroups ||
              pieces.size() == (numArgs - 1 + numSPIGroups));
-
+      auto numAvailabilityAttrs = attr->getAvailabeAttrs().size();
       SpecializeDeclAttrLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode, (unsigned)attr->isExported(),
           (unsigned)attr->getSpecializationKind(),
           S.addGenericSignatureRef(attr->getSpecializedSignature()),
-          S.addDeclRef(targetFunDecl), numArgs, numSPIGroups, pieces);
+          S.addDeclRef(targetFunDecl), numArgs, numSPIGroups,
+          numAvailabilityAttrs, pieces);
+      for (auto availAttr : attr->getAvailabeAttrs()) {
+        writeDeclAttribute(D, availAttr);
+      }
       return;
     }
 
@@ -3093,12 +3132,15 @@ public:
   }
 
   void noteUseOfExportedPrespecialization(const AbstractFunctionDecl *afd) {
+    bool hasNoted = false;
     for (auto *A : afd->getAttrs().getAttributes<SpecializeAttr>()) {
       auto *SA = cast<SpecializeAttr>(A);
       if (!SA->isExported())
         continue;
       if (auto *targetFunctionDecl = SA->getTargetFunctionDecl(afd)) {
-        exportedPrespecializationDecls.push_back(S.addDeclRef(afd));
+        if (!hasNoted)
+          exportedPrespecializationDecls.push_back(S.addDeclRef(afd));
+        hasNoted = true;
       }
     }
   }
@@ -3671,6 +3713,7 @@ public:
         param->isImplicitlyUnwrappedOptional(),
         param->isVariadic(),
         param->isAutoClosure(),
+        param->isIsolated(),
         getRawStableDefaultArgumentKind(argKind),
         defaultArgumentText);
 
@@ -4673,7 +4716,7 @@ class ClangToSwiftBasicWriter :
 
   Serializer &S;
   SmallVectorImpl<uint64_t> &Record;
-  using TypeWriter = 
+  using TypeWriter =
     clang::serialization::AbstractTypeWriter<ClangToSwiftBasicWriter>;
   TypeWriter Types;
 
@@ -5280,6 +5323,7 @@ static void collectInterestingNestedDeclarations(
     Serializer::ObjCMethodTable &objcMethods,
     Serializer::NestedTypeDeclsTable &nestedTypeDecls,
     Serializer::UniquedDerivativeFunctionConfigTable &derivativeConfigs,
+    Serializer::DeclFingerprintsTable &declFingerprints,
     bool isLocal = false) {
   const NominalTypeDecl *nominalParent = nullptr;
 
@@ -5347,10 +5391,15 @@ static void collectInterestingNestedDeclarations(
 
     // Recurse into nested declarations.
     if (auto iterable = dyn_cast<IterableDeclContext>(member)) {
+      if (auto bodyFP = iterable->getBodyFingerprint()) {
+        declFingerprints.insert({S.addDeclRef(member), *bodyFP});
+      }
+
       collectInterestingNestedDeclarations(S, iterable->getAllMembers(),
                                            operatorMethodDecls,
                                            objcMethods, nestedTypeDecls,
                                            derivativeConfigs,
+                                           declFingerprints,
                                            isLocal);
     }
   }
@@ -5432,7 +5481,8 @@ void Serializer::writeAST(ModuleOrSourceFile DC) {
         collectInterestingNestedDeclarations(*this, IDC->getAllMembers(),
                                              operatorMethodDecls, objcMethods,
                                              nestedTypeDecls,
-                                             uniquedDerivativeConfigs);
+                                             uniquedDerivativeConfigs,
+                                             declFingerprints);
       }
     }
 
@@ -5466,10 +5516,11 @@ void Serializer::writeAST(ModuleOrSourceFile DC) {
                                              operatorMethodDecls, objcMethods,
                                              nestedTypeDecls,
                                              uniquedDerivativeConfigs,
+                                             declFingerprints,
                                              /*isLocal=*/true);
       }
     }
-    
+
     for (auto OTD : opaqueReturnTypeDecls) {
       // FIXME: We should delay parsing function bodies so these type decls
       //        don't even get added to the file.
@@ -5643,7 +5694,7 @@ void swift::serializeToBuffers(
   std::unique_ptr<llvm::MemoryBuffer> *moduleSourceInfoBuffer,
   const SILModule *M) {
 
-  assert(!StringRef::withNullAsEmpty(options.OutputPath).empty());
+  assert(!withNullAsEmptyStringRef(options.OutputPath).empty());
   {
     FrontendStatsTracer tracer(getContext(DC).Stats,
                                "Serialization, swiftmodule, to buffer");
@@ -5665,7 +5716,7 @@ void swift::serializeToBuffers(
                         std::move(buf), options.OutputPath);
   }
 
-  if (!StringRef::withNullAsEmpty(options.DocOutputPath).empty()) {
+  if (!withNullAsEmptyStringRef(options.DocOutputPath).empty()) {
     FrontendStatsTracer tracer(getContext(DC).Stats,
                                "Serialization, swiftdoc, to buffer");
     llvm::SmallString<1024> buf;
@@ -5682,7 +5733,7 @@ void swift::serializeToBuffers(
                            std::move(buf), options.DocOutputPath);
   }
 
-  if (!StringRef::withNullAsEmpty(options.SourceInfoOutputPath).empty()) {
+  if (!withNullAsEmptyStringRef(options.SourceInfoOutputPath).empty()) {
     FrontendStatsTracer tracer(getContext(DC).Stats,
                                "Serialization, swiftsourceinfo, to buffer");
     llvm::SmallString<1024> buf;
@@ -5704,12 +5755,12 @@ void swift::serialize(ModuleOrSourceFile DC,
                       const SerializationOptions &options,
                       const SILModule *M,
                       const fine_grained_dependencies::SourceFileDepGraph *DG) {
-  assert(!StringRef::withNullAsEmpty(options.OutputPath).empty());
+  assert(!withNullAsEmptyStringRef(options.OutputPath).empty());
 
   if (StringRef(options.OutputPath) == "-") {
     // Special-case writing to stdout.
     Serializer::writeToStream(llvm::outs(), DC, M, options, DG);
-    assert(StringRef::withNullAsEmpty(options.DocOutputPath).empty());
+    assert(withNullAsEmptyStringRef(options.DocOutputPath).empty());
     return;
   }
 
@@ -5724,7 +5775,7 @@ void swift::serialize(ModuleOrSourceFile DC,
   if (hadError)
     return;
 
-  if (!StringRef::withNullAsEmpty(options.DocOutputPath).empty()) {
+  if (!withNullAsEmptyStringRef(options.DocOutputPath).empty()) {
     (void)withOutputFile(getContext(DC).Diags,
                          options.DocOutputPath,
                          [&](raw_ostream &out) {
@@ -5735,7 +5786,7 @@ void swift::serialize(ModuleOrSourceFile DC,
     });
   }
 
-  if (!StringRef::withNullAsEmpty(options.SourceInfoOutputPath).empty()) {
+  if (!withNullAsEmptyStringRef(options.SourceInfoOutputPath).empty()) {
     (void)withOutputFile(getContext(DC).Diags,
                          options.SourceInfoOutputPath,
                          [&](raw_ostream &out) {
